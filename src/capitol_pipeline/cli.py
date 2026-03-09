@@ -13,20 +13,27 @@ import click
 import httpx
 
 from capitol_pipeline.bridges import (
+    build_dossier_search_document,
     build_fara_member_match_search_document,
     build_fara_registrant_search_document,
     build_house_ptr_search_document,
     build_house_ptr_search_document_from_stub_row,
+    build_news_post_search_document,
     build_offshore_match_search_document,
 )
 from capitol_pipeline.config import OcrBackend, Settings
 from capitol_pipeline.exporters.neon import (
+    backfill_crypto_trade_classification,
     ensure_fara_schema,
     ensure_offshore_schema,
     ensure_search_schema,
+    fetch_existing_fara_registration_numbers,
+    fetch_published_dossiers,
+    fetch_published_news_posts,
     fetch_search_chunk_embedding_backfill,
     fetch_house_stub_search_backfill,
     fetch_house_stub_queue,
+    fetch_pipeline_corpus_status,
     hybrid_search,
     load_member_registry_from_neon,
     mark_house_stub_processed,
@@ -64,6 +71,10 @@ from capitol_pipeline.registries.members import MemberRegistry, load_member_regi
 from capitol_pipeline.sources.house_clerk import fetch_house_feed
 from capitol_pipeline.sources.fara import (
     FaraApiClient,
+    fetch_bulk_foreign_principals,
+    fetch_bulk_reg_documents,
+    fetch_bulk_registrants,
+    fetch_bulk_short_forms,
     fetch_active_registrants,
     fetch_foreign_principals,
     fetch_reg_documents,
@@ -106,6 +117,18 @@ def batched(items: Iterable[T], size: int) -> Iterable[list[T]]:
             batch = []
     if batch:
         yield batch
+
+
+def group_rows_by_registration_number(items: Iterable[object]) -> dict[int, list[object]]:
+    """Group FARA rows by registration number for bulk ingestion."""
+
+    grouped: dict[int, list[object]] = {}
+    for item in items:
+        registration_number = getattr(item, "registration_number", None)
+        if registration_number is None:
+            continue
+        grouped.setdefault(int(registration_number), []).append(item)
+    return grouped
 
 
 def now_iso() -> str:
@@ -510,6 +533,24 @@ def classify_crypto(ticker: str | None, description: str | None) -> None:
     click.echo(json.dumps(classify_crypto_asset(ticker, description).model_dump(), indent=2))
 
 
+@cli.command("backfill-crypto-trades")
+@click.option("--limit", type=int, default=0, show_default=True, help="0 means scan every likely crypto-linked trade.")
+@click.option("--only-unclassified/--include-classified", default=True, show_default=True)
+def backfill_crypto_trades_command(
+    limit: int,
+    only_unclassified: bool,
+) -> None:
+    """Normalize existing CapitolExposed trade rows into crypto classes."""
+
+    settings = Settings()
+    summary = backfill_crypto_trade_classification(
+        settings,
+        limit=limit,
+        only_unclassified=only_unclassified,
+    )
+    click.echo(json.dumps(summary, indent=2))
+
+
 @cli.command("ensure-search-schema")
 def ensure_search_schema_command() -> None:
     """Create the search tables and indexes used for lexical and vector retrieval."""
@@ -534,6 +575,15 @@ def ensure_fara_schema_command() -> None:
 
     settings = Settings()
     summary = ensure_fara_schema(settings)
+    click.echo(json.dumps(summary, indent=2))
+
+
+@cli.command("corpus-status")
+def corpus_status_command() -> None:
+    """Print a compact status snapshot for pipeline-managed corpora and retrieval."""
+
+    settings = Settings()
+    summary = fetch_pipeline_corpus_status(settings)
     click.echo(json.dumps(summary, indent=2))
 
 
@@ -633,12 +683,24 @@ def ingest_offshore_leaks_command(
 
 
 @cli.command("ingest-fara")
+@click.option(
+    "--mode",
+    type=click.Choice(["bulk", "api"]),
+    default="bulk",
+    show_default=True,
+    help="Use the official daily bulk ZIPs or the per-registrant API.",
+)
 @click.option("--limit-registrants", type=int, default=0, show_default=True, help="0 means all active registrants.")
+@click.option("--offset-registrants", type=int, default=0, show_default=True)
+@click.option("--skip-existing/--include-existing", default=True, show_default=True)
 @click.option("--skip-match-index/--with-match-index", default=False, show_default=True)
 @click.option("--with-embeddings/--no-embeddings", default=False, show_default=True)
 @click.option("--export-registry/--no-export-registry", default=True, show_default=True)
 def ingest_fara_command(
+    mode: str,
     limit_registrants: int,
+    offset_registrants: int,
+    skip_existing: bool,
     skip_match_index: bool,
     with_embeddings: bool,
     export_registry: bool,
@@ -650,12 +712,55 @@ def ingest_fara_command(
     if not skip_match_index:
         ensure_search_schema(settings)
     registry = load_registry_if_available(settings, export_cache=export_registry)
-    client = FaraApiClient(settings)
-    registrants = fetch_active_registrants(settings, client)
+    client = FaraApiClient(settings) if mode == "api" else None
+    registrants = (
+        fetch_bulk_registrants(settings)
+        if mode == "bulk"
+        else fetch_active_registrants(settings, client)
+    )
+    skipped_existing = 0
+    if skip_existing:
+        existing_registration_numbers = fetch_existing_fara_registration_numbers(settings)
+        skipped_existing = sum(
+            1 for registrant in registrants if registrant.registration_number in existing_registration_numbers
+        )
+        registrants = [
+            registrant
+            for registrant in registrants
+            if registrant.registration_number not in existing_registration_numbers
+        ]
+    if offset_registrants > 0:
+        registrants = registrants[offset_registrants:]
     if limit_registrants > 0:
         registrants = registrants[:limit_registrants]
 
+    bulk_principal_map: dict[int, list[FaraForeignPrincipalRecord]] = {}
+    bulk_short_form_map: dict[int, list[FaraShortFormRecord]] = {}
+    bulk_document_map: dict[int, list[FaraDocumentRecord]] = {}
+    if mode == "bulk":
+        bulk_principal_map = {
+            registration_number: list(rows)  # type: ignore[list-item]
+            for registration_number, rows in group_rows_by_registration_number(
+                fetch_bulk_foreign_principals(settings)
+            ).items()
+        }
+        bulk_short_form_map = {
+            registration_number: list(rows)  # type: ignore[list-item]
+            for registration_number, rows in group_rows_by_registration_number(
+                fetch_bulk_short_forms(settings)
+            ).items()
+        }
+        bulk_document_map = {
+            registration_number: list(rows)  # type: ignore[list-item]
+            for registration_number, rows in group_rows_by_registration_number(
+                fetch_bulk_reg_documents(settings)
+            ).items()
+        }
+
     summary: dict[str, object] = {
+        "mode": mode,
+        "registrantsFetched": len(registrants) + skipped_existing + offset_registrants,
+        "registrantsSkippedExisting": skipped_existing,
         "registrantsQueued": len(registrants),
         "registrantsUpserted": 0,
         "foreignPrincipalsUpserted": 0,
@@ -673,21 +778,26 @@ def ingest_fara_command(
         documents: list[FaraDocumentRecord] = []
         partial_errors: list[str] = []
 
-        for label, fetcher in (
-            ("foreignPrincipals", lambda: fetch_foreign_principals(settings, registrant.registration_number, client)),
-            ("shortForms", lambda: fetch_short_forms(settings, registrant.registration_number, client)),
-            ("documents", lambda: fetch_reg_documents(settings, registrant.registration_number, client)),
-        ):
-            try:
-                rows = fetcher()
-                if label == "foreignPrincipals":
-                    principals = rows  # type: ignore[assignment]
-                elif label == "shortForms":
-                    short_forms = rows  # type: ignore[assignment]
-                else:
-                    documents = rows  # type: ignore[assignment]
-            except Exception as error:  # pragma: no cover - depends on live API variance
-                partial_errors.append(f"{label}: {error}")
+        if mode == "bulk":
+            principals = bulk_principal_map.get(registrant.registration_number, [])
+            short_forms = bulk_short_form_map.get(registrant.registration_number, [])
+            documents = bulk_document_map.get(registrant.registration_number, [])
+        else:
+            for label, fetcher in (
+                ("foreignPrincipals", lambda: fetch_foreign_principals(settings, registrant.registration_number, client)),
+                ("shortForms", lambda: fetch_short_forms(settings, registrant.registration_number, client)),
+                ("documents", lambda: fetch_reg_documents(settings, registrant.registration_number, client)),
+            ):
+                try:
+                    rows = fetcher()
+                    if label == "foreignPrincipals":
+                        principals = rows  # type: ignore[assignment]
+                    elif label == "shortForms":
+                        short_forms = rows  # type: ignore[assignment]
+                    else:
+                        documents = rows  # type: ignore[assignment]
+                except Exception as error:  # pragma: no cover - depends on live API variance
+                    partial_errors.append(f"{label}: {error}")
 
         upsert_fara_registrants(settings, [registrant], ensure_schema=False)
         upsert_fara_foreign_principals(settings, principals, ensure_schema=False)
@@ -1044,6 +1154,103 @@ def index_house_search_backfill_command(
     click.echo(json.dumps(summary, indent=2))
 
 
+@cli.command("index-site-editorial")
+@click.option("--limit-stories", type=int, default=0, show_default=True, help="0 means index every eligible published story.")
+@click.option("--limit-dossiers", type=int, default=0, show_default=True, help="0 means index every eligible published dossier.")
+@click.option("--only-missing/--reindex-all", default=True, show_default=True)
+@click.option("--with-embeddings/--no-embeddings", default=False, show_default=True)
+@click.option("--export-registry/--no-export-registry", default=True, show_default=True)
+def index_site_editorial_command(
+    limit_stories: int,
+    limit_dossiers: int,
+    only_missing: bool,
+    with_embeddings: bool,
+    export_registry: bool,
+) -> None:
+    """Index published CapitolExposed stories and dossiers into the shared search corpus."""
+
+    settings = Settings()
+    ensure_search_schema(settings)
+    registry = load_registry_if_available(settings, export_cache=export_registry)
+
+    story_rows = fetch_published_news_posts(
+        settings,
+        limit=limit_stories,
+        only_missing=only_missing,
+    )
+    dossier_rows = fetch_published_dossiers(
+        settings,
+        limit=limit_dossiers,
+        only_missing=only_missing,
+    )
+
+    summary = {
+        "storiesQueued": len(story_rows),
+        "dossiersQueued": len(dossier_rows),
+        "documentsUpserted": 0,
+        "chunksUpserted": 0,
+        "embedded": 0,
+        "processed": [],
+    }
+
+    for row in story_rows:
+        search_document = build_news_post_search_document(
+            row,
+            base_url=settings.site_base_url,
+            registry=registry,
+        )
+        index_summary = index_search_document(
+            settings,
+            search_document,
+            with_embeddings=with_embeddings,
+            ensure_schema=False,
+        )
+        summary["documentsUpserted"] += int(
+            (index_summary.get("document") or {}).get("upserted", 0)  # type: ignore[union-attr]
+        )
+        summary["chunksUpserted"] += int(
+            (index_summary.get("chunks") or {}).get("upserted", 0)  # type: ignore[union-attr]
+        )
+        summary["embedded"] += 1 if index_summary.get("embedded") else 0
+        summary["processed"].append(
+            {
+                "kind": "story",
+                "slug": row.get("slug"),
+                "documentId": (index_summary.get("document") or {}).get("document_id"),  # type: ignore[union-attr]
+                "chunks": (index_summary.get("chunks") or {}).get("upserted", 0),  # type: ignore[union-attr]
+            }
+        )
+
+    for row in dossier_rows:
+        search_document = build_dossier_search_document(
+            row,
+            base_url=settings.site_base_url,
+        )
+        index_summary = index_search_document(
+            settings,
+            search_document,
+            with_embeddings=with_embeddings,
+            ensure_schema=False,
+        )
+        summary["documentsUpserted"] += int(
+            (index_summary.get("document") or {}).get("upserted", 0)  # type: ignore[union-attr]
+        )
+        summary["chunksUpserted"] += int(
+            (index_summary.get("chunks") or {}).get("upserted", 0)  # type: ignore[union-attr]
+        )
+        summary["embedded"] += 1 if index_summary.get("embedded") else 0
+        summary["processed"].append(
+            {
+                "kind": "dossier",
+                "slug": row.get("slug"),
+                "documentId": (index_summary.get("document") or {}).get("document_id"),  # type: ignore[union-attr]
+                "chunks": (index_summary.get("chunks") or {}).get("upserted", 0),  # type: ignore[union-attr]
+            }
+        )
+
+    click.echo(json.dumps(summary, indent=2))
+
+
 @cli.command("embed-search-backfill")
 @click.option("--limit", type=int, default=100, show_default=True)
 @click.option("--source", type=str, default=None, help="Optional pipeline_search_documents.source filter.")
@@ -1073,6 +1280,51 @@ def embed_search_backfill_command(
             indent=2,
         )
     )
+
+
+@cli.command("embed-search-corpus")
+@click.option("--batch-size", type=int, default=100, show_default=True)
+@click.option("--max-batches", type=int, default=0, show_default=True, help="0 means run until the queue is empty.")
+@click.option("--source", type=str, default=None, help="Optional pipeline_search_documents.source filter.")
+def embed_search_corpus_command(
+    batch_size: int,
+    max_batches: int,
+    source: str | None,
+) -> None:
+    """Embed the search corpus in stable batches until the queue is drained."""
+
+    settings = Settings()
+    embedder = get_embedder(settings)
+    summary = {
+        "source": source,
+        "batchSize": batch_size,
+        "batches": 0,
+        "queued": 0,
+        "updated": 0,
+    }
+
+    while True:
+        if max_batches > 0 and summary["batches"] >= max_batches:
+            break
+        rows = fetch_search_chunk_embedding_backfill(
+            settings,
+            limit=batch_size,
+            source=source,
+        )
+        if not rows:
+            break
+        embeddings = embedder.embed_texts([str(row.get("content") or "") for row in rows])
+        updates = [
+            (str(row.get("id") or ""), embedding)
+            for row, embedding in zip(rows, embeddings, strict=False)
+            if embedding
+        ]
+        batch_summary = update_search_chunk_embeddings(settings, updates)
+        summary["batches"] += 1
+        summary["queued"] += len(rows)
+        summary["updated"] += int(batch_summary["updated"])
+
+    click.echo(json.dumps(summary, indent=2))
 
 
 @cli.command("process-house-backlog")

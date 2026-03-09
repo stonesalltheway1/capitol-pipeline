@@ -4,9 +4,12 @@ from capitol_pipeline.models.document import Document
 from capitol_pipeline.models.search import build_search_document
 from capitol_pipeline.processors.chunking import build_search_chunks
 from capitol_pipeline.bridges.search_documents import (
+    build_dossier_search_document,
     build_house_ptr_search_document,
     build_house_ptr_search_document_from_stub_row,
+    build_news_post_search_document,
 )
+from capitol_pipeline.registries.members import MemberRegistry
 
 
 def test_build_search_document_preserves_core_metadata() -> None:
@@ -140,3 +143,77 @@ def test_build_house_ptr_search_document_from_stub_row_uses_stored_metadata() ->
     assert document.asset_tickers == ["CVX"]
     assert document.content == "Roger Williams bought CVX."
     assert document.metadata["stubStatus"] == "parsed"
+
+
+def test_build_news_post_search_document_resolves_member_refs() -> None:
+    registry = MemberRegistry.from_rows(
+        [
+            {
+                "id": "m-G000000",
+                "name": "Josh Gottheimer",
+                "slug": "josh-gottheimer",
+                "party": "D",
+                "state": "NJ",
+            }
+        ]
+    )
+    row = {
+        "slug": "example-story",
+        "title": "Example Story",
+        "subtitle": "An accountability reporting sample",
+        "excerpt": "This is the summary.",
+        "body": "Full story body with a deeper evidence chain.",
+        "category": "general",
+        "tags": ["oversight", "accountability"],
+        "author": "CapitolExposed Research Team",
+        "member_refs": [{"name": "Josh Gottheimer", "slug": "josh-gottheimer"}],
+        "evidence": [{"type": "trade"}],
+        "reading_time": "4 min read",
+        "word_count": 900,
+        "published_at": "2026-03-08T05:26:06.320Z",
+        "updated_at": "2026-03-08T12:00:11.909Z",
+    }
+
+    document = build_news_post_search_document(
+        row,
+        base_url="https://www.capitolexposed.com",
+        registry=registry,
+    )
+    assert document.source == "capitol-exposed"
+    assert document.source_url == "https://www.capitolexposed.com/news/example-story"
+    assert document.member_ids == ["m-G000000"]
+    assert document.metadata["memberSlugs"] == ["josh-gottheimer"]
+
+
+def test_build_dossier_search_document_includes_findings() -> None:
+    row = {
+        "member_id": "m-F000459",
+        "title": "Investigation Dossier: Example Member",
+        "slug": "example-member-2026",
+        "summary": "Summary text.",
+        "severity": "high",
+        "verification_status": "unverified",
+        "generated_at": "2026-03-08T12:20:19.767Z",
+        "reviewed_at": None,
+        "updated_at": "2026-03-08T12:20:19.767Z",
+        "executive_summary": "Executive summary text.",
+        "methodology": "Methodology text.",
+        "finding_count": 2,
+        "findings": [
+            {
+                "category": "trade_conflict",
+                "title": "High-conflict trade cluster",
+                "narrative": "Narrative text.",
+            }
+        ],
+    }
+
+    document = build_dossier_search_document(
+        row,
+        base_url="https://www.capitolexposed.com",
+    )
+    assert document.source == "capitol-exposed"
+    assert document.source_url == "https://www.capitolexposed.com/dossier/example-member-2026"
+    assert document.member_ids == ["m-F000459"]
+    assert "Narrative text." in document.content
+    assert "trade_conflict" in document.tags

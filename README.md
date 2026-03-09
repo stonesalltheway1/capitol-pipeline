@@ -51,6 +51,9 @@ capitol-pipeline senate-feed
 # Classify a raw asset
 capitol-pipeline classify-crypto --ticker IBIT --description "iShares Bitcoin Trust ETF"
 
+# Backfill crypto-linked trade rows that were previously stored as generic assets or stocks
+capitol-pipeline backfill-crypto-trades
+
 # OCR a single PDF through the fallback chain
 capitol-pipeline ocr ./sample.pdf
 
@@ -102,11 +105,23 @@ capitol-pipeline ingest-offshore-leaks --with-match-index
 # Create the dedicated FARA corpus tables
 capitol-pipeline ensure-fara-schema
 
-# Ingest the official FARA registrant corpus into raw Neon tables and search
-capitol-pipeline ingest-fara --with-match-index
+# Inspect pipeline-managed corpus counts
+capitol-pipeline corpus-status
+
+# Ingest the official daily FARA bulk corpus into raw Neon tables and search
+capitol-pipeline ingest-fara --mode bulk --with-match-index
+
+# Fallback: ingest via the slower per-registrant API
+capitol-pipeline ingest-fara --mode api --limit-registrants 25
+
+# Index CapitolExposed's own published stories and dossiers into the shared corpus
+capitol-pipeline index-site-editorial --only-missing
 
 # Backfill missing embeddings on already-indexed search chunks
 capitol-pipeline embed-search-backfill --limit 100
+
+# Drain the embedding queue in stable batches, optionally per source
+capitol-pipeline embed-search-corpus --source capitol-exposed --batch-size 100
 ```
 
 ## Search Layer
@@ -122,6 +137,7 @@ That search layer supports:
 1. `tsvector` indexes for exact and lexical retrieval
 2. `pgvector` indexes for semantic retrieval
 3. Hybrid ranking across title, summary, document body, and indexed chunks
+4. A shared corpus that can mix CapitolExposed editorial, House PTRs, FARA, and ICIJ cross-references
 
 Embeddings are optional. The lexical path works immediately. To enable OpenAI
 embeddings, set:
@@ -147,7 +163,7 @@ documents are only created for matched records.
 
 ## FARA Layer
 
-Capitol Pipeline now ingests the official FARA API into dedicated raw tables:
+Capitol Pipeline now ingests the official DOJ FARA daily bulk ZIP exports into dedicated raw tables:
 
 - `pipeline_fara_registrants`
 - `pipeline_fara_foreign_principals`
@@ -157,7 +173,7 @@ Capitol Pipeline now ingests the official FARA API into dedicated raw tables:
 
 Each active registrant is also summarized into the shared search corpus so the
 Research Desk and future site search can retrieve FARA relationships without
-depending on the public API at request time.
+depending on a live API call at request time.
 
 ## Retrofit Priorities
 

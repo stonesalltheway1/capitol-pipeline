@@ -26,6 +26,12 @@ from capitol_pipeline.models.offshore import (
     OffshoreRelationshipRecord,
 )
 from capitol_pipeline.models.search import SearchChunkRecord, SearchDocumentRecord, SearchHit
+from capitol_pipeline.normalizers.crypto_assets import (
+    CRYPTO_EQUITY_TICKERS,
+    CRYPTO_ETF_TICKERS,
+    DIRECT_CRYPTO_SYMBOLS,
+    classify_crypto_asset,
+)
 from capitol_pipeline.registries.members import MemberRegistry
 
 try:
@@ -53,6 +59,11 @@ PIPELINE_FARA_FOREIGN_PRINCIPALS_TABLE = "pipeline_fara_foreign_principals"
 PIPELINE_FARA_SHORT_FORMS_TABLE = "pipeline_fara_short_forms"
 PIPELINE_FARA_DOCUMENTS_TABLE = "pipeline_fara_documents"
 PIPELINE_FARA_MEMBER_MATCHES_TABLE = "pipeline_fara_member_matches"
+CRYPTO_TRADE_SCAN_REGEX = (
+    "(bitcoin|ethereum|ether|solana|xrp|cardano|dogecoin|litecoin|polkadot|"
+    "avalanche|chainlink|crypto|digital asset|coinbase|microstrategy|"
+    "marathon digital|riot platforms|bitcoin trust|bitcoin etf|ethereum trust|ethereum etf)"
+)
 
 
 def ensure_neon_available() -> None:
@@ -647,9 +658,17 @@ def upsert_search_chunks(
         return {"upserted": 0, "document_id": None}
 
     document_id = chunks[0].document_id
+    chunk_ids = [chunk.id for chunk in chunks]
     with neon_connection(settings) as connection:
         with connection.cursor() as cursor:
-            cursor.execute("DELETE FROM pipeline_search_chunks WHERE document_id = %s", (document_id,))
+            cursor.execute(
+                """
+                DELETE FROM pipeline_search_chunks
+                WHERE document_id = %s
+                  AND NOT (id = ANY(%s))
+                """,
+                (document_id, chunk_ids),
+            )
             cursor.executemany(
                 """
                 INSERT INTO pipeline_search_chunks (
@@ -665,6 +684,14 @@ def upsert_search_chunks(
                 VALUES (
                     %s, %s, %s, %s, %s, %s, %s::vector, NOW()
                 )
+                ON CONFLICT (id) DO UPDATE SET
+                    document_id = EXCLUDED.document_id,
+                    chunk_index = EXCLUDED.chunk_index,
+                    content = EXCLUDED.content,
+                    token_estimate = EXCLUDED.token_estimate,
+                    metadata = EXCLUDED.metadata,
+                    embedding = EXCLUDED.embedding,
+                    updated_at = NOW()
                 """,
                 [
                     (
@@ -1427,6 +1454,139 @@ def fetch_house_stub_search_backfill(
             return list(cursor.fetchall())
 
 
+def fetch_published_news_posts(
+    settings: Settings,
+    *,
+    limit: int = 0,
+    only_missing: bool = True,
+) -> list[dict[str, object]]:
+    """Load published CapitolExposed stories for shared search indexing."""
+
+    ensure_search_schema(settings)
+    with neon_connection(settings) as connection:
+        with connection.cursor() as cursor:
+            query = """
+                SELECT
+                    n.id,
+                    n.slug,
+                    n.title,
+                    n.subtitle,
+                    n.excerpt,
+                    n.body,
+                    n.category,
+                    n.tags,
+                    n.author,
+                    n.member_refs,
+                    n.evidence,
+                    n.word_count,
+                    n.reading_time,
+                    n.published_at,
+                    n.updated_at
+                FROM news_posts n
+                WHERE n.status = 'published'
+                  AND COALESCE(n.slug, '') <> ''
+                  AND COALESCE(n.body, '') <> ''
+            """
+            if only_missing:
+                query += """
+                  AND NOT EXISTS (
+                        SELECT 1
+                        FROM pipeline_search_documents d
+                        WHERE d.source_document_id = CONCAT('capitol-story-', n.slug)
+                    )
+                """
+            query += """
+                ORDER BY n.published_at DESC NULLS LAST, n.updated_at DESC NULLS LAST
+            """
+            params: list[object] = []
+            if limit > 0:
+                query += " LIMIT %s"
+                params.append(limit)
+            cursor.execute(query, tuple(params))
+            return list(cursor.fetchall())
+
+
+def fetch_published_dossiers(
+    settings: Settings,
+    *,
+    limit: int = 0,
+    only_missing: bool = True,
+) -> list[dict[str, object]]:
+    """Load published CapitolExposed dossiers with finding narratives for indexing."""
+
+    ensure_search_schema(settings)
+    with neon_connection(settings) as connection:
+        with connection.cursor() as cursor:
+            query = """
+                SELECT
+                    d.id,
+                    d.member_id,
+                    d.title,
+                    d.slug,
+                    d.summary,
+                    d.severity,
+                    d.verification_status,
+                    d.generated_at,
+                    d.reviewed_at,
+                    d.metadata,
+                    d.executive_summary,
+                    d.methodology,
+                    d.finding_count,
+                    d.updated_at,
+                    COALESCE(
+                        jsonb_agg(
+                            jsonb_build_object(
+                                'id', f.id,
+                                'category', f.category,
+                                'title', f.title,
+                                'narrative', f.narrative,
+                                'verification_status', f.verification_status,
+                                'severity_score', f.severity_score,
+                                'sort_order', f.sort_order
+                            )
+                            ORDER BY f.sort_order ASC, f.id ASC
+                        ) FILTER (WHERE f.id IS NOT NULL),
+                        '[]'::jsonb
+                    ) AS findings
+                FROM dossiers d
+                LEFT JOIN dossier_findings f ON f.dossier_id = d.id
+                WHERE d.published = TRUE
+                  AND COALESCE(d.slug, '') <> ''
+            """
+            if only_missing:
+                query += """
+                  AND NOT EXISTS (
+                        SELECT 1
+                        FROM pipeline_search_documents s
+                        WHERE s.source_document_id = CONCAT('capitol-dossier-', d.slug)
+                    )
+                """
+            query += """
+                GROUP BY
+                    d.id,
+                    d.member_id,
+                    d.title,
+                    d.slug,
+                    d.summary,
+                    d.severity,
+                    d.verification_status,
+                    d.generated_at,
+                    d.reviewed_at,
+                    d.metadata,
+                    d.executive_summary,
+                    d.methodology,
+                    d.finding_count,
+                    d.updated_at
+                ORDER BY d.updated_at DESC NULLS LAST, d.generated_at DESC NULLS LAST
+            """
+            params: list[object] = []
+            if limit > 0:
+                query += " LIMIT %s"
+                params.append(limit)
+            cursor.execute(query, tuple(params))
+            return list(cursor.fetchall())
+
+
 def fetch_search_chunk_embedding_backfill(
     settings: Settings,
     *,
@@ -1476,6 +1636,188 @@ def update_search_chunk_embeddings(
             )
         connection.commit()
     return {"updated": len(rows)}
+
+
+def fetch_existing_fara_registration_numbers(settings: Settings) -> set[int]:
+    """Load already-ingested FARA registrant ids so bulk runs can skip repeats."""
+
+    ensure_fara_schema(settings)
+    with neon_connection(settings) as connection:
+        with connection.cursor() as cursor:
+            cursor.execute(
+                f"SELECT registration_number FROM {PIPELINE_FARA_REGISTRANTS_TABLE}"
+            )
+            return {
+                int(row["registration_number"])
+                for row in cursor.fetchall()
+                if row.get("registration_number") is not None
+            }
+
+
+def fetch_pipeline_corpus_status(settings: Settings) -> dict[str, object]:
+    """Return a compact status snapshot for pipeline-managed corpora and retrieval."""
+
+    ensure_search_schema(settings)
+    ensure_offshore_schema(settings)
+    ensure_fara_schema(settings)
+    with neon_connection(settings) as connection:
+        with connection.cursor() as cursor:
+            cursor.execute(
+                f"""
+                SELECT
+                    (SELECT COUNT(*)::int FROM {PIPELINE_OFFSHORE_NODES_TABLE}) AS offshore_nodes,
+                    (SELECT COUNT(*)::int FROM {PIPELINE_OFFSHORE_RELATIONSHIPS_TABLE}) AS offshore_relationships,
+                    (SELECT COUNT(*)::int FROM {PIPELINE_OFFSHORE_MEMBER_MATCHES_TABLE}) AS offshore_matches,
+                    (SELECT COUNT(*)::int FROM {PIPELINE_FARA_REGISTRANTS_TABLE}) AS fara_registrants,
+                    (SELECT COUNT(*)::int FROM {PIPELINE_FARA_FOREIGN_PRINCIPALS_TABLE}) AS fara_foreign_principals,
+                    (SELECT COUNT(*)::int FROM {PIPELINE_FARA_SHORT_FORMS_TABLE}) AS fara_short_forms,
+                    (SELECT COUNT(*)::int FROM {PIPELINE_FARA_DOCUMENTS_TABLE}) AS fara_documents,
+                    (SELECT COUNT(*)::int FROM {PIPELINE_FARA_MEMBER_MATCHES_TABLE}) AS fara_matches,
+                    (SELECT COUNT(*)::int FROM {PIPELINE_SEARCH_DOCUMENTS_TABLE}) AS search_documents,
+                    (SELECT COUNT(*)::int FROM {PIPELINE_SEARCH_CHUNKS_TABLE}) AS search_chunks,
+                    (
+                        SELECT COUNT(*)::int
+                        FROM {PIPELINE_SEARCH_CHUNKS_TABLE}
+                        WHERE embedding IS NOT NULL
+                    ) AS embedded_chunks,
+                    (
+                        SELECT jsonb_object_agg(source, count_value)
+                        FROM (
+                            SELECT source, COUNT(*)::int AS count_value
+                            FROM {PIPELINE_SEARCH_DOCUMENTS_TABLE}
+                            GROUP BY source
+                            ORDER BY source
+                        ) source_counts
+                    ) AS search_documents_by_source,
+                    (
+                        SELECT jsonb_object_agg(source, count_value)
+                        FROM (
+                            SELECT d.source, COUNT(*)::int AS count_value
+                            FROM {PIPELINE_SEARCH_CHUNKS_TABLE} c
+                            JOIN {PIPELINE_SEARCH_DOCUMENTS_TABLE} d ON d.id = c.document_id
+                            WHERE c.embedding IS NOT NULL
+                            GROUP BY d.source
+                            ORDER BY d.source
+                        ) embedded_counts
+                    ) AS embedded_chunks_by_source
+                """
+            )
+            status = cursor.fetchone() or {}
+
+            cursor.execute(
+                """
+                SELECT status, COUNT(*)::int AS count
+                FROM house_filing_stubs
+                GROUP BY status
+                ORDER BY status
+                """
+            )
+            house_stub_counts = {
+                str(row["status"]): int(row["count"])
+                for row in cursor.fetchall()
+                if row.get("status") is not None
+            }
+
+    return {
+        "offshore": {
+            "nodes": int(status.get("offshore_nodes") or 0),
+            "relationships": int(status.get("offshore_relationships") or 0),
+            "matches": int(status.get("offshore_matches") or 0),
+        },
+        "fara": {
+            "registrants": int(status.get("fara_registrants") or 0),
+            "foreignPrincipals": int(status.get("fara_foreign_principals") or 0),
+            "shortForms": int(status.get("fara_short_forms") or 0),
+            "documents": int(status.get("fara_documents") or 0),
+            "matches": int(status.get("fara_matches") or 0),
+        },
+        "search": {
+            "documents": int(status.get("search_documents") or 0),
+            "chunks": int(status.get("search_chunks") or 0),
+            "embeddedChunks": int(status.get("embedded_chunks") or 0),
+            "documentsBySource": status.get("search_documents_by_source") or {},
+            "embeddedChunksBySource": status.get("embedded_chunks_by_source") or {},
+        },
+        "houseStubs": house_stub_counts,
+    }
+
+
+def backfill_crypto_trade_classification(
+    settings: Settings,
+    *,
+    limit: int = 0,
+    only_unclassified: bool = True,
+) -> dict[str, object]:
+    """Normalize existing CapitolExposed trade rows into crypto asset classes."""
+
+    known_tickers = sorted(
+        {
+            *DIRECT_CRYPTO_SYMBOLS.keys(),
+            *CRYPTO_ETF_TICKERS.keys(),
+            *CRYPTO_EQUITY_TICKERS.keys(),
+        }
+    )
+    with neon_connection(settings) as connection:
+        with connection.cursor() as cursor:
+            query = """
+                SELECT id, ticker, asset_type, asset_description
+                FROM trades
+                WHERE (
+                    asset_type IN ('Cryptocurrency', 'Crypto ETF', 'Crypto-Adjacent Equity')
+                    OR UPPER(COALESCE(ticker, '')) = ANY(%s)
+                    OR COALESCE(asset_description, '') ~* %s
+                )
+            """
+            params: list[object] = [known_tickers, CRYPTO_TRADE_SCAN_REGEX]
+            if only_unclassified:
+                query += " AND COALESCE(asset_type, '') NOT IN ('Cryptocurrency', 'Crypto ETF', 'Crypto-Adjacent Equity')"
+            query += " ORDER BY transaction_date DESC NULLS LAST, id ASC"
+            if limit > 0:
+                query += " LIMIT %s"
+                params.append(limit)
+            cursor.execute(query, tuple(params))
+            rows = list(cursor.fetchall())
+
+            updates: list[tuple[str, str | None, str]] = []
+            summary_by_kind = {
+                "direct_crypto": 0,
+                "crypto_etf": 0,
+                "crypto_equity": 0,
+            }
+            for row in rows:
+                classification = classify_crypto_asset(
+                    str(row.get("ticker") or "").strip() or None,
+                    str(row.get("asset_description") or "").strip() or None,
+                )
+                if classification.kind == "unrelated":
+                    continue
+                asset_type = {
+                    "direct_crypto": "Cryptocurrency",
+                    "crypto_etf": "Crypto ETF",
+                    "crypto_equity": "Crypto-Adjacent Equity",
+                }[classification.kind]
+                normalized_ticker = str(row.get("ticker") or "").strip().upper() or None
+                replacement_ticker = normalized_ticker or classification.canonical_symbol
+                updates.append((asset_type, replacement_ticker, str(row["id"])))
+                summary_by_kind[classification.kind] += 1
+
+            if updates:
+                cursor.executemany(
+                    """
+                    UPDATE trades
+                    SET asset_type = %s,
+                        ticker = COALESCE(NULLIF(%s, ''), ticker)
+                    WHERE id = %s
+                    """,
+                    updates,
+                )
+        connection.commit()
+
+    return {
+        "scanned": len(rows),
+        "updated": len(updates),
+        "byKind": summary_by_kind,
+    }
 
 
 def upsert_trade_rows_to_neon(

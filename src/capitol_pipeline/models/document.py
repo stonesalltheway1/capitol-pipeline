@@ -11,6 +11,7 @@ from pydantic import BaseModel, Field
 # ---------------------------------------------------------------------------
 
 DocumentSource = Literal[
+    "capitol-exposed",
     "house-clerk",
     "senate-ethics",
     "senate-watcher",

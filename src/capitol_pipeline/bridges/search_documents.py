@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from datetime import datetime
 from typing import Any
 
 from capitol_pipeline.models.congress import FilingStub, HousePtrParseResult, MemberMatch, NormalizedTradeRow
@@ -9,6 +10,7 @@ from capitol_pipeline.models.document import Document
 from capitol_pipeline.models.fara import FaraMemberMatchRecord, FaraRegistrantBundle
 from capitol_pipeline.models.offshore import OffshoreNodeRecord
 from capitol_pipeline.models.search import SearchDocumentRecord, build_search_document
+from capitol_pipeline.registries.members import MemberRegistry
 
 
 def build_house_ptr_search_document(
@@ -243,5 +245,208 @@ def build_fara_member_match_search_document(
             "matchValue": match.match_value,
             "memberSlug": match.member_slug,
             "registrantName": registrant.name,
+        },
+    )
+
+
+def normalize_document_date(value: Any) -> str | None:
+    """Convert a timestamp-like value into YYYY-MM-DD for canonical document dates."""
+
+    if value is None:
+        return None
+    if isinstance(value, datetime):
+        return value.date().isoformat()
+    text = str(value).strip()
+    if not text:
+        return None
+    if "T" in text:
+        return text.split("T", 1)[0]
+    if " " in text:
+        return text.split(" ", 1)[0]
+    return text[:10]
+
+
+def build_registry_slug_index(registry: MemberRegistry | None) -> dict[str, str]:
+    """Build a slug to member id index for CapitolExposed editorial records."""
+
+    if registry is None:
+        return {}
+    return {
+        str(record.slug): str(record.id)
+        for record in registry.records
+        if record.slug and record.id
+    }
+
+
+def resolve_story_member_ids(
+    member_refs: Any,
+    registry: MemberRegistry | None = None,
+) -> tuple[list[str], list[str]]:
+    """Resolve editorial member refs into member ids and slugs when available."""
+
+    if not isinstance(member_refs, list):
+        return [], []
+    slug_index = build_registry_slug_index(registry)
+    member_ids: list[str] = []
+    member_slugs: list[str] = []
+    seen_ids: set[str] = set()
+    seen_slugs: set[str] = set()
+    for item in member_refs:
+        if not isinstance(item, dict):
+            continue
+        slug = str(item.get("slug") or "").strip()
+        if slug and slug not in seen_slugs:
+            seen_slugs.add(slug)
+            member_slugs.append(slug)
+        member_id = slug_index.get(slug) if slug else None
+        if not member_id:
+            name = str(item.get("name") or "").strip()
+            if registry and name:
+                resolved = registry.resolve(name=name)
+                member_id = resolved.id if resolved and resolved.id else None
+        if member_id and member_id not in seen_ids:
+            seen_ids.add(member_id)
+            member_ids.append(member_id)
+    return member_ids, member_slugs
+
+
+def build_news_post_search_document(
+    row: dict[str, Any],
+    *,
+    base_url: str,
+    registry: MemberRegistry | None = None,
+) -> SearchDocumentRecord:
+    """Build a searchable record from a published CapitolExposed story."""
+
+    member_ids, member_slugs = resolve_story_member_ids(row.get("member_refs"), registry)
+    title = str(row.get("title") or "").strip()
+    subtitle = str(row.get("subtitle") or "").strip()
+    excerpt = str(row.get("excerpt") or "").strip()
+    body = str(row.get("body") or "").strip()
+    author = str(row.get("author") or "").strip()
+    category = str(row.get("category") or "").strip() or "general"
+    tags = [
+        "capitol-exposed",
+        "published-story",
+        "newsroom",
+        category,
+        *[
+            str(tag).strip()
+            for tag in (row.get("tags") or [])
+            if str(tag).strip()
+        ],
+    ]
+    source_url = f"{base_url.rstrip('/')}/news/{row.get('slug')}"
+    content_lines = [
+        subtitle,
+        excerpt,
+        body,
+    ]
+    document = Document(
+        id=f"capitol-story-{row.get('slug')}",
+        title=title,
+        date=normalize_document_date(row.get("published_at") or row.get("updated_at")),
+        source="capitol-exposed",
+        category="newsroom",
+        summary=excerpt or subtitle or None,
+        memberIds=member_ids,
+        tags=list(dict.fromkeys([tag for tag in tags if tag])),
+        sourceUrl=source_url,
+        archiveUrl=source_url,
+        ocrText="\n\n".join(line for line in content_lines if line),
+        verificationStatus="verified",
+    )
+    evidence_items = row.get("evidence") if isinstance(row.get("evidence"), list) else []
+    return build_search_document(
+        document,
+        content=document.ocrText or "",
+        metadata={
+            "slug": row.get("slug"),
+            "author": author or None,
+            "storyCategory": category,
+            "memberSlugs": member_slugs,
+            "readingTime": row.get("reading_time"),
+            "wordCount": row.get("word_count"),
+            "publishedAt": str(row.get("published_at") or "") or None,
+            "updatedAt": str(row.get("updated_at") or "") or None,
+            "evidenceCount": len(evidence_items),
+        },
+    )
+
+
+def build_dossier_search_document(
+    row: dict[str, Any],
+    *,
+    base_url: str,
+) -> SearchDocumentRecord:
+    """Build a searchable record from a published CapitolExposed dossier."""
+
+    slug = str(row.get("slug") or "").strip()
+    summary = str(row.get("summary") or "").strip()
+    executive_summary = str(row.get("executive_summary") or "").strip()
+    methodology = str(row.get("methodology") or "").strip()
+    findings = row.get("findings") if isinstance(row.get("findings"), list) else []
+    finding_lines: list[str] = []
+    finding_categories: list[str] = []
+    for finding in findings:
+        if not isinstance(finding, dict):
+            continue
+        category = str(finding.get("category") or "").strip()
+        title = str(finding.get("title") or "").strip()
+        narrative = str(finding.get("narrative") or "").strip()
+        if category:
+            finding_categories.append(category)
+        if title:
+            finding_lines.append(title)
+        if narrative:
+            finding_lines.append(narrative)
+    content_lines = [summary, executive_summary, methodology, *finding_lines]
+    severity = str(row.get("severity") or "").strip() or "unknown"
+    verification_status = str(row.get("verification_status") or "").strip() or "unverified"
+    source_url = f"{base_url.rstrip('/')}/dossier/{slug}"
+    document = Document(
+        id=f"capitol-dossier-{slug}",
+        title=str(row.get("title") or "").strip(),
+        date=normalize_document_date(
+            row.get("updated_at") or row.get("generated_at") or row.get("reviewed_at")
+        ),
+        source="capitol-exposed",
+        category="newsroom",
+        summary=summary or executive_summary or None,
+        memberIds=[str(row.get("member_id"))] if row.get("member_id") else [],
+        tags=list(
+            dict.fromkeys(
+                [
+                    "capitol-exposed",
+                    "dossier",
+                    "investigation",
+                    severity,
+                    verification_status,
+                    *[category for category in finding_categories if category],
+                ]
+            )
+        ),
+        sourceUrl=source_url,
+        archiveUrl=source_url,
+        ocrText="\n\n".join(line for line in content_lines if line),
+        verificationStatus="unverified",
+    )
+    return build_search_document(
+        document,
+        content=document.ocrText or "",
+        metadata={
+            "slug": slug,
+            "memberId": row.get("member_id"),
+            "severity": severity,
+            "verificationStatus": verification_status,
+            "findingCount": row.get("finding_count"),
+            "generatedAt": str(row.get("generated_at") or "") or None,
+            "reviewedAt": str(row.get("reviewed_at") or "") or None,
+            "updatedAt": str(row.get("updated_at") or "") or None,
+            "findingTitles": [
+                str(finding.get("title") or "").strip()
+                for finding in findings
+                if isinstance(finding, dict) and str(finding.get("title") or "").strip()
+            ],
         },
     )

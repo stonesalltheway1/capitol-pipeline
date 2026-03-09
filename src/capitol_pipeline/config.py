@@ -111,7 +111,12 @@ class Settings(BaseSettings):
         "https://offshoreleaks-data.icij.org/offshoreleaks/csv/full-oldb.LATEST.zip"
     )
     fara_base_url: str = "https://efile.fara.gov/api/v1"
+    fara_bulk_registrants_zip_url: str = "https://efile.fara.gov/bulk/zip/FARA_All_Registrants.csv.zip"
+    fara_bulk_foreign_principals_zip_url: str = "https://efile.fara.gov/bulk/zip/FARA_All_ForeignPrincipals.csv.zip"
+    fara_bulk_short_forms_zip_url: str = "https://efile.fara.gov/bulk/zip/FARA_All_ShortForms.csv.zip"
+    fara_bulk_documents_zip_url: str = "https://efile.fara.gov/bulk/zip/FARA_All_RegistrantDocs.csv.zip"
     fara_request_interval_seconds: float = 2.05
+    site_base_url: str = "https://www.capitolexposed.com"
 
     # ── Document classifier settings ─────────────────────────────────────
     classifier_model: str = "facebook/bart-large-mnli"
