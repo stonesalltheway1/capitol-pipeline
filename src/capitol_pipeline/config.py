@@ -126,13 +126,15 @@ class Settings(BaseSettings):
     def resolved_neon_database_url(self) -> str | None:
         """Return the configured Neon URL, falling back to DATABASE_URL for local retrofit work."""
 
-        return self.neon_database_url or os.getenv("DATABASE_URL")
+        value = self.neon_database_url or os.getenv("DATABASE_URL")
+        return value.strip() if value else None
 
     @property
     def resolved_openai_api_key(self) -> str | None:
         """Return the configured OpenAI key, falling back to OPENAI_API_KEY for local reuse."""
 
-        return self.openai_api_key or os.getenv("OPENAI_API_KEY")
+        value = self.openai_api_key or os.getenv("OPENAI_API_KEY")
+        return value.strip() if value else None
 
     def ensure_dirs(self) -> None:
         """Create data, output, and cache directories if they don't exist."""
