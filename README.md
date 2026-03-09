@@ -13,6 +13,7 @@ PTR filings and asset normalization.
 - Capitol-specific package and settings
 - House Clerk XML source adapter
 - Senate watcher source adapter
+- House PTR parser for text and PDF-backed filings
 - Crypto asset classifier for direct coins, ETFs and trusts, and adjacent equities
 - Bridge helpers that emit shapes compatible with CapitolExposed database tables
 
@@ -29,6 +30,9 @@ logic currently lives inside the web app. This repo is the path to:
 ## Commands
 
 ```bash
+# Install in editable mode for local development
+pip install -e .
+
 # Inspect the House annual disclosure feed
 capitol-pipeline house-feed --year 2026
 
@@ -40,6 +44,17 @@ capitol-pipeline classify-crypto --ticker IBIT --description "iShares Bitcoin Tr
 
 # OCR a single PDF through the fallback chain
 capitol-pipeline ocr ./sample.pdf
+
+# OCR and parse a House PTR PDF into structured trade rows
+capitol-pipeline parse-house-ptr ./sample.pdf \
+  --doc-id 20033783 \
+  --filing-year 2026 \
+  --filing-date 2026-01-15 \
+  --member-name "Roger Williams" \
+  --member-slug "roger-williams" \
+  --member-id "m-20033783" \
+  --party R \
+  --state TX
 ```
 
 ## Retrofit Priorities

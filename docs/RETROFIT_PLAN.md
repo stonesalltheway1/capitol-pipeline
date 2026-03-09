@@ -28,6 +28,10 @@ exporters.
 ### Capitol-specific models
 - `src/capitol_pipeline/models/congress.py`
 
+### House PTR parsing
+- `src/capitol_pipeline/parsers/house_ptr.py`
+- `tests/test_house_ptr_parser.py`
+
 ### Crypto normalization
 - `src/capitol_pipeline/normalizers/crypto_assets.py`
 
@@ -46,6 +50,7 @@ CapitolExposed currently has two weak spots that this pipeline should replace:
 - Run House Clerk XML polling in this pipeline
 - Use OCR fallback chain for live House PTR PDFs
 - Emit normalized filing stubs and parsed rows
+- Regression-test the parser against real House PTR text shapes
 
 ### Phase 2
 - Add Capitol member resolution using the site member registry
@@ -67,6 +72,6 @@ CapitolExposed currently has two weak spots that this pipeline should replace:
 ## Immediate Next Steps
 
 1. Connect this package to the CapitolExposed members registry.
-2. Add House PTR PDF extraction fixtures from recent failing docs.
-3. Add a Neon exporter tailored to CapitolExposed table names.
-4. Wire the crypto asset map into site queries so `/crypto` stops showing zero.
+2. Add a Neon exporter tailored to CapitolExposed table names.
+3. Port the remaining House PTR edge-case handling out of the app layer.
+4. Add end-to-end fixture tests from recent filings that previously failed in production.

@@ -384,14 +384,32 @@ def _get_backend(name: str) -> OcrBackendBase:
 # ---------------------------------------------------------------------------
 
 
-def _process_single_ocr(args: tuple[str, str, str, float, list[str]]) -> ProcessingResult:
+def _process_single_ocr(
+    args: tuple[str, str, str, float, list[str], str, str],
+) -> ProcessingResult:
     """Process a single PDF file for OCR.
 
     This is a module-level function so it can be pickled for use with
     ProcessPoolExecutor.  Accepts a tuple of:
-        (file_path, backend, spacy_model, confidence_threshold, fallback_chain)
+        (
+            file_path,
+            backend,
+            spacy_model,
+            confidence_threshold,
+            fallback_chain,
+            default_source,
+            default_category,
+        )
     """
-    file_path_str, backend, _, confidence_threshold, fallback_chain = args
+    (
+        file_path_str,
+        backend,
+        _,
+        confidence_threshold,
+        fallback_chain,
+        default_source,
+        default_category,
+    ) = args
     path = Path(file_path_str)
     start_ms = time.monotonic_ns() // 1_000_000
     errors: list[str] = []
@@ -459,8 +477,8 @@ def _process_single_ocr(args: tuple[str, str, str, float, list[str]]) -> Process
         Document(
             id=doc_id,
             title=path.stem.replace("_", " ").replace("-", " ").strip(),
-            source=settings.ocr_default_source,
-            category=settings.ocr_default_category,
+            source=default_source,
+            category=default_category,
             ocrText=md_text or None,
             tags=["ocr"],
         )
@@ -522,6 +540,8 @@ class OcrProcessor:
                 self.config.spacy_model,
                 self.confidence_threshold,
                 self.fallback_chain,
+                self.config.ocr_default_source,
+                self.config.ocr_default_category,
             )
         )
 
@@ -583,6 +603,8 @@ class OcrProcessor:
                 self.config.spacy_model,
                 self.confidence_threshold,
                 self.fallback_chain,
+                self.config.ocr_default_source,
+                self.config.ocr_default_category,
             )
             for p, _ in to_process
         ]

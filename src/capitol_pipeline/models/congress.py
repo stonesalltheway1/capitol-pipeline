@@ -62,6 +62,32 @@ class FilingStub(BaseModel):
     raw_state_district: str | None = None
 
 
+class HousePtrTransaction(BaseModel):
+    """A single normalized transaction parsed from a House PTR filing."""
+
+    line_number: int
+    asset_description: str
+    ticker: str | None = None
+    asset_type: str
+    transaction_type: Literal["purchase", "sale", "exchange"]
+    transaction_date: str | None = None
+    notification_date: str | None = None
+    amount_min: int = 0
+    amount_max: int = 0
+    owner: Literal["self", "spouse", "joint", "child"] = "self"
+
+
+class HousePtrParseResult(BaseModel):
+    """Structured output from a parsed House PTR text block or PDF."""
+
+    doc_id: str | None = None
+    member_name: str | None = None
+    state: str | None = None
+    parser_confidence: float = 0.0
+    raw_text_preview: str | None = None
+    transactions: list[HousePtrTransaction] = Field(default_factory=list)
+
+
 class NormalizedAsset(BaseModel):
     """Canonical asset classification emitted by the Capitol pipeline."""
 
