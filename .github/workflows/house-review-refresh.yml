@@ -1,18 +1,18 @@
-name: Filings Refresh
+name: House Review Refresh
 
 on:
   workflow_dispatch:
   schedule:
-    - cron: "*/15 * * * *"
+    - cron: "17 */6 * * *"
 
 concurrency:
-  group: filings-refresh
+  group: house-review-refresh
   cancel-in-progress: false
 
 jobs:
-  ingest:
+  review:
     runs-on: ubuntu-latest
-    timeout-minutes: 25
+    timeout-minutes: 30
     env:
       DATABASE_URL: ${{ secrets.DATABASE_URL }}
       OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
@@ -31,41 +31,23 @@ jobs:
       - name: Install pipeline
         run: |
           python -m pip install --upgrade pip
-          python -m pip install -e ".[neon,pymupdf]"
+          python -m pip install -e ".[neon,pymupdf,ocr]"
 
-      - name: Run House ingest
+      - name: Reprocess House review queue
         run: |
-          HOUSE_YEAR="$(date -u +%Y)"
-          python -u -m capitol_pipeline house-ingest \
-            --year "$HOUSE_YEAR" \
-            --batch-size 25 \
-            --max-batches 6 \
+          python -u -m capitol_pipeline process-house-review \
+            --limit 4 \
+            --ocr-backend docling \
             --with-search-index \
             --no-embeddings
 
-      - name: Run Senate ingest
-        run: |
-          python -u -m capitol_pipeline senate-ingest \
-            --with-search-index \
-            --no-embeddings
-
-      - name: Embed freshest House chunks
+      - name: Embed refreshed House review chunks
         if: env.OPENAI_API_KEY != ''
         env:
           CAPITOL_EMBEDDING_PROVIDER: openai
         run: |
           python -u -m capitol_pipeline embed-search-corpus \
             --source house-clerk \
-            --batch-size 50 \
-            --max-batches 1
-
-      - name: Embed freshest Senate chunks
-        if: env.OPENAI_API_KEY != ''
-        env:
-          CAPITOL_EMBEDDING_PROVIDER: openai
-        run: |
-          python -u -m capitol_pipeline embed-search-corpus \
-            --source senate-watcher \
             --batch-size 50 \
             --max-batches 1
 

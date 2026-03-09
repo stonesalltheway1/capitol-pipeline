@@ -891,22 +891,34 @@ def fetch_house_stub_queue(
     settings: Settings,
     *,
     limit: int = 10,
+    include_needs_review: bool = False,
+    only_needs_review: bool = False,
 ) -> list[dict[str, object]]:
     """Load queued House filing stubs that are ready for extraction or retry."""
+
+    if only_needs_review:
+        status_clause = "status = 'needs_review'"
+    elif include_needs_review:
+        status_clause = "status IN ('pending_extraction', 'extracting', 'needs_review')"
+    else:
+        status_clause = "status IN ('pending_extraction', 'extracting')"
 
     with neon_connection(settings) as connection:
         with connection.cursor() as cursor:
             cursor.execute(
-                """
+                f"""
                 SELECT doc_id, filing_year, source, source_url, status, extracted_trade_id, metadata,
                        detected_at, last_seen_at
                 FROM house_filing_stubs
-                WHERE status IN ('pending_extraction', 'extracting')
+                WHERE {status_clause}
                   AND COALESCE(NULLIF(metadata->>'retryAfter', '')::timestamptz, NOW() - INTERVAL '1 second') <= NOW()
+                  AND (
+                        status <> 'pending_extraction'
+                        OR COALESCE(metadata->>'lastError', '') NOT ILIKE 'PTR PDF fetch failed with 404%%'
+                  )
                 ORDER BY
                     CASE
                         WHEN status = 'pending_extraction'
-                          AND COALESCE(metadata->>'lastError', '') NOT ILIKE 'PTR PDF fetch failed with 404%%'
                           THEN 0
                         WHEN status = 'extracting' THEN 1
                         WHEN status = 'needs_review' THEN 2

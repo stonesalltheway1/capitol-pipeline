@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 import hashlib
 import json
 from pathlib import Path
@@ -179,6 +179,13 @@ def build_retry_after_iso(error: Exception, attempts: int) -> str:
     ).isoformat()
 
 
+def build_review_retry_after_iso(hours: int) -> str:
+    """Return the next review retry time for a hard-to-parse House PTR."""
+
+    delay_hours = max(1, hours)
+    return (datetime.now(timezone.utc) + timedelta(hours=delay_hours)).isoformat()
+
+
 def download_house_pdf(stub: FilingStub, settings: Settings, destination: Path) -> None:
     """Download a House PTR PDF to a local temporary file."""
 
@@ -348,6 +355,7 @@ def process_house_queue_rows(
     ocr_backend: str,
     with_search_index: bool = False,
     with_embeddings: bool = False,
+    review_retry_hours: int = 12,
 ) -> dict[str, object]:
     """Process a batch of queued House PTR stubs from Neon."""
 
@@ -365,21 +373,31 @@ def process_house_queue_rows(
 
     for row in queue_rows:
         stub = build_stub_from_queue_row(row)
+        current_status = str(row.get("status") or "")
         metadata = row.get("metadata") or {}
         if not isinstance(metadata, dict):
             metadata = {}
         attempts = int(metadata.get("extractionAttempts") or 0) + 1
+        metadata_updates: dict[str, object] = {
+            **metadata,
+            "extractionStartedAt": now_iso(),
+            "extractionAttempts": attempts,
+            "retryAfter": None,
+        }
+        if current_status == "needs_review":
+            metadata_updates.update(
+                {
+                    "reviewLastAttemptAt": now_iso(),
+                    "reviewLastBackend": ocr_backend,
+                    "reviewAttempts": int(metadata.get("reviewAttempts") or 0) + 1,
+                }
+            )
         update_house_stub_state(
             settings,
             doc_id=stub.doc_id,
             status="extracting",
             extracted_trade_id=None,
-            metadata_updates={
-                **metadata,
-                "extractionStartedAt": now_iso(),
-                "extractionAttempts": attempts,
-                "retryAfter": None,
-            },
+            metadata_updates=metadata_updates,
         )
 
         try:
@@ -388,8 +406,38 @@ def process_house_queue_rows(
             status = str(upsert_summary["stubStatus"])
             if status == "parsed":
                 summary["parsed"] += 1
+                if current_status == "needs_review":
+                    update_house_stub_state(
+                        settings,
+                        doc_id=stub.doc_id,
+                        status="parsed",
+                        extracted_trade_id=None,
+                        metadata_updates={
+                            "retryAfter": None,
+                            "reviewResolvedAt": now_iso(),
+                            "reviewLastBackend": ocr_backend,
+                        },
+                    )
             else:
                 summary["needsReview"] += 1
+                review_updates: dict[str, object] = {
+                    "retryAfter": build_review_retry_after_iso(review_retry_hours),
+                    "needsReviewAt": now_iso(),
+                }
+                if current_status == "needs_review":
+                    review_updates.update(
+                        {
+                            "reviewLastBackend": ocr_backend,
+                            "reviewLastAttemptAt": now_iso(),
+                        }
+                    )
+                update_house_stub_state(
+                    settings,
+                    doc_id=stub.doc_id,
+                    status="needs_review",
+                    extracted_trade_id=None,
+                    metadata_updates=review_updates,
+                )
             trade_rows = int((upsert_summary.get("trades") or {}).get("upserted", 0))  # type: ignore[union-attr]
             summary["tradeRowsUpserted"] += trade_rows
 
@@ -419,17 +467,32 @@ def process_house_queue_rows(
             summary["processed"].append(processed_item)
         except Exception as error:  # pragma: no cover - depends on live upstream PDFs
             retryable = is_retryable_house_error(error)
+            failed_status = "pending_extraction" if retryable else "needs_review"
+            failure_updates: dict[str, object] = {
+                **metadata,
+                "failedAt": now_iso(),
+                "lastError": str(error)[:500],
+                "retryAfter": (
+                    build_retry_after_iso(error, attempts)
+                    if retryable
+                    else build_review_retry_after_iso(review_retry_hours)
+                ),
+            }
+            if not retryable:
+                failure_updates["needsReviewAt"] = now_iso()
+                if current_status == "needs_review":
+                    failure_updates.update(
+                        {
+                            "reviewLastBackend": ocr_backend,
+                            "reviewLastAttemptAt": now_iso(),
+                        }
+                    )
             update_house_stub_state(
                 settings,
                 doc_id=stub.doc_id,
-                status="pending_extraction" if retryable else "needs_review",
+                status=failed_status,
                 extracted_trade_id=None,
-                metadata_updates={
-                    **metadata,
-                    "failedAt": now_iso(),
-                    "lastError": str(error)[:500],
-                    "retryAfter": build_retry_after_iso(error, attempts) if retryable else None,
-                },
+                metadata_updates=failure_updates,
             )
             if retryable:
                 summary["deferred"] += 1
@@ -1567,6 +1630,10 @@ def embed_search_corpus_command(
 @cli.command("process-house-backlog")
 @click.option("--limit", type=int, default=5, show_default=True)
 @click.option("--export-registry/--no-export-registry", default=True, show_default=True)
+@click.option("--with-search-index/--no-search-index", default=False, show_default=True)
+@click.option("--with-embeddings/--no-embeddings", default=False, show_default=True)
+@click.option("--include-needs-review/--queued-only", default=False, show_default=True)
+@click.option("--review-retry-hours", type=int, default=12, show_default=True)
 @click.option(
     "--ocr-backend",
     type=click.Choice([choice.value for choice in OcrBackend]),
@@ -1576,18 +1643,70 @@ def embed_search_corpus_command(
 def process_house_backlog_command(
     limit: int,
     export_registry: bool,
+    with_search_index: bool,
+    with_embeddings: bool,
+    include_needs_review: bool,
+    review_retry_hours: int,
     ocr_backend: str,
 ) -> None:
     """Process queued House PTR stubs from Neon in batch order."""
 
     settings = Settings()
     load_registry_if_available(settings, export_cache=export_registry)
-    queue_rows = fetch_house_stub_queue(settings, limit=limit)
+    queue_rows = fetch_house_stub_queue(
+        settings,
+        limit=limit,
+        include_needs_review=include_needs_review,
+    )
     summary = process_house_queue_rows(
         settings,
         queue_rows,
         ocr_backend=ocr_backend,
+        with_search_index=with_search_index,
+        with_embeddings=with_embeddings,
+        review_retry_hours=review_retry_hours,
     )
+    click.echo(json.dumps(summary, indent=2))
+
+
+@cli.command("process-house-review")
+@click.option("--limit", type=int, default=2, show_default=True)
+@click.option("--export-registry/--no-export-registry", default=True, show_default=True)
+@click.option("--with-search-index/--no-search-index", default=True, show_default=True)
+@click.option("--with-embeddings/--no-embeddings", default=False, show_default=True)
+@click.option("--review-retry-hours", type=int, default=12, show_default=True)
+@click.option(
+    "--ocr-backend",
+    type=click.Choice([choice.value for choice in OcrBackend]),
+    default=OcrBackend.DOCLING.value,
+    show_default=True,
+)
+def process_house_review_command(
+    limit: int,
+    export_registry: bool,
+    with_search_index: bool,
+    with_embeddings: bool,
+    review_retry_hours: int,
+    ocr_backend: str,
+) -> None:
+    """Reprocess the House PTR review queue with an alternate OCR backend."""
+
+    settings = Settings()
+    load_registry_if_available(settings, export_cache=export_registry)
+    queue_rows = fetch_house_stub_queue(
+        settings,
+        limit=limit,
+        only_needs_review=True,
+    )
+    summary = process_house_queue_rows(
+        settings,
+        queue_rows,
+        ocr_backend=ocr_backend,
+        with_search_index=with_search_index,
+        with_embeddings=with_embeddings,
+        review_retry_hours=review_retry_hours,
+    )
+    summary["mode"] = "needs_review"
     click.echo(json.dumps(summary, indent=2))
 
 
@@ -1599,6 +1718,8 @@ def process_house_backlog_command(
 @click.option("--export-registry/--no-export-registry", default=True, show_default=True)
 @click.option("--with-search-index/--no-search-index", default=True, show_default=True)
 @click.option("--with-embeddings/--no-embeddings", default=False, show_default=True)
+@click.option("--include-needs-review/--fresh-only", default=False, show_default=True)
+@click.option("--review-retry-hours", type=int, default=12, show_default=True)
 @click.option(
     "--ocr-backend",
     type=click.Choice([choice.value for choice in OcrBackend]),
@@ -1613,6 +1734,8 @@ def house_ingest_command(
     export_registry: bool,
     with_search_index: bool,
     with_embeddings: bool,
+    include_needs_review: bool,
+    review_retry_hours: int,
     ocr_backend: str,
 ) -> None:
     """Run the end-to-end House feed sync and backlog processing cycle."""
@@ -1653,7 +1776,11 @@ def house_ingest_command(
     while True:
         if max_batches > 0 and batch_number >= max_batches:
             break
-        queue_rows = fetch_house_stub_queue(settings, limit=batch_size)
+        queue_rows = fetch_house_stub_queue(
+            settings,
+            limit=batch_size,
+            include_needs_review=include_needs_review,
+        )
         if not queue_rows:
             break
         batch_number += 1
@@ -1663,6 +1790,7 @@ def house_ingest_command(
             ocr_backend=ocr_backend,
             with_search_index=with_search_index,
             with_embeddings=with_embeddings,
+            review_retry_hours=review_retry_hours,
         )
         total_summary["batches"].append(batch_summary)  # type: ignore[union-attr]
         totals = total_summary["totals"]  # type: ignore[assignment]
