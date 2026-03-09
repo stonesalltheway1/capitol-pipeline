@@ -68,6 +68,9 @@ capitol-pipeline process-house-doc \
   --year 2026 \
   --doc-id 20033783 \
   --upsert
+
+# Process a batch of queued House PTR stubs directly from CapitolExposed
+capitol-pipeline process-house-backlog --limit 10
 ```
 
 ## Retrofit Priorities

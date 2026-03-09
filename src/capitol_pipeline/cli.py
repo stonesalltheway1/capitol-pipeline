@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from datetime import datetime, timezone
 import json
 from pathlib import Path
 from tempfile import TemporaryDirectory
@@ -11,12 +12,14 @@ import httpx
 
 from capitol_pipeline.config import OcrBackend, Settings
 from capitol_pipeline.exporters.neon import (
+    fetch_house_stub_queue,
     load_member_registry_from_neon,
     mark_house_stub_processed,
     sync_house_stubs_to_neon,
+    update_house_stub_state,
     upsert_trade_rows_to_neon,
 )
-from capitol_pipeline.models.congress import FilingStub, MemberMatch
+from capitol_pipeline.models.congress import FilingStub, HousePtrParseResult, MemberMatch, NormalizedTradeRow
 from capitol_pipeline.normalizers.crypto_assets import classify_crypto_asset
 from capitol_pipeline.parsers.house_ptr import parse_house_ptr_pdf
 from capitol_pipeline.processors.ocr import OcrProcessor
@@ -42,6 +45,135 @@ def load_registry_if_available(
     if settings.members_registry_path.exists():
         return load_member_registry_from_json(settings.members_registry_path)
     return None
+
+
+def now_iso() -> str:
+    """Return the current UTC timestamp in ISO format."""
+
+    return datetime.now(timezone.utc).isoformat()
+
+
+def is_retryable_house_error(error: Exception) -> bool:
+    """Return whether a House PTR processing error should be retried."""
+
+    message = str(error)
+    retryable_patterns = (
+        "PTR PDF fetch failed with 404",
+        "timeout",
+        "timed out",
+        "connection reset",
+        "temporarily unavailable",
+    )
+    return any(pattern.lower() in message.lower() for pattern in retryable_patterns)
+
+
+def build_retry_after_iso(error: Exception, attempts: int) -> str:
+    """Return the next retry time for a transient House PTR failure."""
+
+    base_minutes = 15 if "404" in str(error) else 10
+    delay_minutes = min(base_minutes * max(1, attempts), 360)
+    return datetime.fromtimestamp(
+        datetime.now(timezone.utc).timestamp() + (delay_minutes * 60),
+        tz=timezone.utc,
+    ).isoformat()
+
+
+def download_house_pdf(stub: FilingStub, settings: Settings, destination: Path) -> None:
+    """Download a House PTR PDF to a local temporary file."""
+
+    with httpx.Client(
+        headers={"User-Agent": settings.user_agent},
+        follow_redirects=True,
+        timeout=30.0,
+    ) as client:
+        response = client.get(stub.source_url)
+        response.raise_for_status()
+    destination.write_bytes(response.content)
+
+
+def parse_live_house_stub(
+    stub: FilingStub,
+    settings: Settings,
+    ocr_backend: str,
+) -> tuple[HousePtrParseResult, list[NormalizedTradeRow]]:
+    """Download and parse a live House PTR filing."""
+
+    with TemporaryDirectory(prefix="capitol-ptr-") as temp_dir:
+        pdf_path = Path(temp_dir) / f"{stub.doc_id}.pdf"
+        download_house_pdf(stub, settings, pdf_path)
+        return parse_house_ptr_pdf(
+            pdf_path,
+            stub=stub,
+            settings=settings,
+            backend=ocr_backend,
+        )
+
+
+def persist_parsed_house_stub(
+    settings: Settings,
+    stub: FilingStub,
+    parsed: HousePtrParseResult,
+    trades: list[NormalizedTradeRow],
+) -> dict[str, object]:
+    """Write a parsed House PTR result back into CapitolExposed."""
+
+    sync_house_stubs_to_neon(settings, [stub])
+    trade_summary = upsert_trade_rows_to_neon(settings, trades)
+    status = "parsed" if trades and stub.member.id and parsed.parser_confidence >= 0.6 else "needs_review"
+    mark_house_stub_processed(
+        settings,
+        stub,
+        status=status,
+        parser_confidence=parsed.parser_confidence,
+        parsed_transaction_count=len(parsed.transactions),
+        extracted_trade_id=trade_summary["trade_ids"][0] if trade_summary.get("trade_ids") else None,
+        last_error=(
+            None
+            if parsed.transactions
+            else "PTR text extracted but transactions need manual review"
+        ),
+        raw_text_preview=parsed.raw_text_preview,
+        parsed_transactions=[transaction.model_dump() for transaction in parsed.transactions],
+    )
+    return {
+        "stubs": {"upserted": 1},
+        "trades": trade_summary,
+        "stubStatus": status,
+    }
+
+
+def build_stub_from_queue_row(row: dict[str, object]) -> FilingStub:
+    """Hydrate a FilingStub from a house_filing_stubs database row."""
+
+    metadata = row.get("metadata") or {}
+    if not isinstance(metadata, dict):
+        metadata = {}
+
+    first_name = str(metadata.get("firstName") or "").strip() or None
+    last_name = str(metadata.get("lastName") or "").strip() or None
+    member_name = str(metadata.get("memberName") or "").strip() or " ".join(
+        part for part in [first_name, last_name] if part
+    ).strip()
+
+    return FilingStub(
+        doc_id=str(row.get("doc_id") or ""),
+        filing_year=int(row.get("filing_year") or 0),
+        filing_type=str(metadata.get("filingType") or "PTR"),
+        filing_date=str(metadata.get("filingDate") or "").strip() or None,
+        first_name=first_name,
+        last_name=last_name,
+        member=MemberMatch(
+            id=str(metadata.get("memberId") or "").strip() or None,
+            name=member_name or f"House PTR {row.get('doc_id')}",
+            slug=str(metadata.get("memberSlug") or "").strip() or None,
+            party=str(metadata.get("party") or "").strip() or None,
+            state=str(metadata.get("state") or "").strip() or None,
+            district=str(metadata.get("district") or "").strip() or None,
+        ),
+        source=str(row.get("source") or "house-clerk").replace("_", "-"),
+        source_url=str(row.get("source_url") or ""),
+        raw_state_district=str(metadata.get("rawStateDistrict") or "").strip() or None,
+    )
 
 
 @cli.command("house-feed")
@@ -204,29 +336,7 @@ def parse_house_ptr_command(
 
     upsert_summary: dict[str, object] | None = None
     if upsert:
-        sync_house_stubs_to_neon(settings, [stub])
-        trade_summary = upsert_trade_rows_to_neon(settings, trades)
-        status = "parsed" if trades and stub.member.id and parsed.parser_confidence >= 0.6 else "needs_review"
-        mark_house_stub_processed(
-            settings,
-            stub,
-            status=status,
-            parser_confidence=parsed.parser_confidence,
-            parsed_transaction_count=len(parsed.transactions),
-            extracted_trade_id=trade_summary["trade_ids"][0] if trade_summary.get("trade_ids") else None,
-            last_error=(
-                None
-                if parsed.transactions
-                else "PTR text extracted but transactions need manual review"
-            ),
-            raw_text_preview=parsed.raw_text_preview,
-            parsed_transactions=[transaction.model_dump() for transaction in parsed.transactions],
-        )
-        upsert_summary = {
-            "stubs": {"upserted": 1},
-            "trades": trade_summary,
-            "stubStatus": status,
-        }
+        upsert_summary = persist_parsed_house_stub(settings, stub, parsed, trades)
 
     click.echo(
         json.dumps(
@@ -271,48 +381,11 @@ def process_house_doc_command(
     if not stub:
         raise click.ClickException(f"Doc id {doc_id} was not found in the {year} House feed.")
 
-    with TemporaryDirectory(prefix="capitol-ptr-") as temp_dir:
-        pdf_path = Path(temp_dir) / f"{doc_id}.pdf"
-        with httpx.Client(
-            headers={"User-Agent": settings.user_agent},
-            follow_redirects=True,
-            timeout=30.0,
-        ) as client:
-            response = client.get(stub.source_url)
-            response.raise_for_status()
-        pdf_path.write_bytes(response.content)
-        parsed, trades = parse_house_ptr_pdf(
-            pdf_path,
-            stub=stub,
-            settings=settings,
-            backend=ocr_backend,
-        )
+    parsed, trades = parse_live_house_stub(stub, settings, ocr_backend)
 
     upsert_summary: dict[str, object] | None = None
     if upsert:
-        sync_house_stubs_to_neon(settings, [stub])
-        trade_summary = upsert_trade_rows_to_neon(settings, trades)
-        status = "parsed" if trades and stub.member.id and parsed.parser_confidence >= 0.6 else "needs_review"
-        mark_house_stub_processed(
-            settings,
-            stub,
-            status=status,
-            parser_confidence=parsed.parser_confidence,
-            parsed_transaction_count=len(parsed.transactions),
-            extracted_trade_id=trade_summary["trade_ids"][0] if trade_summary.get("trade_ids") else None,
-            last_error=(
-                None
-                if parsed.transactions
-                else "PTR text extracted but transactions need manual review"
-            ),
-            raw_text_preview=parsed.raw_text_preview,
-            parsed_transactions=[transaction.model_dump() for transaction in parsed.transactions],
-        )
-        upsert_summary = {
-            "stubs": {"upserted": 1},
-            "trades": trade_summary,
-            "stubStatus": status,
-        }
+        upsert_summary = persist_parsed_house_stub(settings, stub, parsed, trades)
 
     click.echo(
         json.dumps(
@@ -325,6 +398,102 @@ def process_house_doc_command(
             indent=2,
         )
     )
+
+
+@cli.command("process-house-backlog")
+@click.option("--limit", type=int, default=5, show_default=True)
+@click.option("--export-registry/--no-export-registry", default=True, show_default=True)
+@click.option(
+    "--ocr-backend",
+    type=click.Choice([choice.value for choice in OcrBackend]),
+    default=OcrBackend.AUTO.value,
+    show_default=True,
+)
+def process_house_backlog_command(
+    limit: int,
+    export_registry: bool,
+    ocr_backend: str,
+) -> None:
+    """Process queued House PTR stubs from Neon in batch order."""
+
+    settings = Settings()
+    load_registry_if_available(settings, export_cache=export_registry)
+    queue_rows = fetch_house_stub_queue(settings, limit=limit)
+
+    summary = {
+        "queued": len(queue_rows),
+        "parsed": 0,
+        "needsReview": 0,
+        "deferred": 0,
+        "failed": 0,
+        "tradeRowsUpserted": 0,
+        "processed": [],
+    }
+
+    for row in queue_rows:
+        stub = build_stub_from_queue_row(row)
+        metadata = row.get("metadata") or {}
+        if not isinstance(metadata, dict):
+            metadata = {}
+        attempts = int(metadata.get("extractionAttempts") or 0) + 1
+        update_house_stub_state(
+            settings,
+            doc_id=stub.doc_id,
+            status="extracting",
+            extracted_trade_id=None,
+            metadata_updates={
+                **metadata,
+                "extractionStartedAt": now_iso(),
+                "extractionAttempts": attempts,
+                "retryAfter": None,
+            },
+        )
+
+        try:
+            parsed, trades = parse_live_house_stub(stub, settings, ocr_backend)
+            upsert_summary = persist_parsed_house_stub(settings, stub, parsed, trades)
+            status = str(upsert_summary["stubStatus"])
+            if status == "parsed":
+                summary["parsed"] += 1
+            else:
+                summary["needsReview"] += 1
+            summary["tradeRowsUpserted"] += int(
+                (upsert_summary.get("trades") or {}).get("upserted", 0)  # type: ignore[union-attr]
+            )
+            summary["processed"].append(
+                {
+                    "docId": stub.doc_id,
+                    "status": status,
+                    "tradeRows": (upsert_summary.get("trades") or {}).get("upserted", 0),  # type: ignore[union-attr]
+                }
+            )
+        except Exception as error:  # pragma: no cover - depends on live upstream PDFs
+            retryable = is_retryable_house_error(error)
+            update_house_stub_state(
+                settings,
+                doc_id=stub.doc_id,
+                status="pending_extraction" if retryable else "needs_review",
+                extracted_trade_id=None,
+                metadata_updates={
+                    **metadata,
+                    "failedAt": now_iso(),
+                    "lastError": str(error)[:500],
+                    "retryAfter": build_retry_after_iso(error, attempts) if retryable else None,
+                },
+            )
+            if retryable:
+                summary["deferred"] += 1
+            else:
+                summary["failed"] += 1
+            summary["processed"].append(
+                {
+                    "docId": stub.doc_id,
+                    "status": "deferred" if retryable else "failed",
+                    "error": str(error)[:200],
+                }
+            )
+
+    click.echo(json.dumps(summary, indent=2))
 
 
 if __name__ == "__main__":

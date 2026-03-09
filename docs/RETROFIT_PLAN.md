@@ -36,6 +36,7 @@ exporters.
 - `src/capitol_pipeline/registries/members.py`
 - `src/capitol_pipeline/exporters/neon.py`
 - `tests/test_member_registry.py`
+- Batch backlog runner via `process-house-backlog`
 
 ### Crypto normalization
 - `src/capitol_pipeline/normalizers/crypto_assets.py`

@@ -133,6 +133,39 @@ def sync_house_stubs_to_neon(
     return {"upserted": len(payloads)}
 
 
+def fetch_house_stub_queue(
+    settings: Settings,
+    *,
+    limit: int = 10,
+) -> list[dict[str, object]]:
+    """Load queued House filing stubs that are ready for extraction or retry."""
+
+    with neon_connection(settings) as connection:
+        with connection.cursor() as cursor:
+            cursor.execute(
+                """
+                SELECT doc_id, filing_year, source, source_url, status, extracted_trade_id, metadata,
+                       detected_at, last_seen_at
+                FROM house_filing_stubs
+                WHERE status IN ('pending_extraction', 'extracting', 'needs_review')
+                  AND COALESCE(NULLIF(metadata->>'retryAfter', '')::timestamptz, NOW() - INTERVAL '1 second') <= NOW()
+                ORDER BY
+                    CASE
+                        WHEN status = 'pending_extraction'
+                          AND COALESCE(metadata->>'lastError', '') NOT ILIKE 'PTR PDF fetch failed with 404%%'
+                          THEN 0
+                        WHEN status = 'extracting' THEN 1
+                        WHEN status = 'needs_review' THEN 2
+                        ELSE 3
+                    END,
+                    detected_at DESC
+                LIMIT %s
+                """,
+                (max(1, limit),),
+            )
+            return list(cursor.fetchall())
+
+
 def upsert_trade_rows_to_neon(
     settings: Settings,
     rows: list[NormalizedTradeRow],
@@ -217,6 +250,36 @@ def upsert_trade_rows_to_neon(
     }
 
 
+def update_house_stub_state(
+    settings: Settings,
+    *,
+    doc_id: str,
+    status: str,
+    metadata_updates: dict[str, object],
+    extracted_trade_id: str | None = None,
+) -> None:
+    """Merge metadata into a stub row and update its extraction state."""
+
+    with neon_connection(settings) as connection:
+        with connection.cursor() as cursor:
+            cursor.execute(
+                """
+                UPDATE house_filing_stubs
+                SET status = %s,
+                    extracted_trade_id = %s,
+                    metadata = COALESCE(metadata, '{}'::jsonb) || %s
+                WHERE doc_id = %s
+                """,
+                (
+                    status,
+                    extracted_trade_id,
+                    Jsonb(metadata_updates),  # type: ignore[arg-type]
+                    doc_id,
+                ),
+            )
+        connection.commit()
+
+
 def mark_house_stub_processed(
     settings: Settings,
     stub: FilingStub,
@@ -243,21 +306,10 @@ def mark_house_stub_processed(
         }
     )
 
-    with neon_connection(settings) as connection:
-        with connection.cursor() as cursor:
-            cursor.execute(
-                """
-                UPDATE house_filing_stubs
-                SET status = %s,
-                    extracted_trade_id = %s,
-                    metadata = COALESCE(metadata, '{}'::jsonb) || %s
-                WHERE doc_id = %s
-                """,
-                (
-                    status,
-                    extracted_trade_id,
-                    Jsonb(metadata),  # type: ignore[arg-type]
-                    stub.doc_id,
-                ),
-            )
-        connection.commit()
+    update_house_stub_state(
+        settings,
+        doc_id=stub.doc_id,
+        status=status,
+        extracted_trade_id=extracted_trade_id,
+        metadata_updates=metadata,
+    )
