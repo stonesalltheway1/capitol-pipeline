@@ -2,6 +2,7 @@
 
 from .congress import FilingStub, MemberMatch, NormalizedAsset, NormalizedTradeRow
 from .document import Document, EntityResult, ProcessingResult
+from .search import SearchChunkRecord, SearchDocumentRecord, SearchHit
 
 __all__ = [
     "Document",
@@ -11,4 +12,7 @@ __all__ = [
     "NormalizedAsset",
     "NormalizedTradeRow",
     "ProcessingResult",
+    "SearchChunkRecord",
+    "SearchDocumentRecord",
+    "SearchHit",
 ]

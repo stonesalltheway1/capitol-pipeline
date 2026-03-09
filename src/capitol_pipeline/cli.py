@@ -10,18 +10,25 @@ from tempfile import TemporaryDirectory
 import click
 import httpx
 
+from capitol_pipeline.bridges import build_house_ptr_search_document
 from capitol_pipeline.config import OcrBackend, Settings
 from capitol_pipeline.exporters.neon import (
+    ensure_search_schema,
     fetch_house_stub_queue,
+    hybrid_search,
     load_member_registry_from_neon,
     mark_house_stub_processed,
     sync_house_stubs_to_neon,
     update_house_stub_state,
+    upsert_search_chunks,
+    upsert_search_document,
     upsert_trade_rows_to_neon,
 )
 from capitol_pipeline.models.congress import FilingStub, HousePtrParseResult, MemberMatch, NormalizedTradeRow
 from capitol_pipeline.normalizers.crypto_assets import classify_crypto_asset
 from capitol_pipeline.parsers.house_ptr import parse_house_ptr_pdf
+from capitol_pipeline.processors.chunking import build_search_chunks
+from capitol_pipeline.processors.embeddings import get_embedder
 from capitol_pipeline.processors.ocr import OcrProcessor
 from capitol_pipeline.registries.members import MemberRegistry, load_member_registry_from_json
 from capitol_pipeline.sources.house_clerk import fetch_house_feed
@@ -81,13 +88,21 @@ def build_retry_after_iso(error: Exception, attempts: int) -> str:
 def download_house_pdf(stub: FilingStub, settings: Settings, destination: Path) -> None:
     """Download a House PTR PDF to a local temporary file."""
 
-    with httpx.Client(
-        headers={"User-Agent": settings.user_agent},
-        follow_redirects=True,
-        timeout=30.0,
-    ) as client:
-        response = client.get(stub.source_url)
-        response.raise_for_status()
+    try:
+        with httpx.Client(
+            headers={"User-Agent": settings.user_agent},
+            follow_redirects=True,
+            timeout=30.0,
+        ) as client:
+            response = client.get(stub.source_url)
+            response.raise_for_status()
+    except httpx.HTTPStatusError as error:
+        status_code = error.response.status_code if error.response is not None else "unknown"
+        raise RuntimeError(
+            f"PTR PDF fetch failed with {status_code} for {stub.source_url}"
+        ) from error
+    except httpx.HTTPError as error:
+        raise RuntimeError(f"PTR PDF fetch failed for {stub.source_url}: {error}") from error
     destination.write_bytes(response.content)
 
 
@@ -176,6 +191,136 @@ def build_stub_from_queue_row(row: dict[str, object]) -> FilingStub:
     )
 
 
+def index_search_document(
+    settings: Settings,
+    document,
+    *,
+    with_embeddings: bool,
+) -> dict[str, object]:
+    """Upsert a searchable document and its chunks."""
+
+    ensure_search_schema(settings)
+    chunks = build_search_chunks(document, settings)
+    if with_embeddings and chunks:
+        embedder = get_embedder(settings)
+        embeddings = embedder.embed_texts([chunk.content for chunk in chunks])
+        for chunk, embedding in zip(chunks, embeddings, strict=False):
+            chunk.embedding = embedding or None
+
+    document_summary = upsert_search_document(settings, document)
+    chunk_summary = upsert_search_chunks(settings, chunks)
+    return {
+        "document": document_summary,
+        "chunks": chunk_summary,
+        "embedded": with_embeddings and any(chunk.embedding for chunk in chunks),
+    }
+
+
+def process_house_queue_rows(
+    settings: Settings,
+    queue_rows: list[dict[str, object]],
+    *,
+    ocr_backend: str,
+    with_search_index: bool = False,
+    with_embeddings: bool = False,
+) -> dict[str, object]:
+    """Process a batch of queued House PTR stubs from Neon."""
+
+    summary = {
+        "queued": len(queue_rows),
+        "parsed": 0,
+        "needsReview": 0,
+        "deferred": 0,
+        "failed": 0,
+        "tradeRowsUpserted": 0,
+        "searchDocumentsUpserted": 0,
+        "searchChunksUpserted": 0,
+        "processed": [],
+    }
+
+    for row in queue_rows:
+        stub = build_stub_from_queue_row(row)
+        metadata = row.get("metadata") or {}
+        if not isinstance(metadata, dict):
+            metadata = {}
+        attempts = int(metadata.get("extractionAttempts") or 0) + 1
+        update_house_stub_state(
+            settings,
+            doc_id=stub.doc_id,
+            status="extracting",
+            extracted_trade_id=None,
+            metadata_updates={
+                **metadata,
+                "extractionStartedAt": now_iso(),
+                "extractionAttempts": attempts,
+                "retryAfter": None,
+            },
+        )
+
+        try:
+            parsed, trades = parse_live_house_stub(stub, settings, ocr_backend)
+            upsert_summary = persist_parsed_house_stub(settings, stub, parsed, trades)
+            status = str(upsert_summary["stubStatus"])
+            if status == "parsed":
+                summary["parsed"] += 1
+            else:
+                summary["needsReview"] += 1
+            trade_rows = int((upsert_summary.get("trades") or {}).get("upserted", 0))  # type: ignore[union-attr]
+            summary["tradeRowsUpserted"] += trade_rows
+
+            index_summary: dict[str, object] | None = None
+            if with_search_index:
+                search_document = build_house_ptr_search_document(stub, parsed, trades)
+                index_summary = index_search_document(
+                    settings,
+                    search_document,
+                    with_embeddings=with_embeddings,
+                )
+                summary["searchDocumentsUpserted"] += int(
+                    (index_summary.get("document") or {}).get("upserted", 0)  # type: ignore[union-attr]
+                )
+                summary["searchChunksUpserted"] += int(
+                    (index_summary.get("chunks") or {}).get("upserted", 0)  # type: ignore[union-attr]
+                )
+
+            processed_item = {
+                "docId": stub.doc_id,
+                "status": status,
+                "tradeRows": trade_rows,
+            }
+            if index_summary:
+                processed_item["searchDocumentId"] = (index_summary.get("document") or {}).get("document_id")  # type: ignore[union-attr]
+                processed_item["searchChunks"] = (index_summary.get("chunks") or {}).get("upserted", 0)  # type: ignore[union-attr]
+            summary["processed"].append(processed_item)
+        except Exception as error:  # pragma: no cover - depends on live upstream PDFs
+            retryable = is_retryable_house_error(error)
+            update_house_stub_state(
+                settings,
+                doc_id=stub.doc_id,
+                status="pending_extraction" if retryable else "needs_review",
+                extracted_trade_id=None,
+                metadata_updates={
+                    **metadata,
+                    "failedAt": now_iso(),
+                    "lastError": str(error)[:500],
+                    "retryAfter": build_retry_after_iso(error, attempts) if retryable else None,
+                },
+            )
+            if retryable:
+                summary["deferred"] += 1
+            else:
+                summary["failed"] += 1
+            summary["processed"].append(
+                {
+                    "docId": stub.doc_id,
+                    "status": "deferred" if retryable else "failed",
+                    "error": str(error)[:200],
+                }
+            )
+
+    return summary
+
+
 @cli.command("house-feed")
 @click.option("--year", type=int, required=True, help="Disclosure year, for example 2026.")
 @click.option("--limit", type=int, default=10, show_default=True)
@@ -254,6 +399,15 @@ def classify_crypto(ticker: str | None, description: str | None) -> None:
     """Classify a security as direct crypto, ETF/trust, adjacent equity, or unrelated."""
 
     click.echo(json.dumps(classify_crypto_asset(ticker, description).model_dump(), indent=2))
+
+
+@cli.command("ensure-search-schema")
+def ensure_search_schema_command() -> None:
+    """Create the search tables and indexes used for lexical and vector retrieval."""
+
+    settings = Settings()
+    summary = ensure_search_schema(settings)
+    click.echo(json.dumps(summary, indent=2))
 
 
 @cli.command("ocr")
@@ -400,6 +554,53 @@ def process_house_doc_command(
     )
 
 
+@cli.command("index-house-doc-search")
+@click.option("--year", type=int, required=True, help="Disclosure year, for example 2026.")
+@click.option("--doc-id", type=str, required=True, help="House PTR filing document id.")
+@click.option("--export-registry/--no-export-registry", default=True, show_default=True)
+@click.option("--with-embeddings/--no-embeddings", default=False, show_default=True)
+@click.option(
+    "--ocr-backend",
+    type=click.Choice([choice.value for choice in OcrBackend]),
+    default=OcrBackend.AUTO.value,
+    show_default=True,
+)
+def index_house_doc_search_command(
+    year: int,
+    doc_id: str,
+    export_registry: bool,
+    with_embeddings: bool,
+    ocr_backend: str,
+) -> None:
+    """Index a live House PTR into searchable documents and chunks."""
+
+    settings = Settings()
+    registry = load_registry_if_available(settings, export_cache=export_registry)
+    feed = fetch_house_feed(
+        year,
+        resolver=registry.resolve_feed_member if registry else None,
+        settings=settings,
+    )
+    stub = next((row for row in feed if row.doc_id == doc_id), None)
+    if not stub:
+        raise click.ClickException(f"Doc id {doc_id} was not found in the {year} House feed.")
+
+    parsed, trades = parse_live_house_stub(stub, settings, ocr_backend)
+    search_document = build_house_ptr_search_document(stub, parsed, trades)
+    summary = index_search_document(settings, search_document, with_embeddings=with_embeddings)
+    click.echo(
+        json.dumps(
+            {
+                "stub": stub.model_dump(),
+                "parsedTransactionCount": len(parsed.transactions),
+                "searchDocument": search_document.model_dump(),
+                "indexing": summary,
+            },
+            indent=2,
+        )
+    )
+
+
 @cli.command("process-house-backlog")
 @click.option("--limit", type=int, default=5, show_default=True)
 @click.option("--export-registry/--no-export-registry", default=True, show_default=True)
@@ -419,81 +620,128 @@ def process_house_backlog_command(
     settings = Settings()
     load_registry_if_available(settings, export_cache=export_registry)
     queue_rows = fetch_house_stub_queue(settings, limit=limit)
+    summary = process_house_queue_rows(
+        settings,
+        queue_rows,
+        ocr_backend=ocr_backend,
+    )
+    click.echo(json.dumps(summary, indent=2))
 
-    summary = {
-        "queued": len(queue_rows),
-        "parsed": 0,
-        "needsReview": 0,
-        "deferred": 0,
-        "failed": 0,
-        "tradeRowsUpserted": 0,
-        "processed": [],
+
+@cli.command("house-ingest")
+@click.option("--year", type=int, required=True, help="Disclosure year, for example 2026.")
+@click.option("--sync-limit", type=int, default=0, show_default=True, help="0 means sync all feed rows.")
+@click.option("--batch-size", type=int, default=10, show_default=True)
+@click.option("--max-batches", type=int, default=0, show_default=True, help="0 means run until the queue is drained.")
+@click.option("--export-registry/--no-export-registry", default=True, show_default=True)
+@click.option("--with-search-index/--no-search-index", default=True, show_default=True)
+@click.option("--with-embeddings/--no-embeddings", default=False, show_default=True)
+@click.option(
+    "--ocr-backend",
+    type=click.Choice([choice.value for choice in OcrBackend]),
+    default=OcrBackend.AUTO.value,
+    show_default=True,
+)
+def house_ingest_command(
+    year: int,
+    sync_limit: int,
+    batch_size: int,
+    max_batches: int,
+    export_registry: bool,
+    with_search_index: bool,
+    with_embeddings: bool,
+    ocr_backend: str,
+) -> None:
+    """Run the end-to-end House feed sync and backlog processing cycle."""
+
+    settings = Settings()
+    registry = load_registry_if_available(settings, export_cache=export_registry)
+    feed = fetch_house_feed(
+        year,
+        resolver=registry.resolve_feed_member if registry else None,
+        settings=settings,
+    )
+    if sync_limit > 0:
+        feed = feed[:sync_limit]
+    sync_summary = sync_house_stubs_to_neon(settings, feed)
+
+    if with_search_index:
+        ensure_search_schema(settings)
+
+    total_summary: dict[str, object] = {
+        "year": year,
+        "synced": len(feed),
+        "resolvedMembers": sum(1 for row in feed if row.member.id),
+        "syncSummary": sync_summary,
+        "batches": [],
+        "totals": {
+            "queued": 0,
+            "parsed": 0,
+            "needsReview": 0,
+            "deferred": 0,
+            "failed": 0,
+            "tradeRowsUpserted": 0,
+            "searchDocumentsUpserted": 0,
+            "searchChunksUpserted": 0,
+        },
     }
 
-    for row in queue_rows:
-        stub = build_stub_from_queue_row(row)
-        metadata = row.get("metadata") or {}
-        if not isinstance(metadata, dict):
-            metadata = {}
-        attempts = int(metadata.get("extractionAttempts") or 0) + 1
-        update_house_stub_state(
+    batch_number = 0
+    while True:
+        if max_batches > 0 and batch_number >= max_batches:
+            break
+        queue_rows = fetch_house_stub_queue(settings, limit=batch_size)
+        if not queue_rows:
+            break
+        batch_number += 1
+        batch_summary = process_house_queue_rows(
             settings,
-            doc_id=stub.doc_id,
-            status="extracting",
-            extracted_trade_id=None,
-            metadata_updates={
-                **metadata,
-                "extractionStartedAt": now_iso(),
-                "extractionAttempts": attempts,
-                "retryAfter": None,
-            },
+            queue_rows,
+            ocr_backend=ocr_backend,
+            with_search_index=with_search_index,
+            with_embeddings=with_embeddings,
         )
+        total_summary["batches"].append(batch_summary)  # type: ignore[union-attr]
+        totals = total_summary["totals"]  # type: ignore[assignment]
+        for key in (
+            "queued",
+            "parsed",
+            "needsReview",
+            "deferred",
+            "failed",
+            "tradeRowsUpserted",
+            "searchDocumentsUpserted",
+            "searchChunksUpserted",
+        ):
+            totals[key] = int(totals[key]) + int(batch_summary.get(key, 0))  # type: ignore[index]
+        if len(queue_rows) < batch_size:
+            break
 
-        try:
-            parsed, trades = parse_live_house_stub(stub, settings, ocr_backend)
-            upsert_summary = persist_parsed_house_stub(settings, stub, parsed, trades)
-            status = str(upsert_summary["stubStatus"])
-            if status == "parsed":
-                summary["parsed"] += 1
-            else:
-                summary["needsReview"] += 1
-            summary["tradeRowsUpserted"] += int(
-                (upsert_summary.get("trades") or {}).get("upserted", 0)  # type: ignore[union-attr]
-            )
-            summary["processed"].append(
-                {
-                    "docId": stub.doc_id,
-                    "status": status,
-                    "tradeRows": (upsert_summary.get("trades") or {}).get("upserted", 0),  # type: ignore[union-attr]
-                }
-            )
-        except Exception as error:  # pragma: no cover - depends on live upstream PDFs
-            retryable = is_retryable_house_error(error)
-            update_house_stub_state(
-                settings,
-                doc_id=stub.doc_id,
-                status="pending_extraction" if retryable else "needs_review",
-                extracted_trade_id=None,
-                metadata_updates={
-                    **metadata,
-                    "failedAt": now_iso(),
-                    "lastError": str(error)[:500],
-                    "retryAfter": build_retry_after_iso(error, attempts) if retryable else None,
-                },
-            )
-            if retryable:
-                summary["deferred"] += 1
-            else:
-                summary["failed"] += 1
-            summary["processed"].append(
-                {
-                    "docId": stub.doc_id,
-                    "status": "deferred" if retryable else "failed",
-                    "error": str(error)[:200],
-                }
-            )
+    click.echo(json.dumps(total_summary, indent=2))
 
-    click.echo(json.dumps(summary, indent=2))
+
+@cli.command("hybrid-search")
+@click.option("--query", "query_text", type=str, required=True, help="Search query text.")
+@click.option("--limit", type=int, default=10, show_default=True)
+@click.option("--with-embeddings/--no-embeddings", default=False, show_default=True)
+def hybrid_search_command(
+    query_text: str,
+    limit: int,
+    with_embeddings: bool,
+) -> None:
+    """Run a hybrid lexical and vector search against indexed chunks."""
+
+    settings = Settings()
+    query_embedding = None
+    if with_embeddings:
+        query_embedding = get_embedder(settings).embed_texts([query_text])[0]
+    hits = hybrid_search(
+        settings,
+        query_text=query_text,
+        query_embedding=query_embedding,
+        limit=limit,
+    )
+    click.echo(json.dumps([hit.model_dump() for hit in hits], indent=2))
 
 
 if __name__ == "__main__":

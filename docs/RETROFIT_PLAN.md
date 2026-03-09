@@ -76,12 +76,19 @@ Status: completed locally
 Status: classification completed, site backfill started in CapitolExposed
 
 ### Phase 4
+- Add dedicated pipeline search tables with `tsvector` and optional `pgvector`
+- Index House PTR filings into searchable documents and chunks
+- Add hybrid retrieval commands for lexical search now and semantic search later
+
+Status: completed locally
+
+### Phase 5
 - Replace Senate watcher dependency with official Senate Ethics ingestion where
   feasible
 - Add filings quality scoring and manual-review queue output
 - Add regression tests against real Congress PDF fixtures
 
-### Phase 5
+### Phase 6
 - Replace CapitolExposed's `lib/ptr-extraction.ts` queue worker with a thin
   wrapper that shells into or directly imports this pipeline
 - Move House retry policy and stub status transitions into the pipeline layer
@@ -91,6 +98,8 @@ Status: classification completed, site backfill started in CapitolExposed
 ## Immediate Next Steps
 
 1. Replace the site's current House PTR cron execution path with this package.
-2. Port the remaining House PTR edge-case handling out of the app layer.
-3. Add end-to-end fixture tests from recent filings that previously failed in production.
-4. Extend the same pipeline architecture to official Senate ingestion.
+2. Use `house-ingest` as the default runner for feed sync plus backlog processing.
+3. Port the remaining House PTR edge-case handling out of the app layer.
+4. Backfill indexed search for parsed House PTR documents already in Neon.
+5. Add end-to-end fixture tests from recent filings that previously failed in production.
+6. Extend the same pipeline architecture to official Senate ingestion.

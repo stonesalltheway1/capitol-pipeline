@@ -76,12 +76,17 @@ class Settings(BaseSettings):
     dedup_num_perm: int = 128  # MinHash permutation count
 
     # ── Embedding settings ───────────────────────────────────────────────
+    embedding_provider: Literal["none", "openai"] = "none"
     embedding_model: str = "nomic-ai/nomic-embed-text-v2-moe"
     embedding_dimensions: int = 768  # 768 full, 256 Matryoshka
     embedding_chunk_size: int = 3200  # chars (~800 tokens)
     embedding_chunk_overlap: int = 800  # chars (~200 tokens)
     embedding_batch_size: int | None = None  # None = auto-detect
     embedding_device: str | None = None  # None = auto-detect
+    openai_api_key: str | None = None
+    openai_base_url: str = "https://api.openai.com/v1"
+    openai_embedding_model: str = "text-embedding-3-large"
+    openai_embedding_dimensions: int = 3072
 
     # ── Chunker settings ─────────────────────────────────────────────────
     chunker_mode: Literal["fixed", "semantic"] = "semantic"

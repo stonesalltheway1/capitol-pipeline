@@ -18,6 +18,8 @@ PTR filings and asset normalization.
 - Crypto asset classifier for direct coins, ETFs and trusts, and adjacent equities
 - Bridge helpers that emit shapes compatible with CapitolExposed database tables
 - Neon exporters for member loading, House stub sync, and parsed trade upserts
+- Dedicated pipeline search tables with `tsvector` and optional `pgvector` indexing
+- Hybrid retrieval commands for lexical search now and semantic search when embeddings are enabled
 
 ## Why This Repo Matters
 
@@ -71,14 +73,49 @@ capitol-pipeline process-house-doc \
 
 # Process a batch of queued House PTR stubs directly from CapitolExposed
 capitol-pipeline process-house-backlog --limit 10
+
+# Create the pipeline-managed search schema in Neon
+capitol-pipeline ensure-search-schema
+
+# Index one House PTR into pipeline_search_documents and pipeline_search_chunks
+capitol-pipeline index-house-doc-search --year 2026 --doc-id 20033783
+
+# Search the indexed filing corpus
+capitol-pipeline hybrid-search --query "Roger Williams Chevron"
+
+# Run the full House ingestion loop: sync the feed, process the queue, and
+# optionally index parsed PTRs in one command
+capitol-pipeline house-ingest --year 2026 --batch-size 10 --max-batches 5
 ```
+
+## Search Layer
+
+Capitol Pipeline now manages its own retrieval tables in Neon instead of
+writing into any older app-owned search tables:
+
+- `pipeline_search_documents`
+- `pipeline_search_chunks`
+
+That search layer supports:
+
+1. `tsvector` indexes for exact and lexical retrieval
+2. `pgvector` indexes for semantic retrieval
+3. Hybrid ranking across title, summary, document body, and indexed chunks
+
+Embeddings are optional. The lexical path works immediately. To enable OpenAI
+embeddings, set:
+
+- `CAPITOL_EMBEDDING_PROVIDER=openai`
+- `CAPITOL_OPENAI_API_KEY=...`
+- optionally `CAPITOL_OPENAI_EMBEDDING_MODEL` and `CAPITOL_OPENAI_EMBEDDING_DIMENSIONS`
 
 ## Retrofit Priorities
 
 1. Replace the current House PTR OCR and extraction path in CapitolExposed
 2. Backfill crypto-linked trades already present in the database
 3. Replace the site-side House extraction cron path with this package
-4. Add fixture-driven regression tests from real House and Senate disclosures
+4. Expand indexed search across filings, stories, and official source documents
+5. Add fixture-driven regression tests from real House and Senate disclosures
 
 See [docs/RETROFIT_PLAN.md](docs/RETROFIT_PLAN.md) for the full implementation
 plan.
