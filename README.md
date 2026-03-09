@@ -20,6 +20,7 @@ PTR filings and asset normalization.
 - Neon exporters for member loading, House stub sync, and parsed trade upserts
 - Dedicated pipeline search tables with `tsvector` and optional `pgvector` indexing
 - Hybrid retrieval commands for lexical search now and semantic search when embeddings are enabled
+- ICIJ Offshore Leaks ingestion into dedicated raw corpus tables plus Congress match extraction
 
 ## Why This Repo Matters
 
@@ -89,6 +90,13 @@ capitol-pipeline hybrid-search --query "Roger Williams Chevron"
 # Run the full House ingestion loop: sync the feed, process the queue, and
 # optionally index parsed PTRs in one command
 capitol-pipeline house-ingest --year 2026 --batch-size 10 --max-batches 5
+
+# Create the dedicated Offshore Leaks corpus tables
+capitol-pipeline ensure-offshore-schema
+
+# Ingest the full official ICIJ Offshore Leaks database into raw Neon tables,
+# derive exact Congress matches, and index those matches for retrieval
+capitol-pipeline ingest-offshore-leaks --with-match-index
 ```
 
 ## Search Layer
@@ -111,6 +119,20 @@ embeddings, set:
 - `CAPITOL_EMBEDDING_PROVIDER=openai`
 - `CAPITOL_OPENAI_API_KEY=...`
 - optionally `CAPITOL_OPENAI_EMBEDDING_MODEL` and `CAPITOL_OPENAI_EMBEDDING_DIMENSIONS`
+
+## Offshore Leaks Layer
+
+The best external cross-reference corpus for CapitolExposed is the official
+ICIJ Offshore Leaks structured database. Capitol Pipeline now ingests that
+corpus into dedicated raw tables:
+
+- `pipeline_offshore_nodes`
+- `pipeline_offshore_relationships`
+- `pipeline_offshore_member_matches`
+
+That design keeps the full public corpus available without flooding the main
+site retrieval tables with millions of low-signal rows. Congress-facing search
+documents are only created for matched records.
 
 ## Retrofit Priorities
 

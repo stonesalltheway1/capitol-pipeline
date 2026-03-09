@@ -3,9 +3,11 @@
 from __future__ import annotations
 
 from datetime import datetime, timezone
+import hashlib
 import json
 from pathlib import Path
 from tempfile import TemporaryDirectory
+from typing import Iterable, TypeVar
 
 import click
 import httpx
@@ -13,9 +15,11 @@ import httpx
 from capitol_pipeline.bridges import (
     build_house_ptr_search_document,
     build_house_ptr_search_document_from_stub_row,
+    build_offshore_match_search_document,
 )
 from capitol_pipeline.config import OcrBackend, Settings
 from capitol_pipeline.exporters.neon import (
+    ensure_offshore_schema,
     ensure_search_schema,
     fetch_house_stub_search_backfill,
     fetch_house_stub_queue,
@@ -23,12 +27,16 @@ from capitol_pipeline.exporters.neon import (
     load_member_registry_from_neon,
     mark_house_stub_processed,
     sync_house_stubs_to_neon,
+    upsert_offshore_member_matches,
+    upsert_offshore_nodes,
+    upsert_offshore_relationships,
     update_house_stub_state,
     upsert_search_chunks,
     upsert_search_document,
     upsert_trade_rows_to_neon,
 )
 from capitol_pipeline.models.congress import FilingStub, HousePtrParseResult, MemberMatch, NormalizedTradeRow
+from capitol_pipeline.models.offshore import OffshoreMemberMatchRecord, OffshoreNodeRecord
 from capitol_pipeline.normalizers.crypto_assets import classify_crypto_asset
 from capitol_pipeline.parsers.house_ptr import parse_house_ptr_pdf
 from capitol_pipeline.processors.chunking import build_search_chunks
@@ -36,7 +44,11 @@ from capitol_pipeline.processors.embeddings import get_embedder
 from capitol_pipeline.processors.ocr import OcrProcessor
 from capitol_pipeline.registries.members import MemberRegistry, load_member_registry_from_json
 from capitol_pipeline.sources.house_clerk import fetch_house_feed
+from capitol_pipeline.sources.icij_offshore_leaks import iter_offshore_nodes, iter_offshore_relationships
 from capitol_pipeline.sources.senate_ethics import fetch_senate_watcher_feed
+
+
+T = TypeVar("T")
 
 
 @click.group()
@@ -56,6 +68,19 @@ def load_registry_if_available(
     if settings.members_registry_path.exists():
         return load_member_registry_from_json(settings.members_registry_path)
     return None
+
+
+def batched(items: Iterable[T], size: int) -> Iterable[list[T]]:
+    """Yield stable batches from an iterable."""
+
+    batch: list[T] = []
+    for item in items:
+        batch.append(item)
+        if len(batch) >= size:
+            yield batch
+            batch = []
+    if batch:
+        yield batch
 
 
 def now_iso() -> str:
@@ -327,6 +352,31 @@ def process_house_queue_rows(
     return summary
 
 
+def build_offshore_member_match(
+    node: OffshoreNodeRecord,
+    member: MemberMatch,
+) -> OffshoreMemberMatchRecord:
+    """Create a stable exact-name Congress match record for an Offshore node."""
+
+    stable_key = hashlib.sha1(f"{member.id}|{node.node_key}|exact_name".encode("utf-8")).hexdigest()
+    return OffshoreMemberMatchRecord(
+        match_key=stable_key,
+        member_id=member.id or "",
+        member_name=member.name,
+        member_slug=member.slug,
+        node_key=node.node_key,
+        node_type=node.node_type,
+        source_dataset=node.source_dataset,
+        match_value=node.name,
+        metadata={
+            "normalizedName": node.normalized_name,
+            "countries": node.countries,
+            "countryCodes": node.country_codes,
+            "jurisdiction": node.jurisdiction_description or node.jurisdiction,
+        },
+    )
+
+
 @cli.command("house-feed")
 @click.option("--year", type=int, required=True, help="Disclosure year, for example 2026.")
 @click.option("--limit", type=int, default=10, show_default=True)
@@ -413,6 +463,107 @@ def ensure_search_schema_command() -> None:
 
     settings = Settings()
     summary = ensure_search_schema(settings)
+    click.echo(json.dumps(summary, indent=2))
+
+
+@cli.command("ensure-offshore-schema")
+def ensure_offshore_schema_command() -> None:
+    """Create the Offshore raw corpus tables and Congress match table."""
+
+    settings = Settings()
+    summary = ensure_offshore_schema(settings)
+    click.echo(json.dumps(summary, indent=2))
+
+
+@cli.command("ingest-offshore-leaks")
+@click.option("--node-batch-size", type=int, default=5000, show_default=True)
+@click.option("--relationship-batch-size", type=int, default=10000, show_default=True)
+@click.option("--node-limit-per-type", type=int, default=0, show_default=True, help="0 means full file.")
+@click.option("--relationship-limit", type=int, default=0, show_default=True, help="0 means full file.")
+@click.option("--skip-relationships/--include-relationships", default=False, show_default=True)
+@click.option("--skip-match-index/--with-match-index", default=False, show_default=True)
+@click.option("--with-embeddings/--no-embeddings", default=False, show_default=True)
+@click.option("--export-registry/--no-export-registry", default=True, show_default=True)
+def ingest_offshore_leaks_command(
+    node_batch_size: int,
+    relationship_batch_size: int,
+    node_limit_per_type: int,
+    relationship_limit: int,
+    skip_relationships: bool,
+    skip_match_index: bool,
+    with_embeddings: bool,
+    export_registry: bool,
+) -> None:
+    """Ingest the official ICIJ Offshore Leaks corpus into Neon."""
+
+    settings = Settings()
+    ensure_offshore_schema(settings)
+    registry = load_registry_if_available(settings, export_cache=export_registry)
+    if not registry:
+        raise click.ClickException("Member registry is required for Offshore match extraction.")
+    if not skip_match_index:
+        ensure_search_schema(settings)
+
+    summary: dict[str, object] = {
+        "nodesUpserted": 0,
+        "relationshipsUpserted": 0,
+        "memberMatchesUpserted": 0,
+        "matchDocumentsUpserted": 0,
+        "matchChunksUpserted": 0,
+        "nodeBatches": 0,
+        "relationshipBatches": 0,
+        "datasets": {},
+    }
+
+    for batch in batched(
+        iter_offshore_nodes(settings, limit_per_type=node_limit_per_type),
+        max(1, node_batch_size),
+    ):
+        upsert_offshore_nodes(settings, batch)
+        summary["nodesUpserted"] = int(summary["nodesUpserted"]) + len(batch)
+        summary["nodeBatches"] = int(summary["nodeBatches"]) + 1
+        datasets = summary["datasets"]
+        for node in batch:
+            datasets[node.source_dataset] = int(datasets.get(node.source_dataset, 0)) + 1  # type: ignore[union-attr]
+
+        matches = [
+            build_offshore_member_match(node, match)
+            for node in batch
+            for match in [registry.resolve(name=node.name)]
+            if match and match.id
+        ]
+        if matches:
+            upsert_offshore_member_matches(settings, matches)
+            summary["memberMatchesUpserted"] = int(summary["memberMatchesUpserted"]) + len(matches)
+            if not skip_match_index:
+                for match_record in matches:
+                    node = next(item for item in batch if item.node_key == match_record.node_key)
+                    member = registry.resolve(name=match_record.member_name)
+                    if not member:
+                        continue
+                    search_document = build_offshore_match_search_document(node, member)
+                    index_summary = index_search_document(
+                        settings,
+                        search_document,
+                        with_embeddings=with_embeddings,
+                        ensure_schema=False,
+                    )
+                    summary["matchDocumentsUpserted"] = int(summary["matchDocumentsUpserted"]) + int(
+                        (index_summary.get("document") or {}).get("upserted", 0)  # type: ignore[union-attr]
+                    )
+                    summary["matchChunksUpserted"] = int(summary["matchChunksUpserted"]) + int(
+                        (index_summary.get("chunks") or {}).get("upserted", 0)  # type: ignore[union-attr]
+                    )
+
+    if not skip_relationships:
+        for batch in batched(
+            iter_offshore_relationships(settings, limit=relationship_limit),
+            max(1, relationship_batch_size),
+        ):
+            upsert_offshore_relationships(settings, batch)
+            summary["relationshipsUpserted"] = int(summary["relationshipsUpserted"]) + len(batch)
+            summary["relationshipBatches"] = int(summary["relationshipBatches"]) + 1
+
     click.echo(json.dumps(summary, indent=2))
 
 

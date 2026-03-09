@@ -4,8 +4,9 @@ from __future__ import annotations
 
 from typing import Any
 
-from capitol_pipeline.models.congress import FilingStub, HousePtrParseResult, NormalizedTradeRow
+from capitol_pipeline.models.congress import FilingStub, HousePtrParseResult, MemberMatch, NormalizedTradeRow
 from capitol_pipeline.models.document import Document
+from capitol_pipeline.models.offshore import OffshoreNodeRecord
 from capitol_pipeline.models.search import SearchDocumentRecord, build_search_document
 
 
@@ -112,5 +113,48 @@ def build_house_ptr_search_document_from_stub_row(
             "parserConfidence": metadata.get("parserConfidence"),
             "parsedTransactionCount": transaction_count,
             "stubStatus": status,
+        },
+    )
+
+
+def build_offshore_match_search_document(
+    node: OffshoreNodeRecord,
+    member: MemberMatch,
+) -> SearchDocumentRecord:
+    """Build a searchable cross-reference document for a Congress match."""
+
+    document = Document(
+        id=f"offshore-match-{node.node_key}",
+        title=f"{member.name} cross-reference in {node.source_dataset}",
+        source="icij-offshore-leaks",
+        category="cross-reference",
+        date=None,
+        summary=f"{member.name} exactly matches an Offshore Leaks node in {node.source_dataset}.",
+        memberIds=[member.id] if member.id else [],
+        tags=["offshore-leaks", "cross-reference", node.node_type, node.source_dataset],
+        sourceUrl="https://offshoreleaks.icij.org/",
+        archiveUrl=node.metadata.get("sourceID") if isinstance(node.metadata.get("sourceID"), str) else None,
+        ocrText="\n".join(
+            [
+                f"Matched member: {member.name}",
+                f"Offshore dataset: {node.source_dataset}",
+                f"Node type: {node.node_type}",
+                f"Node name: {node.name}",
+                node.content,
+            ]
+        ),
+        verificationStatus="unverified",
+    )
+
+    return build_search_document(
+        document,
+        content=document.ocrText or "",
+        metadata={
+            "nodeKey": node.node_key,
+            "nodeType": node.node_type,
+            "sourceDataset": node.source_dataset,
+            "matchType": "exact_name",
+            "matchValue": node.name,
+            "memberSlug": member.slug,
         },
     )

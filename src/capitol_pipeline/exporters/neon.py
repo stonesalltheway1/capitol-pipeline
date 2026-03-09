@@ -12,6 +12,11 @@ from capitol_pipeline.bridges.capitol_exposed import (
 )
 from capitol_pipeline.config import Settings
 from capitol_pipeline.models.congress import FilingStub, NormalizedTradeRow
+from capitol_pipeline.models.offshore import (
+    OffshoreMemberMatchRecord,
+    OffshoreNodeRecord,
+    OffshoreRelationshipRecord,
+)
 from capitol_pipeline.models.search import SearchChunkRecord, SearchDocumentRecord, SearchHit
 from capitol_pipeline.registries.members import MemberRegistry
 
@@ -32,6 +37,9 @@ except ImportError:  # pragma: no cover - optional dependency in local env
 
 PIPELINE_SEARCH_DOCUMENTS_TABLE = "pipeline_search_documents"
 PIPELINE_SEARCH_CHUNKS_TABLE = "pipeline_search_chunks"
+PIPELINE_OFFSHORE_NODES_TABLE = "pipeline_offshore_nodes"
+PIPELINE_OFFSHORE_RELATIONSHIPS_TABLE = "pipeline_offshore_relationships"
+PIPELINE_OFFSHORE_MEMBER_MATCHES_TABLE = "pipeline_offshore_member_matches"
 
 
 def ensure_neon_available() -> None:
@@ -186,6 +194,106 @@ def ensure_search_schema(settings: Settings) -> dict[str, object]:
     return {
         "dimensions": dimensions,
         "tables": [PIPELINE_SEARCH_DOCUMENTS_TABLE, PIPELINE_SEARCH_CHUNKS_TABLE],
+    }
+
+
+def ensure_offshore_schema(settings: Settings) -> dict[str, object]:
+    """Create the Offshore Leaks raw corpus tables and Congress match table."""
+
+    with neon_connection(settings) as connection:
+        with connection.cursor() as cursor:
+            cursor.execute(
+                f"""
+                CREATE TABLE IF NOT EXISTS {PIPELINE_OFFSHORE_NODES_TABLE} (
+                    node_key TEXT PRIMARY KEY,
+                    node_id TEXT NOT NULL,
+                    node_type TEXT NOT NULL,
+                    name TEXT NOT NULL,
+                    normalized_name TEXT NOT NULL,
+                    source_dataset TEXT NOT NULL,
+                    summary TEXT NOT NULL,
+                    content TEXT NOT NULL,
+                    countries TEXT[] NOT NULL DEFAULT '{{}}'::text[],
+                    country_codes TEXT[] NOT NULL DEFAULT '{{}}'::text[],
+                    jurisdiction TEXT NULL,
+                    jurisdiction_description TEXT NULL,
+                    company_type TEXT NULL,
+                    address TEXT NULL,
+                    status TEXT NULL,
+                    service_provider TEXT NULL,
+                    note TEXT NULL,
+                    valid_until TEXT NULL,
+                    metadata JSONB NOT NULL DEFAULT '{{}}'::jsonb,
+                    content_tsv tsvector GENERATED ALWAYS AS (
+                        to_tsvector('english', coalesce(name, '') || ' ' || coalesce(summary, '') || ' ' || coalesce(content, ''))
+                    ) STORED,
+                    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+                    updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+                )
+                """
+            )
+            cursor.execute(
+                f"""
+                CREATE TABLE IF NOT EXISTS {PIPELINE_OFFSHORE_RELATIONSHIPS_TABLE} (
+                    relationship_key TEXT PRIMARY KEY,
+                    start_node_id TEXT NOT NULL,
+                    end_node_id TEXT NOT NULL,
+                    rel_type TEXT NOT NULL,
+                    link TEXT NULL,
+                    status TEXT NULL,
+                    start_date TEXT NULL,
+                    end_date TEXT NULL,
+                    source_dataset TEXT NOT NULL,
+                    metadata JSONB NOT NULL DEFAULT '{{}}'::jsonb,
+                    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+                    updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+                )
+                """
+            )
+            cursor.execute(
+                f"""
+                CREATE TABLE IF NOT EXISTS {PIPELINE_OFFSHORE_MEMBER_MATCHES_TABLE} (
+                    match_key TEXT PRIMARY KEY,
+                    member_id TEXT NOT NULL,
+                    member_name TEXT NOT NULL,
+                    member_slug TEXT NULL,
+                    node_key TEXT NOT NULL REFERENCES {PIPELINE_OFFSHORE_NODES_TABLE}(node_key) ON DELETE CASCADE,
+                    node_type TEXT NOT NULL,
+                    source_dataset TEXT NOT NULL,
+                    match_type TEXT NOT NULL,
+                    match_value TEXT NOT NULL,
+                    metadata JSONB NOT NULL DEFAULT '{{}}'::jsonb,
+                    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+                    updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+                )
+                """
+            )
+            cursor.execute(
+                f"CREATE INDEX IF NOT EXISTS idx_pipeline_offshore_nodes_name ON {PIPELINE_OFFSHORE_NODES_TABLE} USING BTREE (normalized_name)"
+            )
+            cursor.execute(
+                f"CREATE INDEX IF NOT EXISTS idx_pipeline_offshore_nodes_dataset ON {PIPELINE_OFFSHORE_NODES_TABLE} USING BTREE (source_dataset, node_type)"
+            )
+            cursor.execute(
+                f"CREATE INDEX IF NOT EXISTS idx_pipeline_offshore_nodes_tsv ON {PIPELINE_OFFSHORE_NODES_TABLE} USING GIN (content_tsv)"
+            )
+            cursor.execute(
+                f"CREATE INDEX IF NOT EXISTS idx_pipeline_offshore_relationships_start ON {PIPELINE_OFFSHORE_RELATIONSHIPS_TABLE} USING BTREE (start_node_id, rel_type)"
+            )
+            cursor.execute(
+                f"CREATE INDEX IF NOT EXISTS idx_pipeline_offshore_relationships_end ON {PIPELINE_OFFSHORE_RELATIONSHIPS_TABLE} USING BTREE (end_node_id, rel_type)"
+            )
+            cursor.execute(
+                f"CREATE INDEX IF NOT EXISTS idx_pipeline_offshore_member_matches_member ON {PIPELINE_OFFSHORE_MEMBER_MATCHES_TABLE} USING BTREE (member_id, source_dataset)"
+            )
+        connection.commit()
+
+    return {
+        "tables": [
+            PIPELINE_OFFSHORE_NODES_TABLE,
+            PIPELINE_OFFSHORE_RELATIONSHIPS_TABLE,
+            PIPELINE_OFFSHORE_MEMBER_MATCHES_TABLE,
+        ]
     }
 
 
@@ -524,6 +632,210 @@ def fetch_house_stub_queue(
                 (max(1, limit),),
             )
             return list(cursor.fetchall())
+
+
+def upsert_offshore_nodes(
+    settings: Settings,
+    rows: list[OffshoreNodeRecord],
+) -> dict[str, int]:
+    """Upsert Offshore Leaks nodes into the raw corpus table."""
+
+    if not rows:
+        return {"upserted": 0}
+    ensure_offshore_schema(settings)
+    with neon_connection(settings) as connection:
+        with connection.cursor() as cursor:
+            cursor.executemany(
+                f"""
+                INSERT INTO {PIPELINE_OFFSHORE_NODES_TABLE} (
+                    node_key,
+                    node_id,
+                    node_type,
+                    name,
+                    normalized_name,
+                    source_dataset,
+                    summary,
+                    content,
+                    countries,
+                    country_codes,
+                    jurisdiction,
+                    jurisdiction_description,
+                    company_type,
+                    address,
+                    status,
+                    service_provider,
+                    note,
+                    valid_until,
+                    metadata,
+                    updated_at
+                )
+                VALUES (
+                    %s, %s, %s, %s, %s, %s, %s, %s, %s, %s,
+                    %s, %s, %s, %s, %s, %s, %s, %s, %s, NOW()
+                )
+                ON CONFLICT (node_key) DO UPDATE SET
+                    name = EXCLUDED.name,
+                    normalized_name = EXCLUDED.normalized_name,
+                    source_dataset = EXCLUDED.source_dataset,
+                    summary = EXCLUDED.summary,
+                    content = EXCLUDED.content,
+                    countries = EXCLUDED.countries,
+                    country_codes = EXCLUDED.country_codes,
+                    jurisdiction = EXCLUDED.jurisdiction,
+                    jurisdiction_description = EXCLUDED.jurisdiction_description,
+                    company_type = EXCLUDED.company_type,
+                    address = EXCLUDED.address,
+                    status = EXCLUDED.status,
+                    service_provider = EXCLUDED.service_provider,
+                    note = EXCLUDED.note,
+                    valid_until = EXCLUDED.valid_until,
+                    metadata = EXCLUDED.metadata,
+                    updated_at = NOW()
+                """,
+                [
+                    (
+                        row.node_key,
+                        row.node_id,
+                        row.node_type,
+                        row.name,
+                        row.normalized_name,
+                        row.source_dataset,
+                        row.summary,
+                        row.content,
+                        row.countries,
+                        row.country_codes,
+                        row.jurisdiction,
+                        row.jurisdiction_description,
+                        row.company_type,
+                        row.address,
+                        row.status,
+                        row.service_provider,
+                        row.note,
+                        row.valid_until,
+                        Jsonb(row.metadata),  # type: ignore[arg-type]
+                    )
+                    for row in rows
+                ],
+            )
+        connection.commit()
+    return {"upserted": len(rows)}
+
+
+def upsert_offshore_relationships(
+    settings: Settings,
+    rows: list[OffshoreRelationshipRecord],
+) -> dict[str, int]:
+    """Upsert Offshore Leaks relationships into the raw corpus table."""
+
+    if not rows:
+        return {"upserted": 0}
+    ensure_offshore_schema(settings)
+    with neon_connection(settings) as connection:
+        with connection.cursor() as cursor:
+            cursor.executemany(
+                f"""
+                INSERT INTO {PIPELINE_OFFSHORE_RELATIONSHIPS_TABLE} (
+                    relationship_key,
+                    start_node_id,
+                    end_node_id,
+                    rel_type,
+                    link,
+                    status,
+                    start_date,
+                    end_date,
+                    source_dataset,
+                    metadata,
+                    updated_at
+                )
+                VALUES (
+                    %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, NOW()
+                )
+                ON CONFLICT (relationship_key) DO UPDATE SET
+                    link = EXCLUDED.link,
+                    status = EXCLUDED.status,
+                    start_date = EXCLUDED.start_date,
+                    end_date = EXCLUDED.end_date,
+                    source_dataset = EXCLUDED.source_dataset,
+                    metadata = EXCLUDED.metadata,
+                    updated_at = NOW()
+                """,
+                [
+                    (
+                        row.relationship_key,
+                        row.start_node_id,
+                        row.end_node_id,
+                        row.rel_type,
+                        row.link,
+                        row.status,
+                        row.start_date,
+                        row.end_date,
+                        row.source_dataset,
+                        Jsonb(row.metadata),  # type: ignore[arg-type]
+                    )
+                    for row in rows
+                ],
+            )
+        connection.commit()
+    return {"upserted": len(rows)}
+
+
+def upsert_offshore_member_matches(
+    settings: Settings,
+    rows: list[OffshoreMemberMatchRecord],
+) -> dict[str, int]:
+    """Upsert exact Congress matches against Offshore Leaks nodes."""
+
+    if not rows:
+        return {"upserted": 0}
+    ensure_offshore_schema(settings)
+    with neon_connection(settings) as connection:
+        with connection.cursor() as cursor:
+            cursor.executemany(
+                f"""
+                INSERT INTO {PIPELINE_OFFSHORE_MEMBER_MATCHES_TABLE} (
+                    match_key,
+                    member_id,
+                    member_name,
+                    member_slug,
+                    node_key,
+                    node_type,
+                    source_dataset,
+                    match_type,
+                    match_value,
+                    metadata,
+                    updated_at
+                )
+                VALUES (
+                    %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, NOW()
+                )
+                ON CONFLICT (match_key) DO UPDATE SET
+                    member_name = EXCLUDED.member_name,
+                    member_slug = EXCLUDED.member_slug,
+                    node_type = EXCLUDED.node_type,
+                    source_dataset = EXCLUDED.source_dataset,
+                    match_type = EXCLUDED.match_type,
+                    match_value = EXCLUDED.match_value,
+                    metadata = EXCLUDED.metadata,
+                    updated_at = NOW()
+                """,
+                [
+                    (
+                        row.match_key,
+                        row.member_id,
+                        row.member_name,
+                        row.member_slug,
+                        row.node_key,
+                        row.node_type,
+                        row.source_dataset,
+                        row.match_type,
+                        row.match_value,
+                        Jsonb(row.metadata),  # type: ignore[arg-type]
+                    )
+                    for row in rows
+                ],
+            )
+        connection.commit()
+    return {"upserted": len(rows)}
 
 
 def fetch_house_stub_search_backfill(

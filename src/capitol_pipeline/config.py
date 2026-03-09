@@ -48,6 +48,7 @@ class Settings(BaseSettings):
     cache_dir: Path = Path("./.cache")
     members_registry_path: Path = Path("./data/members-registry.json")
     crypto_asset_map_path: Path = Path("./data/crypto-assets.json")
+    offshore_leaks_archive_path: Path = Path("./data/offshore-leaks/full-oldb.LATEST.zip")
 
     # ── General processing ───────────────────────────────────────────────
     max_workers: int = 4
@@ -105,6 +106,9 @@ class Settings(BaseSettings):
     senate_watcher_url: str = (
         "https://raw.githubusercontent.com/timothycarambat/"
         "senate-stock-watcher-data/master/aggregate/all_transactions.json"
+    )
+    offshore_leaks_zip_url: str = (
+        "https://offshoreleaks-data.icij.org/offshoreleaks/csv/full-oldb.LATEST.zip"
     )
 
     # ── Document classifier settings ─────────────────────────────────────

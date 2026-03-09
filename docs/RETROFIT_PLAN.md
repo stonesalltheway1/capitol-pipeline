@@ -89,6 +89,13 @@ Status: completed locally
 - Add regression tests against real Congress PDF fixtures
 
 ### Phase 6
+- Ingest the official ICIJ Offshore Leaks database into dedicated raw corpus tables
+- Derive Congress exact-name matches from the offshore corpus
+- Index matched offshore records into the pipeline search layer
+
+Status: in progress
+
+### Phase 7
 - Replace CapitolExposed's `lib/ptr-extraction.ts` queue worker with a thin
   wrapper that shells into or directly imports this pipeline
 - Move House retry policy and stub status transitions into the pipeline layer
@@ -101,5 +108,6 @@ Status: completed locally
 2. Use `house-ingest` as the default runner for feed sync plus backlog processing.
 3. Port the remaining House PTR edge-case handling out of the app layer.
 4. Backfill indexed search for parsed House PTR documents already in Neon.
-5. Add end-to-end fixture tests from recent filings that previously failed in production.
-6. Extend the same pipeline architecture to official Senate ingestion.
+5. Finish the full Offshore Leaks corpus import and relationship backfill.
+6. Add end-to-end fixture tests from recent filings that previously failed in production.
+7. Extend the same pipeline architecture to official Senate ingestion.

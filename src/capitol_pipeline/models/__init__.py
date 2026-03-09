@@ -2,6 +2,7 @@
 
 from .congress import FilingStub, MemberMatch, NormalizedAsset, NormalizedTradeRow
 from .document import Document, EntityResult, ProcessingResult
+from .offshore import OffshoreMemberMatchRecord, OffshoreNodeRecord, OffshoreRelationshipRecord
 from .search import SearchChunkRecord, SearchDocumentRecord, SearchHit
 
 __all__ = [
@@ -11,6 +12,9 @@ __all__ = [
     "MemberMatch",
     "NormalizedAsset",
     "NormalizedTradeRow",
+    "OffshoreMemberMatchRecord",
+    "OffshoreNodeRecord",
+    "OffshoreRelationshipRecord",
     "ProcessingResult",
     "SearchChunkRecord",
     "SearchDocumentRecord",

@@ -18,6 +18,7 @@ DocumentSource = Literal[
     "lda",
     "congress-gov",
     "sec",
+    "icij-offshore-leaks",
     "manual",
     "other",
 ]
@@ -30,6 +31,7 @@ DocumentCategory = Literal[
     "vote",
     "committee",
     "newsroom",
+    "cross-reference",
     "other",
 ]
 
