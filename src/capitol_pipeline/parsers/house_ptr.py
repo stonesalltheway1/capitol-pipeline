@@ -256,6 +256,7 @@ def build_trade_rows_from_house_ptr(
                 source="house-clerk",
                 disclosure_kind="house-ptr",
                 source_id=f"{stub.doc_id}:{transaction.line_number}",
+                source_url=stub.source_url,
                 ticker=transaction.ticker,
                 asset_description=transaction.asset_description,
                 asset_type=asset_type,
@@ -265,6 +266,11 @@ def build_trade_rows_from_house_ptr(
                 amount_min=transaction.amount_min,
                 amount_max=transaction.amount_max,
                 owner=transaction.owner,
+                comment=(
+                    f"Parsed from House PTR {stub.doc_id} at "
+                    f"{round(parsed.parser_confidence * 100)}% confidence"
+                ),
+                parser_confidence=parsed.parser_confidence,
                 normalized_asset=normalized_asset,
             )
         )

@@ -5,6 +5,16 @@ from __future__ import annotations
 from capitol_pipeline.models.congress import FilingStub, NormalizedTradeRow
 
 
+def build_trade_id(row: NormalizedTradeRow) -> str:
+    """Create the canonical CapitolExposed trade id for a normalized row."""
+
+    if row.disclosure_kind == "house-ptr":
+        return f"tr-house-{row.source_id.replace(':', '-')}"
+    if row.disclosure_kind == "senate-trade":
+        return f"tr-senate-{row.source_id.replace(':', '-')}"
+    return f"tr-{row.source.replace(':', '-')}-{row.source_id.replace(':', '-')}"
+
+
 def build_house_stub_payload(stub: FilingStub) -> dict[str, object]:
     """Build a row payload compatible with the site's house_filing_stubs table."""
 
@@ -46,6 +56,7 @@ def build_trade_payload(row: NormalizedTradeRow) -> dict[str, object]:
             asset_type = "Crypto-Adjacent Equity"
 
     return {
+        "id": build_trade_id(row),
         "member_id": row.member.id,
         "ticker": row.ticker,
         "asset_description": row.asset_description,
@@ -56,8 +67,11 @@ def build_trade_payload(row: NormalizedTradeRow) -> dict[str, object]:
         "amount_min": row.amount_min,
         "amount_max": row.amount_max,
         "owner": row.owner,
+        "comment": row.comment,
         "source": row.source,
-        "source_id": row.source_id,
+        "source_url": row.source_url or "",
+        "conflict_score": 0.0,
+        "conflict_flags": [],
         "crypto_kind": normalized_asset.kind if normalized_asset else None,
         "crypto_symbol": normalized_asset.canonical_symbol if normalized_asset else None,
         "crypto_match_confidence": normalized_asset.confidence if normalized_asset else None,

@@ -14,8 +14,10 @@ PTR filings and asset normalization.
 - House Clerk XML source adapter
 - Senate watcher source adapter
 - House PTR parser for text and PDF-backed filings
+- CapitolExposed-compatible member registry resolution
 - Crypto asset classifier for direct coins, ETFs and trusts, and adjacent equities
 - Bridge helpers that emit shapes compatible with CapitolExposed database tables
+- Neon exporters for member loading, House stub sync, and parsed trade upserts
 
 ## Why This Repo Matters
 
@@ -36,6 +38,9 @@ pip install -e .
 # Inspect the House annual disclosure feed
 capitol-pipeline house-feed --year 2026
 
+# Sync House filing stubs into CapitolExposed and resolve members first
+capitol-pipeline sync-house-feed --year 2026
+
 # Inspect the current Senate watcher aggregate feed
 capitol-pipeline senate-feed
 
@@ -54,14 +59,22 @@ capitol-pipeline parse-house-ptr ./sample.pdf \
   --member-slug "roger-williams" \
   --member-id "m-20033783" \
   --party R \
-  --state TX
+  --state TX \
+  --upsert
+
+# Fetch a live House PTR from the annual feed, resolve the member, parse it,
+# and optionally write the stub and trades back into CapitolExposed
+capitol-pipeline process-house-doc \
+  --year 2026 \
+  --doc-id 20033783 \
+  --upsert
 ```
 
 ## Retrofit Priorities
 
 1. Replace the current House PTR OCR and extraction path in CapitolExposed
 2. Backfill crypto-linked trades already present in the database
-3. Add Capitol-specific Neon exporters and scheduled runners
+3. Replace the site-side House extraction cron path with this package
 4. Add fixture-driven regression tests from real House and Senate disclosures
 
 See [docs/RETROFIT_PLAN.md](docs/RETROFIT_PLAN.md) for the full implementation

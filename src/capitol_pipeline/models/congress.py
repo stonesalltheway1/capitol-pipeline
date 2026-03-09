@@ -108,6 +108,7 @@ class NormalizedTradeRow(BaseModel):
     source: DisclosureSource
     disclosure_kind: DisclosureKind
     source_id: str
+    source_url: str | None = None
     ticker: str | None = None
     asset_description: str
     asset_type: str
@@ -117,4 +118,6 @@ class NormalizedTradeRow(BaseModel):
     amount_min: int = 0
     amount_max: int = 0
     owner: str = "self"
+    comment: str | None = None
+    parser_confidence: float | None = None
     normalized_asset: NormalizedAsset | None = None

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from enum import Enum
+import os
 from pathlib import Path
 from typing import Literal
 
@@ -109,6 +110,12 @@ class Settings(BaseSettings):
     kg_llm_provider: str = "openai"  # "openai" or "anthropic"
     kg_llm_model: str = "gpt-4o-mini"
     kg_extract_relationships: bool = False  # LLM extraction is opt-in
+
+    @property
+    def resolved_neon_database_url(self) -> str | None:
+        """Return the configured Neon URL, falling back to DATABASE_URL for local retrofit work."""
+
+        return self.neon_database_url or os.getenv("DATABASE_URL")
 
     def ensure_dirs(self) -> None:
         """Create data, output, and cache directories if they don't exist."""
