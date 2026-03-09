@@ -246,10 +246,13 @@ def sync_house_stubs_to_neon(
 def upsert_search_document(
     settings: Settings,
     document: SearchDocumentRecord,
+    *,
+    ensure_schema: bool = True,
 ) -> dict[str, object]:
     """Upsert a searchable document record."""
 
-    ensure_search_schema(settings)
+    if ensure_schema:
+        ensure_search_schema(settings)
     with neon_connection(settings) as connection:
         with connection.cursor() as cursor:
             cursor.execute(
@@ -321,10 +324,13 @@ def upsert_search_document(
 def upsert_search_chunks(
     settings: Settings,
     chunks: list[SearchChunkRecord],
+    *,
+    ensure_schema: bool = True,
 ) -> dict[str, object]:
     """Replace and insert search chunks for a document."""
 
-    ensure_search_schema(settings)
+    if ensure_schema:
+        ensure_search_schema(settings)
     if not chunks:
         return {"upserted": 0, "document_id": None}
 
@@ -517,6 +523,37 @@ def fetch_house_stub_queue(
                 """,
                 (max(1, limit),),
             )
+            return list(cursor.fetchall())
+
+
+def fetch_house_stub_search_backfill(
+    settings: Settings,
+    *,
+    limit: int = 0,
+    include_needs_review: bool = True,
+    only_missing: bool = True,
+) -> list[dict[str, object]]:
+    """Load parsed House PTR stubs that should be indexed into search."""
+
+    statuses = ["parsed"]
+    if include_needs_review:
+        statuses.append("needs_review")
+
+    with neon_connection(settings) as connection:
+        with connection.cursor() as cursor:
+            query = f"""
+                SELECT h.doc_id, h.filing_year, h.source_url, h.status, h.metadata, h.detected_at
+                FROM house_filing_stubs h
+                WHERE h.status = ANY(%s)
+                  AND COALESCE(h.metadata->>'rawTextPreview', '') <> ''
+                  {"AND NOT EXISTS (SELECT 1 FROM pipeline_search_documents d WHERE d.source_document_id = CONCAT('house-ptr-', h.doc_id))" if only_missing else ""}
+                ORDER BY h.detected_at DESC
+                {"" if limit <= 0 else "LIMIT %s"}
+            """
+            params: list[object] = [statuses]
+            if limit > 0:
+                params.append(limit)
+            cursor.execute(query, tuple(params))
             return list(cursor.fetchall())
 
 

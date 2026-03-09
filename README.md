@@ -80,6 +80,9 @@ capitol-pipeline ensure-search-schema
 # Index one House PTR into pipeline_search_documents and pipeline_search_chunks
 capitol-pipeline index-house-doc-search --year 2026 --doc-id 20033783
 
+# Backfill indexed search documents from already-parsed House PTR rows in Neon
+capitol-pipeline index-house-search-backfill --only-missing
+
 # Search the indexed filing corpus
 capitol-pipeline hybrid-search --query "Roger Williams Chevron"
 

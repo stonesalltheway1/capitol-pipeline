@@ -3,6 +3,7 @@
 from .neon import (
     ensure_neon_available,
     ensure_search_schema,
+    fetch_house_stub_search_backfill,
     fetch_house_stub_queue,
     hybrid_search,
     load_member_registry_from_neon,
@@ -17,6 +18,7 @@ from .neon import (
 __all__ = [
     "ensure_neon_available",
     "ensure_search_schema",
+    "fetch_house_stub_search_backfill",
     "fetch_house_stub_queue",
     "hybrid_search",
     "load_member_registry_from_neon",

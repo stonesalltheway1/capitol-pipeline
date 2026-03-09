@@ -3,7 +3,10 @@ from capitol_pipeline.models.congress import FilingStub, HousePtrParseResult, Me
 from capitol_pipeline.models.document import Document
 from capitol_pipeline.models.search import build_search_document
 from capitol_pipeline.processors.chunking import build_search_chunks
-from capitol_pipeline.bridges.search_documents import build_house_ptr_search_document
+from capitol_pipeline.bridges.search_documents import (
+    build_house_ptr_search_document,
+    build_house_ptr_search_document_from_stub_row,
+)
 
 
 def test_build_search_document_preserves_core_metadata() -> None:
@@ -112,3 +115,28 @@ def test_build_house_ptr_search_document_includes_trade_metadata() -> None:
     assert document.source_document_id == "house-ptr-20039999"
     assert document.asset_tickers == ["BTC"]
     assert document.metadata["parserConfidence"] == 0.91
+
+
+def test_build_house_ptr_search_document_from_stub_row_uses_stored_metadata() -> None:
+    row = {
+        "doc_id": "20033783",
+        "filing_year": 2026,
+        "source_url": "https://example.test/ptr.pdf",
+        "status": "parsed",
+        "metadata": {
+            "memberId": "m-W000816",
+            "memberName": "Roger Williams",
+            "filingType": "PTR",
+            "filingDate": "2026-01-15",
+            "rawTextPreview": "Roger Williams bought CVX.",
+            "parsedTransactions": [{"ticker": "CVX"}],
+            "parserConfidence": 0.92,
+        },
+    }
+
+    document = build_house_ptr_search_document_from_stub_row(row)
+    assert document.id == "doc-house-ptr-20033783"
+    assert document.title == "Roger Williams House PTR 20033783"
+    assert document.asset_tickers == ["CVX"]
+    assert document.content == "Roger Williams bought CVX."
+    assert document.metadata["stubStatus"] == "parsed"

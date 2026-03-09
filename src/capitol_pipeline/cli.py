@@ -10,10 +10,14 @@ from tempfile import TemporaryDirectory
 import click
 import httpx
 
-from capitol_pipeline.bridges import build_house_ptr_search_document
+from capitol_pipeline.bridges import (
+    build_house_ptr_search_document,
+    build_house_ptr_search_document_from_stub_row,
+)
 from capitol_pipeline.config import OcrBackend, Settings
 from capitol_pipeline.exporters.neon import (
     ensure_search_schema,
+    fetch_house_stub_search_backfill,
     fetch_house_stub_queue,
     hybrid_search,
     load_member_registry_from_neon,
@@ -196,10 +200,12 @@ def index_search_document(
     document,
     *,
     with_embeddings: bool,
+    ensure_schema: bool = True,
 ) -> dict[str, object]:
     """Upsert a searchable document and its chunks."""
 
-    ensure_search_schema(settings)
+    if ensure_schema:
+        ensure_search_schema(settings)
     chunks = build_search_chunks(document, settings)
     if with_embeddings and chunks:
         embedder = get_embedder(settings)
@@ -207,8 +213,8 @@ def index_search_document(
         for chunk, embedding in zip(chunks, embeddings, strict=False):
             chunk.embedding = embedding or None
 
-    document_summary = upsert_search_document(settings, document)
-    chunk_summary = upsert_search_chunks(settings, chunks)
+    document_summary = upsert_search_document(settings, document, ensure_schema=False)
+    chunk_summary = upsert_search_chunks(settings, chunks, ensure_schema=False)
     return {
         "document": document_summary,
         "chunks": chunk_summary,
@@ -599,6 +605,63 @@ def index_house_doc_search_command(
             indent=2,
         )
     )
+
+
+@cli.command("index-house-search-backfill")
+@click.option("--limit", type=int, default=0, show_default=True, help="0 means index every eligible stored PTR.")
+@click.option("--include-needs-review/--parsed-only", default=True, show_default=True)
+@click.option("--only-missing/--reindex-all", default=True, show_default=True)
+@click.option("--with-embeddings/--no-embeddings", default=False, show_default=True)
+def index_house_search_backfill_command(
+    limit: int,
+    include_needs_review: bool,
+    only_missing: bool,
+    with_embeddings: bool,
+) -> None:
+    """Backfill indexed House PTR search documents from stored Neon stub rows."""
+
+    settings = Settings()
+    ensure_search_schema(settings)
+    rows = fetch_house_stub_search_backfill(
+        settings,
+        limit=limit,
+        include_needs_review=include_needs_review,
+        only_missing=only_missing,
+    )
+
+    summary = {
+        "queued": len(rows),
+        "documentsUpserted": 0,
+        "chunksUpserted": 0,
+        "embedded": 0,
+        "processed": [],
+    }
+
+    for row in rows:
+        search_document = build_house_ptr_search_document_from_stub_row(row)
+        index_summary = index_search_document(
+            settings,
+            search_document,
+            with_embeddings=with_embeddings,
+            ensure_schema=False,
+        )
+        summary["documentsUpserted"] += int(
+            (index_summary.get("document") or {}).get("upserted", 0)  # type: ignore[union-attr]
+        )
+        summary["chunksUpserted"] += int(
+            (index_summary.get("chunks") or {}).get("upserted", 0)  # type: ignore[union-attr]
+        )
+        summary["embedded"] += 1 if index_summary.get("embedded") else 0
+        summary["processed"].append(
+            {
+                "docId": row.get("doc_id"),
+                "status": row.get("status"),
+                "documentId": (index_summary.get("document") or {}).get("document_id"),  # type: ignore[union-attr]
+                "chunks": (index_summary.get("chunks") or {}).get("upserted", 0),  # type: ignore[union-attr]
+            }
+        )
+
+    click.echo(json.dumps(summary, indent=2))
 
 
 @cli.command("process-house-backlog")
