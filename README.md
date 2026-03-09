@@ -124,6 +124,22 @@ capitol-pipeline embed-search-backfill --limit 100
 capitol-pipeline embed-search-corpus --source capitol-exposed --batch-size 100
 ```
 
+## Automation
+
+This repo now includes GitHub Actions for unattended refresh:
+
+- `.github/workflows/house-refresh.yml`
+- `.github/workflows/corpus-refresh.yml`
+- `.github/workflows/offshore-full-refresh.yml`
+
+Set these repository secrets before enabling the schedules:
+
+- `DATABASE_URL`
+- `OPENAI_API_KEY`
+
+Operational details and recovery commands live in
+[docs/OPERATIONS.md](docs/OPERATIONS.md).
+
 ## Search Layer
 
 Capitol Pipeline now manages its own retrieval tables in Neon instead of

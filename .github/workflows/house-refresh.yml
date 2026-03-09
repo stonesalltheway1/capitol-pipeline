@@ -1,0 +1,45 @@
+name: House Refresh
+
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: "*/15 * * * *"
+
+concurrency:
+  group: house-refresh
+  cancel-in-progress: false
+
+jobs:
+  ingest:
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    env:
+      DATABASE_URL: ${{ secrets.DATABASE_URL }}
+      CAPITOL_EMBEDDING_PROVIDER: none
+      PYTHONUNBUFFERED: "1"
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install pipeline
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install -e ".[neon]"
+
+      - name: Run House ingest
+        run: |
+          HOUSE_YEAR="$(date -u +%Y)"
+          python -u -m capitol_pipeline house-ingest \
+            --year "$HOUSE_YEAR" \
+            --batch-size 25 \
+            --max-batches 6 \
+            --with-search-index \
+            --no-embeddings
+
+      - name: Print corpus status
+        run: python -u -m capitol_pipeline corpus-status

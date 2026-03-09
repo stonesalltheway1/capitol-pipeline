@@ -1,0 +1,49 @@
+name: Offshore Full Refresh
+
+on:
+  workflow_dispatch:
+    inputs:
+      with_embeddings:
+        description: Create embeddings for matched Offshore documents during this run
+        required: false
+        default: "false"
+
+concurrency:
+  group: offshore-full-refresh
+  cancel-in-progress: false
+
+jobs:
+  refresh:
+    runs-on: ubuntu-latest
+    timeout-minutes: 180
+    env:
+      DATABASE_URL: ${{ secrets.DATABASE_URL }}
+      OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
+      CAPITOL_EMBEDDING_PROVIDER: openai
+      CAPITOL_OPENAI_EMBEDDING_DIMENSIONS: "768"
+      PYTHONUNBUFFERED: "1"
+      WITH_EMBEDDINGS: ${{ github.event.inputs.with_embeddings || 'false' }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install pipeline
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install -e ".[neon]"
+
+      - name: Run full Offshore refresh
+        run: |
+          if [ "${WITH_EMBEDDINGS}" = "true" ]; then
+            python -u -m capitol_pipeline ingest-offshore-leaks --with-match-index --with-embeddings
+          else
+            python -u -m capitol_pipeline ingest-offshore-leaks --with-match-index --no-embeddings
+          fi
+
+      - name: Print corpus status
+        run: python -u -m capitol_pipeline corpus-status
