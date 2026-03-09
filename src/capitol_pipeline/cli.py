@@ -1450,10 +1450,22 @@ def house_ingest_command(
 @click.option("--query", "query_text", type=str, required=True, help="Search query text.")
 @click.option("--limit", type=int, default=10, show_default=True)
 @click.option("--with-embeddings/--no-embeddings", default=False, show_default=True)
+@click.option("--source", type=str, default=None, help="Optional document source filter.")
+@click.option("--category", type=str, default=None, help="Optional document category filter.")
+@click.option("--member-id", type=str, default=None, help="Optional member scope filter.")
+@click.option("--committee-id", type=str, default=None, help="Optional committee scope filter.")
+@click.option("--bill-id", type=str, default=None, help="Optional bill scope filter.")
+@click.option("--ticker", type=str, default=None, help="Optional asset ticker filter.")
 def hybrid_search_command(
     query_text: str,
     limit: int,
     with_embeddings: bool,
+    source: str | None,
+    category: str | None,
+    member_id: str | None,
+    committee_id: str | None,
+    bill_id: str | None,
+    ticker: str | None,
 ) -> None:
     """Run a hybrid lexical and vector search against indexed chunks."""
 
@@ -1466,6 +1478,12 @@ def hybrid_search_command(
         query_text=query_text,
         query_embedding=query_embedding,
         limit=limit,
+        source=source,
+        category=category,
+        member_id=member_id,
+        committee_id=committee_id,
+        bill_id=bill_id,
+        ticker=ticker,
     )
     click.echo(json.dumps([hit.model_dump() for hit in hits], indent=2))
 

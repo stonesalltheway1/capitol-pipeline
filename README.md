@@ -91,6 +91,9 @@ capitol-pipeline index-house-search-backfill --only-missing
 # Search the indexed filing corpus
 capitol-pipeline hybrid-search --query "Roger Williams Chevron"
 
+# Scope a retrieval query to a source and ticker
+capitol-pipeline hybrid-search --query "Roger Williams Chevron" --source house-clerk --ticker CVX
+
 # Run the full House ingestion loop: sync the feed, process the queue, and
 # optionally index parsed PTRs in one command
 capitol-pipeline house-ingest --year 2026 --batch-size 10 --max-batches 5

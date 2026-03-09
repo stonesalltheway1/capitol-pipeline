@@ -248,6 +248,21 @@ def ensure_search_schema(settings: Settings) -> dict[str, object]:
                     "CREATE INDEX IF NOT EXISTS idx_pipeline_search_documents_source ON pipeline_search_documents USING BTREE (source, category, document_date DESC)"
                 )
                 cursor.execute(
+                    "CREATE INDEX IF NOT EXISTS idx_pipeline_search_documents_member_ids ON pipeline_search_documents USING GIN (member_ids)"
+                )
+                cursor.execute(
+                    "CREATE INDEX IF NOT EXISTS idx_pipeline_search_documents_committee_ids ON pipeline_search_documents USING GIN (committee_ids)"
+                )
+                cursor.execute(
+                    "CREATE INDEX IF NOT EXISTS idx_pipeline_search_documents_bill_ids ON pipeline_search_documents USING GIN (bill_ids)"
+                )
+                cursor.execute(
+                    "CREATE INDEX IF NOT EXISTS idx_pipeline_search_documents_asset_tickers ON pipeline_search_documents USING GIN (asset_tickers)"
+                )
+                cursor.execute(
+                    "CREATE INDEX IF NOT EXISTS idx_pipeline_search_documents_tags ON pipeline_search_documents USING GIN (tags)"
+                )
+                cursor.execute(
                     """
                     CREATE INDEX IF NOT EXISTS idx_pipeline_search_chunks_embedding
                     ON pipeline_search_chunks
@@ -716,16 +731,59 @@ def hybrid_search(
     query_text: str,
     query_embedding: list[float] | None = None,
     limit: int = 10,
+    source: str | None = None,
+    category: str | None = None,
+    member_id: str | None = None,
+    committee_id: str | None = None,
+    bill_id: str | None = None,
+    ticker: str | None = None,
 ) -> list[SearchHit]:
     """Run a hybrid lexical and vector search across indexed chunks."""
 
     ensure_search_schema(settings)
+    filters: list[str] = []
+    filter_params: list[object] = []
+    if source:
+        filters.append("d.source = %s")
+        filter_params.append(source)
+    if category:
+        filters.append("d.category = %s")
+        filter_params.append(category)
+    if member_id:
+        filters.append("%s = ANY(d.member_ids)")
+        filter_params.append(member_id)
+    if committee_id:
+        filters.append("%s = ANY(d.committee_ids)")
+        filter_params.append(committee_id)
+    if bill_id:
+        filters.append("%s = ANY(d.bill_ids)")
+        filter_params.append(bill_id)
+    if ticker:
+        filters.append("%s = ANY(d.asset_tickers)")
+        filter_params.append(ticker.upper())
+
+    filter_sql = ""
+    if filters:
+        filter_sql = " AND " + " AND ".join(filters)
+
     rows: list[dict[str, object]]
     with neon_connection(settings) as connection:
         with connection.cursor() as cursor:
             if query_embedding:
+                params: list[object] = [
+                    query_text,
+                    query_text,
+                    vector_literal(query_embedding),
+                    query_text,
+                    query_text,
+                    vector_literal(query_embedding),
+                    query_text,
+                    query_text,
+                    *filter_params,
+                    max(1, limit),
+                ]
                 cursor.execute(
-                    """
+                    f"""
                     WITH ranked AS (
                         SELECT
                             d.id AS document_id,
@@ -751,30 +809,32 @@ def hybrid_search(
                             c.metadata
                         FROM pipeline_search_chunks c
                         JOIN pipeline_search_documents d ON d.id = c.document_id
-                        WHERE d.content_tsv @@ websearch_to_tsquery('english', %s)
-                           OR c.text_tsv @@ websearch_to_tsquery('english', %s)
-                           OR c.embedding IS NOT NULL
+                        WHERE (
+                            d.content_tsv @@ websearch_to_tsquery('english', %s)
+                            OR c.text_tsv @@ websearch_to_tsquery('english', %s)
+                            OR c.embedding IS NOT NULL
+                        )
+                          {filter_sql}
                         ORDER BY combined_score DESC
                         LIMIT %s
                     )
                     SELECT * FROM ranked ORDER BY combined_score DESC
                     """,
-                    (
-                        query_text,
-                        query_text,
-                        query_text,
-                        vector_literal(query_embedding),
-                        query_text,
-                        query_text,
-                        vector_literal(query_embedding),
-                        query_text,
-                        query_text,
-                        max(1, limit),
-                    ),
+                    tuple(params),
                 )
             else:
+                params = [
+                    query_text,
+                    query_text,
+                    query_text,
+                    query_text,
+                    query_text,
+                    query_text,
+                    *filter_params,
+                    max(1, limit),
+                ]
                 cursor.execute(
-                    """
+                    f"""
                     SELECT
                         d.id AS document_id,
                         c.id AS chunk_id,
@@ -796,20 +856,15 @@ def hybrid_search(
                         c.metadata
                     FROM pipeline_search_chunks c
                     JOIN pipeline_search_documents d ON d.id = c.document_id
-                    WHERE d.content_tsv @@ websearch_to_tsquery('english', %s)
-                       OR c.text_tsv @@ websearch_to_tsquery('english', %s)
+                    WHERE (
+                        d.content_tsv @@ websearch_to_tsquery('english', %s)
+                        OR c.text_tsv @@ websearch_to_tsquery('english', %s)
+                    )
+                      {filter_sql}
                     ORDER BY combined_score DESC
                     LIMIT %s
                     """,
-                    (
-                        query_text,
-                        query_text,
-                        query_text,
-                        query_text,
-                        query_text,
-                        query_text,
-                        max(1, limit),
-                    ),
+                    tuple(params),
                 )
             rows = list(cursor.fetchall())
 
