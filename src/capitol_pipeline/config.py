@@ -110,6 +110,8 @@ class Settings(BaseSettings):
     offshore_leaks_zip_url: str = (
         "https://offshoreleaks-data.icij.org/offshoreleaks/csv/full-oldb.LATEST.zip"
     )
+    fara_base_url: str = "https://efile.fara.gov/api/v1"
+    fara_request_interval_seconds: float = 2.05
 
     # ── Document classifier settings ─────────────────────────────────────
     classifier_model: str = "facebook/bart-large-mnli"
@@ -125,6 +127,12 @@ class Settings(BaseSettings):
         """Return the configured Neon URL, falling back to DATABASE_URL for local retrofit work."""
 
         return self.neon_database_url or os.getenv("DATABASE_URL")
+
+    @property
+    def resolved_openai_api_key(self) -> str | None:
+        """Return the configured OpenAI key, falling back to OPENAI_API_KEY for local reuse."""
+
+        return self.openai_api_key or os.getenv("OPENAI_API_KEY")
 
     def ensure_dirs(self) -> None:
         """Create data, output, and cache directories if they don't exist."""

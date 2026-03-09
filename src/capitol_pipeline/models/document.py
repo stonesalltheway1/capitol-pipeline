@@ -14,6 +14,7 @@ DocumentSource = Literal[
     "house-clerk",
     "senate-ethics",
     "senate-watcher",
+    "fara",
     "fec",
     "lda",
     "congress-gov",

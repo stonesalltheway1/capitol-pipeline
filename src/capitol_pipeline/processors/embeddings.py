@@ -33,9 +33,9 @@ class OpenAIEmbedder(BaseEmbedder):
     """OpenAI embeddings via the REST API."""
 
     def __init__(self, settings: Settings) -> None:
-        api_key = settings.openai_api_key
+        api_key = settings.resolved_openai_api_key
         if not api_key:
-            raise RuntimeError("CAPITOL_OPENAI_API_KEY is required for OpenAI embeddings.")
+            raise RuntimeError("CAPITOL_OPENAI_API_KEY or OPENAI_API_KEY is required for OpenAI embeddings.")
         self.api_key = api_key
         self.base_url = settings.openai_base_url.rstrip("/")
         self.model = settings.openai_embedding_model

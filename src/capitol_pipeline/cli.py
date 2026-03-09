@@ -13,20 +13,30 @@ import click
 import httpx
 
 from capitol_pipeline.bridges import (
+    build_fara_member_match_search_document,
+    build_fara_registrant_search_document,
     build_house_ptr_search_document,
     build_house_ptr_search_document_from_stub_row,
     build_offshore_match_search_document,
 )
 from capitol_pipeline.config import OcrBackend, Settings
 from capitol_pipeline.exporters.neon import (
+    ensure_fara_schema,
     ensure_offshore_schema,
     ensure_search_schema,
+    fetch_search_chunk_embedding_backfill,
     fetch_house_stub_search_backfill,
     fetch_house_stub_queue,
     hybrid_search,
     load_member_registry_from_neon,
     mark_house_stub_processed,
     sync_house_stubs_to_neon,
+    update_search_chunk_embeddings,
+    upsert_fara_documents,
+    upsert_fara_foreign_principals,
+    upsert_fara_member_matches,
+    upsert_fara_registrants,
+    upsert_fara_short_forms,
     upsert_offshore_member_matches,
     upsert_offshore_nodes,
     upsert_offshore_relationships,
@@ -36,6 +46,14 @@ from capitol_pipeline.exporters.neon import (
     upsert_trade_rows_to_neon,
 )
 from capitol_pipeline.models.congress import FilingStub, HousePtrParseResult, MemberMatch, NormalizedTradeRow
+from capitol_pipeline.models.fara import (
+    FaraDocumentRecord,
+    FaraForeignPrincipalRecord,
+    FaraMemberMatchRecord,
+    FaraRegistrantBundle,
+    FaraRegistrantRecord,
+    FaraShortFormRecord,
+)
 from capitol_pipeline.models.offshore import OffshoreMemberMatchRecord, OffshoreNodeRecord
 from capitol_pipeline.normalizers.crypto_assets import classify_crypto_asset
 from capitol_pipeline.parsers.house_ptr import parse_house_ptr_pdf
@@ -44,6 +62,13 @@ from capitol_pipeline.processors.embeddings import get_embedder
 from capitol_pipeline.processors.ocr import OcrProcessor
 from capitol_pipeline.registries.members import MemberRegistry, load_member_registry_from_json
 from capitol_pipeline.sources.house_clerk import fetch_house_feed
+from capitol_pipeline.sources.fara import (
+    FaraApiClient,
+    fetch_active_registrants,
+    fetch_foreign_principals,
+    fetch_reg_documents,
+    fetch_short_forms,
+)
 from capitol_pipeline.sources.icij_offshore_leaks import iter_offshore_nodes, iter_offshore_relationships
 from capitol_pipeline.sources.senate_ethics import fetch_senate_watcher_feed
 
@@ -377,6 +402,34 @@ def build_offshore_member_match(
     )
 
 
+def build_fara_member_match(
+    registrant: FaraRegistrantRecord,
+    member: MemberMatch,
+    *,
+    entity_kind: str,
+    entity_key: str,
+    match_value: str,
+    metadata: dict[str, object] | None = None,
+) -> FaraMemberMatchRecord:
+    """Create a stable exact-name Congress match record for a FARA entity."""
+
+    stable_key = hashlib.sha1(
+        f"{member.id}|{entity_kind}|{entity_key}|{match_value}|exact_name".encode("utf-8")
+    ).hexdigest()
+    return FaraMemberMatchRecord(
+        match_key=stable_key,
+        member_id=member.id or "",
+        member_name=member.name,
+        member_slug=member.slug,
+        registration_number=registrant.registration_number,
+        entity_kind=entity_kind,
+        entity_key=entity_key,
+        registrant_name=registrant.name,
+        match_value=match_value,
+        metadata=metadata or {},
+    )
+
+
 @cli.command("house-feed")
 @click.option("--year", type=int, required=True, help="Disclosure year, for example 2026.")
 @click.option("--limit", type=int, default=10, show_default=True)
@@ -475,11 +528,21 @@ def ensure_offshore_schema_command() -> None:
     click.echo(json.dumps(summary, indent=2))
 
 
+@cli.command("ensure-fara-schema")
+def ensure_fara_schema_command() -> None:
+    """Create the official FARA raw corpus tables and Congress match table."""
+
+    settings = Settings()
+    summary = ensure_fara_schema(settings)
+    click.echo(json.dumps(summary, indent=2))
+
+
 @cli.command("ingest-offshore-leaks")
 @click.option("--node-batch-size", type=int, default=5000, show_default=True)
 @click.option("--relationship-batch-size", type=int, default=10000, show_default=True)
 @click.option("--node-limit-per-type", type=int, default=0, show_default=True, help="0 means full file.")
 @click.option("--relationship-limit", type=int, default=0, show_default=True, help="0 means full file.")
+@click.option("--skip-nodes/--include-nodes", default=False, show_default=True)
 @click.option("--skip-relationships/--include-relationships", default=False, show_default=True)
 @click.option("--skip-match-index/--with-match-index", default=False, show_default=True)
 @click.option("--with-embeddings/--no-embeddings", default=False, show_default=True)
@@ -489,6 +552,7 @@ def ingest_offshore_leaks_command(
     relationship_batch_size: int,
     node_limit_per_type: int,
     relationship_limit: int,
+    skip_nodes: bool,
     skip_relationships: bool,
     skip_match_index: bool,
     with_embeddings: bool,
@@ -515,54 +579,219 @@ def ingest_offshore_leaks_command(
         "datasets": {},
     }
 
-    for batch in batched(
-        iter_offshore_nodes(settings, limit_per_type=node_limit_per_type),
-        max(1, node_batch_size),
-    ):
-        upsert_offshore_nodes(settings, batch)
-        summary["nodesUpserted"] = int(summary["nodesUpserted"]) + len(batch)
-        summary["nodeBatches"] = int(summary["nodeBatches"]) + 1
-        datasets = summary["datasets"]
-        for node in batch:
-            datasets[node.source_dataset] = int(datasets.get(node.source_dataset, 0)) + 1  # type: ignore[union-attr]
+    if not skip_nodes:
+        for batch in batched(
+            iter_offshore_nodes(settings, limit_per_type=node_limit_per_type),
+            max(1, node_batch_size),
+        ):
+            upsert_offshore_nodes(settings, batch, ensure_schema=False)
+            summary["nodesUpserted"] = int(summary["nodesUpserted"]) + len(batch)
+            summary["nodeBatches"] = int(summary["nodeBatches"]) + 1
+            datasets = summary["datasets"]
+            for node in batch:
+                datasets[node.source_dataset] = int(datasets.get(node.source_dataset, 0)) + 1  # type: ignore[union-attr]
 
-        matches = [
-            build_offshore_member_match(node, match)
-            for node in batch
-            for match in [registry.resolve(name=node.name)]
-            if match and match.id
-        ]
-        if matches:
-            upsert_offshore_member_matches(settings, matches)
-            summary["memberMatchesUpserted"] = int(summary["memberMatchesUpserted"]) + len(matches)
-            if not skip_match_index:
-                for match_record in matches:
-                    node = next(item for item in batch if item.node_key == match_record.node_key)
-                    member = registry.resolve(name=match_record.member_name)
-                    if not member:
-                        continue
-                    search_document = build_offshore_match_search_document(node, member)
-                    index_summary = index_search_document(
-                        settings,
-                        search_document,
-                        with_embeddings=with_embeddings,
-                        ensure_schema=False,
-                    )
-                    summary["matchDocumentsUpserted"] = int(summary["matchDocumentsUpserted"]) + int(
-                        (index_summary.get("document") or {}).get("upserted", 0)  # type: ignore[union-attr]
-                    )
-                    summary["matchChunksUpserted"] = int(summary["matchChunksUpserted"]) + int(
-                        (index_summary.get("chunks") or {}).get("upserted", 0)  # type: ignore[union-attr]
-                    )
+            matches = [
+                build_offshore_member_match(node, match)
+                for node in batch
+                for match in [registry.resolve(name=node.name)]
+                if match and match.id
+            ]
+            if matches:
+                upsert_offshore_member_matches(settings, matches, ensure_schema=False)
+                summary["memberMatchesUpserted"] = int(summary["memberMatchesUpserted"]) + len(matches)
+                if not skip_match_index:
+                    for match_record in matches:
+                        node = next(item for item in batch if item.node_key == match_record.node_key)
+                        member = registry.resolve(name=match_record.member_name)
+                        if not member:
+                            continue
+                        search_document = build_offshore_match_search_document(node, member)
+                        index_summary = index_search_document(
+                            settings,
+                            search_document,
+                            with_embeddings=with_embeddings,
+                            ensure_schema=False,
+                        )
+                        summary["matchDocumentsUpserted"] = int(summary["matchDocumentsUpserted"]) + int(
+                            (index_summary.get("document") or {}).get("upserted", 0)  # type: ignore[union-attr]
+                        )
+                        summary["matchChunksUpserted"] = int(summary["matchChunksUpserted"]) + int(
+                            (index_summary.get("chunks") or {}).get("upserted", 0)  # type: ignore[union-attr]
+                        )
 
     if not skip_relationships:
         for batch in batched(
             iter_offshore_relationships(settings, limit=relationship_limit),
             max(1, relationship_batch_size),
         ):
-            upsert_offshore_relationships(settings, batch)
+            upsert_offshore_relationships(settings, batch, ensure_schema=False)
             summary["relationshipsUpserted"] = int(summary["relationshipsUpserted"]) + len(batch)
             summary["relationshipBatches"] = int(summary["relationshipBatches"]) + 1
+
+    click.echo(json.dumps(summary, indent=2))
+
+
+@cli.command("ingest-fara")
+@click.option("--limit-registrants", type=int, default=0, show_default=True, help="0 means all active registrants.")
+@click.option("--skip-match-index/--with-match-index", default=False, show_default=True)
+@click.option("--with-embeddings/--no-embeddings", default=False, show_default=True)
+@click.option("--export-registry/--no-export-registry", default=True, show_default=True)
+def ingest_fara_command(
+    limit_registrants: int,
+    skip_match_index: bool,
+    with_embeddings: bool,
+    export_registry: bool,
+) -> None:
+    """Ingest the official FARA corpus into Neon and search."""
+
+    settings = Settings()
+    ensure_fara_schema(settings)
+    if not skip_match_index:
+        ensure_search_schema(settings)
+    registry = load_registry_if_available(settings, export_cache=export_registry)
+    client = FaraApiClient(settings)
+    registrants = fetch_active_registrants(settings, client)
+    if limit_registrants > 0:
+        registrants = registrants[:limit_registrants]
+
+    summary: dict[str, object] = {
+        "registrantsQueued": len(registrants),
+        "registrantsUpserted": 0,
+        "foreignPrincipalsUpserted": 0,
+        "shortFormsUpserted": 0,
+        "documentsUpserted": 0,
+        "memberMatchesUpserted": 0,
+        "searchDocumentsUpserted": 0,
+        "searchChunksUpserted": 0,
+        "failedRegistrants": [],
+    }
+
+    for registrant in registrants:
+        principals: list[FaraForeignPrincipalRecord] = []
+        short_forms: list[FaraShortFormRecord] = []
+        documents: list[FaraDocumentRecord] = []
+        partial_errors: list[str] = []
+
+        for label, fetcher in (
+            ("foreignPrincipals", lambda: fetch_foreign_principals(settings, registrant.registration_number, client)),
+            ("shortForms", lambda: fetch_short_forms(settings, registrant.registration_number, client)),
+            ("documents", lambda: fetch_reg_documents(settings, registrant.registration_number, client)),
+        ):
+            try:
+                rows = fetcher()
+                if label == "foreignPrincipals":
+                    principals = rows  # type: ignore[assignment]
+                elif label == "shortForms":
+                    short_forms = rows  # type: ignore[assignment]
+                else:
+                    documents = rows  # type: ignore[assignment]
+            except Exception as error:  # pragma: no cover - depends on live API variance
+                partial_errors.append(f"{label}: {error}")
+
+        upsert_fara_registrants(settings, [registrant], ensure_schema=False)
+        upsert_fara_foreign_principals(settings, principals, ensure_schema=False)
+        upsert_fara_short_forms(settings, short_forms, ensure_schema=False)
+        upsert_fara_documents(settings, documents, ensure_schema=False)
+        summary["registrantsUpserted"] = int(summary["registrantsUpserted"]) + 1
+        summary["foreignPrincipalsUpserted"] = int(summary["foreignPrincipalsUpserted"]) + len(principals)
+        summary["shortFormsUpserted"] = int(summary["shortFormsUpserted"]) + len(short_forms)
+        summary["documentsUpserted"] = int(summary["documentsUpserted"]) + len(documents)
+
+        bundle = FaraRegistrantBundle(
+            registrant=registrant,
+            foreign_principals=principals,
+            short_forms=short_forms,
+            documents=documents,
+        )
+
+        matches: list[FaraMemberMatchRecord] = []
+        if registry:
+            registrant_match = registry.resolve(name=registrant.name, state=registrant.state)
+            if registrant_match and registrant_match.id:
+                matches.append(
+                    build_fara_member_match(
+                        registrant,
+                        registrant_match,
+                        entity_kind="registrant",
+                        entity_key=f"registrant:{registrant.registration_number}",
+                        match_value=registrant.name,
+                        metadata={"registrationDate": registrant.registration_date},
+                    )
+                )
+            for principal in principals:
+                member = registry.resolve(name=principal.foreign_principal_name, state=principal.state)
+                if member and member.id:
+                    matches.append(
+                        build_fara_member_match(
+                            registrant,
+                            member,
+                            entity_kind="foreign_principal",
+                            entity_key=principal.principal_key,
+                            match_value=principal.foreign_principal_name,
+                            metadata={"country": principal.country_name},
+                        )
+                    )
+            for short_form in short_forms:
+                member = registry.resolve(
+                    first_name=short_form.first_name,
+                    last_name=short_form.last_name,
+                    state=short_form.state,
+                )
+                if member and member.id:
+                    matches.append(
+                        build_fara_member_match(
+                            registrant,
+                            member,
+                            entity_kind="short_form",
+                            entity_key=short_form.short_form_key,
+                            match_value=short_form.full_name,
+                            metadata={"shortFormDate": short_form.short_form_date},
+                        )
+                    )
+        if matches:
+            deduped: dict[str, FaraMemberMatchRecord] = {match.match_key: match for match in matches}
+            fara_matches = list(deduped.values())
+            upsert_fara_member_matches(settings, fara_matches, ensure_schema=False)
+            summary["memberMatchesUpserted"] = int(summary["memberMatchesUpserted"]) + len(fara_matches)
+        else:
+            fara_matches = []
+
+        if not skip_match_index:
+            registrant_index_summary = index_search_document(
+                settings,
+                build_fara_registrant_search_document(bundle),
+                with_embeddings=with_embeddings,
+                ensure_schema=False,
+            )
+            summary["searchDocumentsUpserted"] = int(summary["searchDocumentsUpserted"]) + int(
+                (registrant_index_summary.get("document") or {}).get("upserted", 0)  # type: ignore[union-attr]
+            )
+            summary["searchChunksUpserted"] = int(summary["searchChunksUpserted"]) + int(
+                (registrant_index_summary.get("chunks") or {}).get("upserted", 0)  # type: ignore[union-attr]
+            )
+            for match in fara_matches:
+                match_index_summary = index_search_document(
+                    settings,
+                    build_fara_member_match_search_document(match, bundle),
+                    with_embeddings=with_embeddings,
+                    ensure_schema=False,
+                )
+                summary["searchDocumentsUpserted"] = int(summary["searchDocumentsUpserted"]) + int(
+                    (match_index_summary.get("document") or {}).get("upserted", 0)  # type: ignore[union-attr]
+                )
+                summary["searchChunksUpserted"] = int(summary["searchChunksUpserted"]) + int(
+                    (match_index_summary.get("chunks") or {}).get("upserted", 0)  # type: ignore[union-attr]
+                )
+
+        if partial_errors:
+            summary["failedRegistrants"].append(  # type: ignore[union-attr]
+                {
+                    "registrationNumber": registrant.registration_number,
+                    "name": registrant.name,
+                    "errors": partial_errors,
+                }
+            )
 
     click.echo(json.dumps(summary, indent=2))
 
@@ -813,6 +1042,37 @@ def index_house_search_backfill_command(
         )
 
     click.echo(json.dumps(summary, indent=2))
+
+
+@cli.command("embed-search-backfill")
+@click.option("--limit", type=int, default=100, show_default=True)
+@click.option("--source", type=str, default=None, help="Optional pipeline_search_documents.source filter.")
+def embed_search_backfill_command(
+    limit: int,
+    source: str | None,
+) -> None:
+    """Embed existing search chunks that still have null embeddings."""
+
+    settings = Settings()
+    rows = fetch_search_chunk_embedding_backfill(settings, limit=limit, source=source)
+    embedder = get_embedder(settings)
+    embeddings = embedder.embed_texts([str(row.get("content") or "") for row in rows])
+    updates = [
+        (str(row.get("id") or ""), embedding)
+        for row, embedding in zip(rows, embeddings, strict=False)
+        if embedding
+    ]
+    summary = update_search_chunk_embeddings(settings, updates)
+    click.echo(
+        json.dumps(
+            {
+                "queued": len(rows),
+                "updated": summary["updated"],
+                "source": source,
+            },
+            indent=2,
+        )
+    )
 
 
 @cli.command("process-house-backlog")

@@ -93,9 +93,16 @@ Status: completed locally
 - Derive Congress exact-name matches from the offshore corpus
 - Index matched offshore records into the pipeline search layer
 
-Status: in progress
+Status: in progress, raw node ingest live
 
 ### Phase 7
+- Ingest the official FARA API into dedicated raw corpus tables
+- Build registrant-level search documents for retrieval
+- Derive exact Congress matches from registrant, foreign principal, and short-form names
+
+Status: completed locally, full ingest started
+
+### Phase 8
 - Replace CapitolExposed's `lib/ptr-extraction.ts` queue worker with a thin
   wrapper that shells into or directly imports this pipeline
 - Move House retry policy and stub status transitions into the pipeline layer
@@ -109,5 +116,6 @@ Status: in progress
 3. Port the remaining House PTR edge-case handling out of the app layer.
 4. Backfill indexed search for parsed House PTR documents already in Neon.
 5. Finish the full Offshore Leaks corpus import and relationship backfill.
-6. Add end-to-end fixture tests from recent filings that previously failed in production.
-7. Extend the same pipeline architecture to official Senate ingestion.
+6. Finish the full FARA ingest and embed the most useful search chunks.
+7. Add end-to-end fixture tests from recent filings that previously failed in production.
+8. Extend the same pipeline architecture to official Senate ingestion.

@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from contextlib import contextmanager
 from datetime import datetime, timezone
+import hashlib
 from typing import Iterator
 
 from capitol_pipeline.bridges.capitol_exposed import (
@@ -12,6 +13,13 @@ from capitol_pipeline.bridges.capitol_exposed import (
 )
 from capitol_pipeline.config import Settings
 from capitol_pipeline.models.congress import FilingStub, NormalizedTradeRow
+from capitol_pipeline.models.fara import (
+    FaraDocumentRecord,
+    FaraForeignPrincipalRecord,
+    FaraMemberMatchRecord,
+    FaraRegistrantRecord,
+    FaraShortFormRecord,
+)
 from capitol_pipeline.models.offshore import (
     OffshoreMemberMatchRecord,
     OffshoreNodeRecord,
@@ -40,6 +48,11 @@ PIPELINE_SEARCH_CHUNKS_TABLE = "pipeline_search_chunks"
 PIPELINE_OFFSHORE_NODES_TABLE = "pipeline_offshore_nodes"
 PIPELINE_OFFSHORE_RELATIONSHIPS_TABLE = "pipeline_offshore_relationships"
 PIPELINE_OFFSHORE_MEMBER_MATCHES_TABLE = "pipeline_offshore_member_matches"
+PIPELINE_FARA_REGISTRANTS_TABLE = "pipeline_fara_registrants"
+PIPELINE_FARA_FOREIGN_PRINCIPALS_TABLE = "pipeline_fara_foreign_principals"
+PIPELINE_FARA_SHORT_FORMS_TABLE = "pipeline_fara_short_forms"
+PIPELINE_FARA_DOCUMENTS_TABLE = "pipeline_fara_documents"
+PIPELINE_FARA_MEMBER_MATCHES_TABLE = "pipeline_fara_member_matches"
 
 
 def ensure_neon_available() -> None:
@@ -83,6 +96,28 @@ def vector_literal(values: list[float] | None) -> str | None:
     return "[" + ",".join(f"{value:.8f}" for value in values) + "]"
 
 
+def advisory_lock_key(name: str) -> int:
+    """Create a stable advisory lock key from a schema name."""
+
+    digest = hashlib.sha1(name.encode("utf-8")).digest()
+    unsigned = int.from_bytes(digest[:8], "big", signed=False)
+    return unsigned - (1 << 63) if unsigned >= (1 << 63) else unsigned
+
+
+@contextmanager
+def advisory_lock(connection: "psycopg.Connection", name: str) -> Iterator[None]:  # type: ignore[name-defined]
+    """Hold a Postgres advisory lock for the duration of a schema update."""
+
+    key = advisory_lock_key(name)
+    with connection.cursor() as cursor:
+        cursor.execute("SELECT pg_advisory_lock(%s)", (key,))
+    try:
+        yield
+    finally:
+        with connection.cursor() as cursor:
+            cursor.execute("SELECT pg_advisory_unlock(%s)", (key,))
+
+
 def load_member_registry_from_neon(
     settings: Settings,
     *,
@@ -119,77 +154,97 @@ def ensure_search_schema(settings: Settings) -> dict[str, object]:
         raise RuntimeError("Embedding dimensions must be greater than zero.")
 
     with neon_connection(settings) as connection:
-        with connection.cursor() as cursor:
-            cursor.execute("CREATE EXTENSION IF NOT EXISTS vector")
-            cursor.execute(
-                """
-                CREATE TABLE IF NOT EXISTS pipeline_search_documents (
-                    id TEXT PRIMARY KEY,
-                    source_document_id TEXT NOT NULL UNIQUE,
-                    title TEXT NOT NULL,
-                    content TEXT NOT NULL,
-                    source TEXT NOT NULL,
-                    category TEXT NOT NULL,
-                    document_date DATE NULL,
-                    summary TEXT NULL,
-                    source_url TEXT NULL,
-                    pdf_url TEXT NULL,
-                    member_ids TEXT[] NOT NULL DEFAULT '{}'::text[],
-                    committee_ids TEXT[] NOT NULL DEFAULT '{}'::text[],
-                    bill_ids TEXT[] NOT NULL DEFAULT '{}'::text[],
-                    asset_tickers TEXT[] NOT NULL DEFAULT '{}'::text[],
-                    tags TEXT[] NOT NULL DEFAULT '{}'::text[],
-                    metadata JSONB NOT NULL DEFAULT '{}'::jsonb,
-                    content_tsv tsvector GENERATED ALWAYS AS (
-                        to_tsvector(
-                            'english',
-                            coalesce(title, '') || ' ' || coalesce(summary, '') || ' ' || coalesce(content, '')
-                        )
-                    ) STORED,
-                    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-                    updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+        with advisory_lock(connection, "pipeline-search-schema"):
+            with connection.cursor() as cursor:
+                cursor.execute("CREATE EXTENSION IF NOT EXISTS vector")
+                cursor.execute(
+                    """
+                    CREATE TABLE IF NOT EXISTS pipeline_search_documents (
+                        id TEXT PRIMARY KEY,
+                        source_document_id TEXT NOT NULL UNIQUE,
+                        title TEXT NOT NULL,
+                        content TEXT NOT NULL,
+                        source TEXT NOT NULL,
+                        category TEXT NOT NULL,
+                        document_date DATE NULL,
+                        summary TEXT NULL,
+                        source_url TEXT NULL,
+                        pdf_url TEXT NULL,
+                        member_ids TEXT[] NOT NULL DEFAULT '{}'::text[],
+                        committee_ids TEXT[] NOT NULL DEFAULT '{}'::text[],
+                        bill_ids TEXT[] NOT NULL DEFAULT '{}'::text[],
+                        asset_tickers TEXT[] NOT NULL DEFAULT '{}'::text[],
+                        tags TEXT[] NOT NULL DEFAULT '{}'::text[],
+                        metadata JSONB NOT NULL DEFAULT '{}'::jsonb,
+                        content_tsv tsvector GENERATED ALWAYS AS (
+                            to_tsvector(
+                                'english',
+                                coalesce(title, '') || ' ' || coalesce(summary, '') || ' ' || coalesce(content, '')
+                            )
+                        ) STORED,
+                        created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+                        updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+                    )
+                    """
                 )
-                """
-            )
-            cursor.execute(
-                f"""
-                CREATE TABLE IF NOT EXISTS pipeline_search_chunks (
-                    id TEXT PRIMARY KEY,
-                    document_id TEXT NOT NULL REFERENCES pipeline_search_documents(id) ON DELETE CASCADE,
-                    chunk_index INT NOT NULL,
-                    content TEXT NOT NULL,
-                    token_estimate INT NOT NULL DEFAULT 0,
-                    metadata JSONB NOT NULL DEFAULT '{{}}'::jsonb,
-                    text_tsv tsvector GENERATED ALWAYS AS (
-                        to_tsvector('english', coalesce(content, ''))
-                    ) STORED,
-                    embedding vector({dimensions}),
-                    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-                    updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+                cursor.execute(
+                    f"""
+                    CREATE TABLE IF NOT EXISTS pipeline_search_chunks (
+                        id TEXT PRIMARY KEY,
+                        document_id TEXT NOT NULL REFERENCES pipeline_search_documents(id) ON DELETE CASCADE,
+                        chunk_index INT NOT NULL,
+                        content TEXT NOT NULL,
+                        token_estimate INT NOT NULL DEFAULT 0,
+                        metadata JSONB NOT NULL DEFAULT '{{}}'::jsonb,
+                        text_tsv tsvector GENERATED ALWAYS AS (
+                            to_tsvector('english', coalesce(content, ''))
+                        ) STORED,
+                        embedding vector({dimensions}),
+                        created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+                        updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+                    )
+                    """
                 )
-                """
-            )
-            cursor.execute(
-                "CREATE INDEX IF NOT EXISTS idx_pipeline_search_documents_tsv ON pipeline_search_documents USING GIN (content_tsv)"
-            )
-            cursor.execute(
-                "CREATE INDEX IF NOT EXISTS idx_pipeline_search_chunks_tsv ON pipeline_search_chunks USING GIN (text_tsv)"
-            )
-            cursor.execute(
-                "CREATE INDEX IF NOT EXISTS idx_pipeline_search_chunks_document ON pipeline_search_chunks USING BTREE (document_id, chunk_index)"
-            )
-            cursor.execute(
-                "CREATE INDEX IF NOT EXISTS idx_pipeline_search_documents_source ON pipeline_search_documents USING BTREE (source, category, document_date DESC)"
-            )
-            cursor.execute(
-                """
-                CREATE INDEX IF NOT EXISTS idx_pipeline_search_chunks_embedding
-                ON pipeline_search_chunks
-                USING ivfflat (embedding vector_cosine_ops)
-                WITH (lists = 100)
-                """
-            )
-        connection.commit()
+                cursor.execute(
+                    """
+                    SELECT format_type(a.atttypid, a.atttypmod)
+                    FROM pg_attribute a
+                    JOIN pg_class c ON a.attrelid = c.oid
+                    JOIN pg_namespace n ON c.relnamespace = n.oid
+                    WHERE c.relname = 'pipeline_search_chunks'
+                      AND a.attname = 'embedding'
+                      AND n.nspname = current_schema()
+                    """
+                )
+                row = cursor.fetchone()
+                current_type = str(row["format_type"]) if row and row.get("format_type") else None
+                expected_type = f"vector({dimensions})"
+                if current_type and current_type != expected_type:
+                    raise RuntimeError(
+                        f"Existing pipeline_search_chunks.embedding uses {current_type}. "
+                        f"Expected {expected_type}. Set matching embedding dimensions before indexing."
+                    )
+                cursor.execute(
+                    "CREATE INDEX IF NOT EXISTS idx_pipeline_search_documents_tsv ON pipeline_search_documents USING GIN (content_tsv)"
+                )
+                cursor.execute(
+                    "CREATE INDEX IF NOT EXISTS idx_pipeline_search_chunks_tsv ON pipeline_search_chunks USING GIN (text_tsv)"
+                )
+                cursor.execute(
+                    "CREATE INDEX IF NOT EXISTS idx_pipeline_search_chunks_document ON pipeline_search_chunks USING BTREE (document_id, chunk_index)"
+                )
+                cursor.execute(
+                    "CREATE INDEX IF NOT EXISTS idx_pipeline_search_documents_source ON pipeline_search_documents USING BTREE (source, category, document_date DESC)"
+                )
+                cursor.execute(
+                    """
+                    CREATE INDEX IF NOT EXISTS idx_pipeline_search_chunks_embedding
+                    ON pipeline_search_chunks
+                    USING ivfflat (embedding vector_cosine_ops)
+                    WITH (lists = 100)
+                    """
+                )
+            connection.commit()
 
     return {
         "dimensions": dimensions,
@@ -201,8 +256,9 @@ def ensure_offshore_schema(settings: Settings) -> dict[str, object]:
     """Create the Offshore Leaks raw corpus tables and Congress match table."""
 
     with neon_connection(settings) as connection:
-        with connection.cursor() as cursor:
-            cursor.execute(
+        with advisory_lock(connection, "pipeline-offshore-schema"):
+            with connection.cursor() as cursor:
+                cursor.execute(
                 f"""
                 CREATE TABLE IF NOT EXISTS {PIPELINE_OFFSHORE_NODES_TABLE} (
                     node_key TEXT PRIMARY KEY,
@@ -232,7 +288,7 @@ def ensure_offshore_schema(settings: Settings) -> dict[str, object]:
                 )
                 """
             )
-            cursor.execute(
+                cursor.execute(
                 f"""
                 CREATE TABLE IF NOT EXISTS {PIPELINE_OFFSHORE_RELATIONSHIPS_TABLE} (
                     relationship_key TEXT PRIMARY KEY,
@@ -250,7 +306,7 @@ def ensure_offshore_schema(settings: Settings) -> dict[str, object]:
                 )
                 """
             )
-            cursor.execute(
+                cursor.execute(
                 f"""
                 CREATE TABLE IF NOT EXISTS {PIPELINE_OFFSHORE_MEMBER_MATCHES_TABLE} (
                     match_key TEXT PRIMARY KEY,
@@ -268,31 +324,179 @@ def ensure_offshore_schema(settings: Settings) -> dict[str, object]:
                 )
                 """
             )
-            cursor.execute(
+                cursor.execute(
                 f"CREATE INDEX IF NOT EXISTS idx_pipeline_offshore_nodes_name ON {PIPELINE_OFFSHORE_NODES_TABLE} USING BTREE (normalized_name)"
-            )
-            cursor.execute(
+                )
+                cursor.execute(
                 f"CREATE INDEX IF NOT EXISTS idx_pipeline_offshore_nodes_dataset ON {PIPELINE_OFFSHORE_NODES_TABLE} USING BTREE (source_dataset, node_type)"
-            )
-            cursor.execute(
+                )
+                cursor.execute(
                 f"CREATE INDEX IF NOT EXISTS idx_pipeline_offshore_nodes_tsv ON {PIPELINE_OFFSHORE_NODES_TABLE} USING GIN (content_tsv)"
-            )
-            cursor.execute(
+                )
+                cursor.execute(
                 f"CREATE INDEX IF NOT EXISTS idx_pipeline_offshore_relationships_start ON {PIPELINE_OFFSHORE_RELATIONSHIPS_TABLE} USING BTREE (start_node_id, rel_type)"
-            )
-            cursor.execute(
+                )
+                cursor.execute(
                 f"CREATE INDEX IF NOT EXISTS idx_pipeline_offshore_relationships_end ON {PIPELINE_OFFSHORE_RELATIONSHIPS_TABLE} USING BTREE (end_node_id, rel_type)"
-            )
-            cursor.execute(
+                )
+                cursor.execute(
                 f"CREATE INDEX IF NOT EXISTS idx_pipeline_offshore_member_matches_member ON {PIPELINE_OFFSHORE_MEMBER_MATCHES_TABLE} USING BTREE (member_id, source_dataset)"
-            )
-        connection.commit()
+                )
+            connection.commit()
 
     return {
         "tables": [
             PIPELINE_OFFSHORE_NODES_TABLE,
             PIPELINE_OFFSHORE_RELATIONSHIPS_TABLE,
             PIPELINE_OFFSHORE_MEMBER_MATCHES_TABLE,
+        ]
+    }
+
+
+def ensure_fara_schema(settings: Settings) -> dict[str, object]:
+    """Create the official FARA raw corpus tables and Congress match table."""
+
+    with neon_connection(settings) as connection:
+        with advisory_lock(connection, "pipeline-fara-schema"):
+            with connection.cursor() as cursor:
+                cursor.execute(
+                    f"""
+                    CREATE TABLE IF NOT EXISTS {PIPELINE_FARA_REGISTRANTS_TABLE} (
+                        registration_number INT PRIMARY KEY,
+                        name TEXT NOT NULL,
+                        normalized_name TEXT NOT NULL,
+                        registration_date DATE NULL,
+                        address_1 TEXT NULL,
+                        address_2 TEXT NULL,
+                        city TEXT NULL,
+                        state TEXT NULL,
+                        zip_code TEXT NULL,
+                        summary TEXT NOT NULL,
+                        content TEXT NOT NULL,
+                        metadata JSONB NOT NULL DEFAULT '{{}}'::jsonb,
+                        content_tsv tsvector GENERATED ALWAYS AS (
+                            to_tsvector('english', coalesce(name, '') || ' ' || coalesce(summary, '') || ' ' || coalesce(content, ''))
+                        ) STORED,
+                        created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+                        updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+                    )
+                    """
+                )
+                cursor.execute(
+                    f"""
+                    CREATE TABLE IF NOT EXISTS {PIPELINE_FARA_FOREIGN_PRINCIPALS_TABLE} (
+                        principal_key TEXT PRIMARY KEY,
+                        registration_number INT NOT NULL REFERENCES {PIPELINE_FARA_REGISTRANTS_TABLE}(registration_number) ON DELETE CASCADE,
+                        foreign_principal_name TEXT NOT NULL,
+                        normalized_name TEXT NOT NULL,
+                        registrant_name TEXT NOT NULL,
+                        country_name TEXT NULL,
+                        registration_date DATE NULL,
+                        foreign_principal_registration_date DATE NULL,
+                        address_1 TEXT NULL,
+                        address_2 TEXT NULL,
+                        city TEXT NULL,
+                        state TEXT NULL,
+                        zip_code TEXT NULL,
+                        metadata JSONB NOT NULL DEFAULT '{{}}'::jsonb,
+                        created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+                        updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+                    )
+                    """
+                )
+                cursor.execute(
+                    f"""
+                    CREATE TABLE IF NOT EXISTS {PIPELINE_FARA_SHORT_FORMS_TABLE} (
+                        short_form_key TEXT PRIMARY KEY,
+                        registration_number INT NOT NULL REFERENCES {PIPELINE_FARA_REGISTRANTS_TABLE}(registration_number) ON DELETE CASCADE,
+                        registrant_name TEXT NOT NULL,
+                        first_name TEXT NOT NULL,
+                        last_name TEXT NOT NULL,
+                        full_name TEXT NOT NULL,
+                        normalized_name TEXT NOT NULL,
+                        short_form_date DATE NULL,
+                        registration_date DATE NULL,
+                        address_1 TEXT NULL,
+                        address_2 TEXT NULL,
+                        city TEXT NULL,
+                        state TEXT NULL,
+                        zip_code TEXT NULL,
+                        metadata JSONB NOT NULL DEFAULT '{{}}'::jsonb,
+                        created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+                        updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+                    )
+                    """
+                )
+                cursor.execute(
+                    f"""
+                    CREATE TABLE IF NOT EXISTS {PIPELINE_FARA_DOCUMENTS_TABLE} (
+                        document_key TEXT PRIMARY KEY,
+                        registration_number INT NOT NULL REFERENCES {PIPELINE_FARA_REGISTRANTS_TABLE}(registration_number) ON DELETE CASCADE,
+                        registrant_name TEXT NOT NULL,
+                        document_type TEXT NOT NULL,
+                        date_stamped DATE NULL,
+                        url TEXT NOT NULL,
+                        short_form_name TEXT NULL,
+                        foreign_principal_name TEXT NULL,
+                        foreign_principal_country TEXT NULL,
+                        metadata JSONB NOT NULL DEFAULT '{{}}'::jsonb,
+                        created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+                        updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+                    )
+                    """
+                )
+                cursor.execute(
+                    f"""
+                    CREATE TABLE IF NOT EXISTS {PIPELINE_FARA_MEMBER_MATCHES_TABLE} (
+                        match_key TEXT PRIMARY KEY,
+                        member_id TEXT NOT NULL,
+                        member_name TEXT NOT NULL,
+                        member_slug TEXT NULL,
+                        registration_number INT NOT NULL REFERENCES {PIPELINE_FARA_REGISTRANTS_TABLE}(registration_number) ON DELETE CASCADE,
+                        entity_kind TEXT NOT NULL,
+                        entity_key TEXT NOT NULL,
+                        registrant_name TEXT NOT NULL,
+                        match_type TEXT NOT NULL,
+                        match_value TEXT NOT NULL,
+                        metadata JSONB NOT NULL DEFAULT '{{}}'::jsonb,
+                        created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+                        updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+                    )
+                    """
+                )
+                cursor.execute(
+                    f"CREATE INDEX IF NOT EXISTS idx_pipeline_fara_registrants_name ON {PIPELINE_FARA_REGISTRANTS_TABLE} USING BTREE (normalized_name)"
+                )
+                cursor.execute(
+                    f"CREATE INDEX IF NOT EXISTS idx_pipeline_fara_registrants_tsv ON {PIPELINE_FARA_REGISTRANTS_TABLE} USING GIN (content_tsv)"
+                )
+                cursor.execute(
+                    f"CREATE INDEX IF NOT EXISTS idx_pipeline_fara_foreign_principals_reg ON {PIPELINE_FARA_FOREIGN_PRINCIPALS_TABLE} USING BTREE (registration_number)"
+                )
+                cursor.execute(
+                    f"CREATE INDEX IF NOT EXISTS idx_pipeline_fara_foreign_principals_name ON {PIPELINE_FARA_FOREIGN_PRINCIPALS_TABLE} USING BTREE (normalized_name)"
+                )
+                cursor.execute(
+                    f"CREATE INDEX IF NOT EXISTS idx_pipeline_fara_short_forms_reg ON {PIPELINE_FARA_SHORT_FORMS_TABLE} USING BTREE (registration_number)"
+                )
+                cursor.execute(
+                    f"CREATE INDEX IF NOT EXISTS idx_pipeline_fara_short_forms_name ON {PIPELINE_FARA_SHORT_FORMS_TABLE} USING BTREE (normalized_name)"
+                )
+                cursor.execute(
+                    f"CREATE INDEX IF NOT EXISTS idx_pipeline_fara_documents_reg ON {PIPELINE_FARA_DOCUMENTS_TABLE} USING BTREE (registration_number, date_stamped DESC)"
+                )
+                cursor.execute(
+                    f"CREATE INDEX IF NOT EXISTS idx_pipeline_fara_member_matches_member ON {PIPELINE_FARA_MEMBER_MATCHES_TABLE} USING BTREE (member_id, entity_kind)"
+                )
+            connection.commit()
+
+    return {
+        "tables": [
+            PIPELINE_FARA_REGISTRANTS_TABLE,
+            PIPELINE_FARA_FOREIGN_PRINCIPALS_TABLE,
+            PIPELINE_FARA_SHORT_FORMS_TABLE,
+            PIPELINE_FARA_DOCUMENTS_TABLE,
+            PIPELINE_FARA_MEMBER_MATCHES_TABLE,
         ]
     }
 
@@ -637,12 +841,15 @@ def fetch_house_stub_queue(
 def upsert_offshore_nodes(
     settings: Settings,
     rows: list[OffshoreNodeRecord],
+    *,
+    ensure_schema: bool = True,
 ) -> dict[str, int]:
     """Upsert Offshore Leaks nodes into the raw corpus table."""
 
     if not rows:
         return {"upserted": 0}
-    ensure_offshore_schema(settings)
+    if ensure_schema:
+        ensure_offshore_schema(settings)
     with neon_connection(settings) as connection:
         with connection.cursor() as cursor:
             cursor.executemany(
@@ -724,12 +931,15 @@ def upsert_offshore_nodes(
 def upsert_offshore_relationships(
     settings: Settings,
     rows: list[OffshoreRelationshipRecord],
+    *,
+    ensure_schema: bool = True,
 ) -> dict[str, int]:
     """Upsert Offshore Leaks relationships into the raw corpus table."""
 
     if not rows:
         return {"upserted": 0}
-    ensure_offshore_schema(settings)
+    if ensure_schema:
+        ensure_offshore_schema(settings)
     with neon_connection(settings) as connection:
         with connection.cursor() as cursor:
             cursor.executemany(
@@ -782,12 +992,15 @@ def upsert_offshore_relationships(
 def upsert_offshore_member_matches(
     settings: Settings,
     rows: list[OffshoreMemberMatchRecord],
+    *,
+    ensure_schema: bool = True,
 ) -> dict[str, int]:
     """Upsert exact Congress matches against Offshore Leaks nodes."""
 
     if not rows:
         return {"upserted": 0}
-    ensure_offshore_schema(settings)
+    if ensure_schema:
+        ensure_offshore_schema(settings)
     with neon_connection(settings) as connection:
         with connection.cursor() as cursor:
             cursor.executemany(
@@ -838,6 +1051,351 @@ def upsert_offshore_member_matches(
     return {"upserted": len(rows)}
 
 
+def upsert_fara_registrants(
+    settings: Settings,
+    rows: list[FaraRegistrantRecord],
+    *,
+    ensure_schema: bool = True,
+) -> dict[str, int]:
+    """Upsert FARA registrants into the raw corpus table."""
+
+    if not rows:
+        return {"upserted": 0}
+    if ensure_schema:
+        ensure_fara_schema(settings)
+    with neon_connection(settings) as connection:
+        with connection.cursor() as cursor:
+            cursor.executemany(
+                f"""
+                INSERT INTO {PIPELINE_FARA_REGISTRANTS_TABLE} (
+                    registration_number,
+                    name,
+                    normalized_name,
+                    registration_date,
+                    address_1,
+                    address_2,
+                    city,
+                    state,
+                    zip_code,
+                    summary,
+                    content,
+                    metadata,
+                    updated_at
+                )
+                VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, NOW())
+                ON CONFLICT (registration_number) DO UPDATE SET
+                    name = EXCLUDED.name,
+                    normalized_name = EXCLUDED.normalized_name,
+                    registration_date = EXCLUDED.registration_date,
+                    address_1 = EXCLUDED.address_1,
+                    address_2 = EXCLUDED.address_2,
+                    city = EXCLUDED.city,
+                    state = EXCLUDED.state,
+                    zip_code = EXCLUDED.zip_code,
+                    summary = EXCLUDED.summary,
+                    content = EXCLUDED.content,
+                    metadata = EXCLUDED.metadata,
+                    updated_at = NOW()
+                """,
+                [
+                    (
+                        row.registration_number,
+                        row.name,
+                        row.normalized_name,
+                        row.registration_date,
+                        row.address_1,
+                        row.address_2,
+                        row.city,
+                        row.state,
+                        row.zip_code,
+                        row.summary,
+                        row.content,
+                        Jsonb(row.metadata),  # type: ignore[arg-type]
+                    )
+                    for row in rows
+                ],
+            )
+        connection.commit()
+    return {"upserted": len(rows)}
+
+
+def upsert_fara_foreign_principals(
+    settings: Settings,
+    rows: list[FaraForeignPrincipalRecord],
+    *,
+    ensure_schema: bool = True,
+) -> dict[str, int]:
+    """Upsert FARA foreign principals into the raw corpus table."""
+
+    if not rows:
+        return {"upserted": 0}
+    if ensure_schema:
+        ensure_fara_schema(settings)
+    with neon_connection(settings) as connection:
+        with connection.cursor() as cursor:
+            cursor.executemany(
+                f"""
+                INSERT INTO {PIPELINE_FARA_FOREIGN_PRINCIPALS_TABLE} (
+                    principal_key,
+                    registration_number,
+                    foreign_principal_name,
+                    normalized_name,
+                    registrant_name,
+                    country_name,
+                    registration_date,
+                    foreign_principal_registration_date,
+                    address_1,
+                    address_2,
+                    city,
+                    state,
+                    zip_code,
+                    metadata,
+                    updated_at
+                )
+                VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, NOW())
+                ON CONFLICT (principal_key) DO UPDATE SET
+                    registration_number = EXCLUDED.registration_number,
+                    foreign_principal_name = EXCLUDED.foreign_principal_name,
+                    normalized_name = EXCLUDED.normalized_name,
+                    registrant_name = EXCLUDED.registrant_name,
+                    country_name = EXCLUDED.country_name,
+                    registration_date = EXCLUDED.registration_date,
+                    foreign_principal_registration_date = EXCLUDED.foreign_principal_registration_date,
+                    address_1 = EXCLUDED.address_1,
+                    address_2 = EXCLUDED.address_2,
+                    city = EXCLUDED.city,
+                    state = EXCLUDED.state,
+                    zip_code = EXCLUDED.zip_code,
+                    metadata = EXCLUDED.metadata,
+                    updated_at = NOW()
+                """,
+                [
+                    (
+                        row.principal_key,
+                        row.registration_number,
+                        row.foreign_principal_name,
+                        row.normalized_name,
+                        row.registrant_name,
+                        row.country_name,
+                        row.registration_date,
+                        row.foreign_principal_registration_date,
+                        row.address_1,
+                        row.address_2,
+                        row.city,
+                        row.state,
+                        row.zip_code,
+                        Jsonb(row.metadata),  # type: ignore[arg-type]
+                    )
+                    for row in rows
+                ],
+            )
+        connection.commit()
+    return {"upserted": len(rows)}
+
+
+def upsert_fara_short_forms(
+    settings: Settings,
+    rows: list[FaraShortFormRecord],
+    *,
+    ensure_schema: bool = True,
+) -> dict[str, int]:
+    """Upsert FARA short-form registrants into the raw corpus table."""
+
+    if not rows:
+        return {"upserted": 0}
+    if ensure_schema:
+        ensure_fara_schema(settings)
+    with neon_connection(settings) as connection:
+        with connection.cursor() as cursor:
+            cursor.executemany(
+                f"""
+                INSERT INTO {PIPELINE_FARA_SHORT_FORMS_TABLE} (
+                    short_form_key,
+                    registration_number,
+                    registrant_name,
+                    first_name,
+                    last_name,
+                    full_name,
+                    normalized_name,
+                    short_form_date,
+                    registration_date,
+                    address_1,
+                    address_2,
+                    city,
+                    state,
+                    zip_code,
+                    metadata,
+                    updated_at
+                )
+                VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, NOW())
+                ON CONFLICT (short_form_key) DO UPDATE SET
+                    registration_number = EXCLUDED.registration_number,
+                    registrant_name = EXCLUDED.registrant_name,
+                    first_name = EXCLUDED.first_name,
+                    last_name = EXCLUDED.last_name,
+                    full_name = EXCLUDED.full_name,
+                    normalized_name = EXCLUDED.normalized_name,
+                    short_form_date = EXCLUDED.short_form_date,
+                    registration_date = EXCLUDED.registration_date,
+                    address_1 = EXCLUDED.address_1,
+                    address_2 = EXCLUDED.address_2,
+                    city = EXCLUDED.city,
+                    state = EXCLUDED.state,
+                    zip_code = EXCLUDED.zip_code,
+                    metadata = EXCLUDED.metadata,
+                    updated_at = NOW()
+                """,
+                [
+                    (
+                        row.short_form_key,
+                        row.registration_number,
+                        row.registrant_name,
+                        row.first_name,
+                        row.last_name,
+                        row.full_name,
+                        row.normalized_name,
+                        row.short_form_date,
+                        row.registration_date,
+                        row.address_1,
+                        row.address_2,
+                        row.city,
+                        row.state,
+                        row.zip_code,
+                        Jsonb(row.metadata),  # type: ignore[arg-type]
+                    )
+                    for row in rows
+                ],
+            )
+        connection.commit()
+    return {"upserted": len(rows)}
+
+
+def upsert_fara_documents(
+    settings: Settings,
+    rows: list[FaraDocumentRecord],
+    *,
+    ensure_schema: bool = True,
+) -> dict[str, int]:
+    """Upsert FARA document metadata rows into the raw corpus table."""
+
+    if not rows:
+        return {"upserted": 0}
+    if ensure_schema:
+        ensure_fara_schema(settings)
+    with neon_connection(settings) as connection:
+        with connection.cursor() as cursor:
+            cursor.executemany(
+                f"""
+                INSERT INTO {PIPELINE_FARA_DOCUMENTS_TABLE} (
+                    document_key,
+                    registration_number,
+                    registrant_name,
+                    document_type,
+                    date_stamped,
+                    url,
+                    short_form_name,
+                    foreign_principal_name,
+                    foreign_principal_country,
+                    metadata,
+                    updated_at
+                )
+                VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, NOW())
+                ON CONFLICT (document_key) DO UPDATE SET
+                    registration_number = EXCLUDED.registration_number,
+                    registrant_name = EXCLUDED.registrant_name,
+                    document_type = EXCLUDED.document_type,
+                    date_stamped = EXCLUDED.date_stamped,
+                    url = EXCLUDED.url,
+                    short_form_name = EXCLUDED.short_form_name,
+                    foreign_principal_name = EXCLUDED.foreign_principal_name,
+                    foreign_principal_country = EXCLUDED.foreign_principal_country,
+                    metadata = EXCLUDED.metadata,
+                    updated_at = NOW()
+                """,
+                [
+                    (
+                        row.document_key,
+                        row.registration_number,
+                        row.registrant_name,
+                        row.document_type,
+                        row.date_stamped,
+                        row.url,
+                        row.short_form_name,
+                        row.foreign_principal_name,
+                        row.foreign_principal_country,
+                        Jsonb(row.metadata),  # type: ignore[arg-type]
+                    )
+                    for row in rows
+                ],
+            )
+        connection.commit()
+    return {"upserted": len(rows)}
+
+
+def upsert_fara_member_matches(
+    settings: Settings,
+    rows: list[FaraMemberMatchRecord],
+    *,
+    ensure_schema: bool = True,
+) -> dict[str, int]:
+    """Upsert exact Congress matches against FARA entities."""
+
+    if not rows:
+        return {"upserted": 0}
+    if ensure_schema:
+        ensure_fara_schema(settings)
+    with neon_connection(settings) as connection:
+        with connection.cursor() as cursor:
+            cursor.executemany(
+                f"""
+                INSERT INTO {PIPELINE_FARA_MEMBER_MATCHES_TABLE} (
+                    match_key,
+                    member_id,
+                    member_name,
+                    member_slug,
+                    registration_number,
+                    entity_kind,
+                    entity_key,
+                    registrant_name,
+                    match_type,
+                    match_value,
+                    metadata,
+                    updated_at
+                )
+                VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, NOW())
+                ON CONFLICT (match_key) DO UPDATE SET
+                    member_name = EXCLUDED.member_name,
+                    member_slug = EXCLUDED.member_slug,
+                    registration_number = EXCLUDED.registration_number,
+                    entity_kind = EXCLUDED.entity_kind,
+                    entity_key = EXCLUDED.entity_key,
+                    registrant_name = EXCLUDED.registrant_name,
+                    match_type = EXCLUDED.match_type,
+                    match_value = EXCLUDED.match_value,
+                    metadata = EXCLUDED.metadata,
+                    updated_at = NOW()
+                """,
+                [
+                    (
+                        row.match_key,
+                        row.member_id,
+                        row.member_name,
+                        row.member_slug,
+                        row.registration_number,
+                        row.entity_kind,
+                        row.entity_key,
+                        row.registrant_name,
+                        row.match_type,
+                        row.match_value,
+                        Jsonb(row.metadata),  # type: ignore[arg-type]
+                    )
+                    for row in rows
+                ],
+            )
+        connection.commit()
+    return {"upserted": len(rows)}
+
+
 def fetch_house_stub_search_backfill(
     settings: Settings,
     *,
@@ -867,6 +1425,57 @@ def fetch_house_stub_search_backfill(
                 params.append(limit)
             cursor.execute(query, tuple(params))
             return list(cursor.fetchall())
+
+
+def fetch_search_chunk_embedding_backfill(
+    settings: Settings,
+    *,
+    limit: int = 100,
+    source: str | None = None,
+) -> list[dict[str, object]]:
+    """Load indexed search chunks that still need embeddings."""
+
+    ensure_search_schema(settings)
+    with neon_connection(settings) as connection:
+        with connection.cursor() as cursor:
+            query = """
+                SELECT c.id, c.document_id, c.content, c.metadata, d.source
+                FROM pipeline_search_chunks c
+                JOIN pipeline_search_documents d ON d.id = c.document_id
+                WHERE c.embedding IS NULL
+            """
+            params: list[object] = []
+            if source:
+                query += " AND d.source = %s"
+                params.append(source)
+            query += " ORDER BY d.updated_at DESC, c.chunk_index ASC LIMIT %s"
+            params.append(max(1, limit))
+            cursor.execute(query, tuple(params))
+            return list(cursor.fetchall())
+
+
+def update_search_chunk_embeddings(
+    settings: Settings,
+    rows: list[tuple[str, list[float]]],
+) -> dict[str, int]:
+    """Write embeddings back into existing search chunks."""
+
+    if not rows:
+        return {"updated": 0}
+    ensure_search_schema(settings)
+    with neon_connection(settings) as connection:
+        with connection.cursor() as cursor:
+            cursor.executemany(
+                """
+                UPDATE pipeline_search_chunks
+                SET embedding = %s::vector,
+                    updated_at = NOW()
+                WHERE id = %s
+                """,
+                [(vector_literal(embedding), chunk_id) for chunk_id, embedding in rows],
+            )
+        connection.commit()
+    return {"updated": len(rows)}
 
 
 def upsert_trade_rows_to_neon(

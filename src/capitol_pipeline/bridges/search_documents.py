@@ -6,6 +6,7 @@ from typing import Any
 
 from capitol_pipeline.models.congress import FilingStub, HousePtrParseResult, MemberMatch, NormalizedTradeRow
 from capitol_pipeline.models.document import Document
+from capitol_pipeline.models.fara import FaraMemberMatchRecord, FaraRegistrantBundle
 from capitol_pipeline.models.offshore import OffshoreNodeRecord
 from capitol_pipeline.models.search import SearchDocumentRecord, build_search_document
 
@@ -156,5 +157,91 @@ def build_offshore_match_search_document(
             "matchType": "exact_name",
             "matchValue": node.name,
             "memberSlug": member.slug,
+        },
+    )
+
+
+def build_fara_registrant_search_document(bundle: FaraRegistrantBundle) -> SearchDocumentRecord:
+    """Build a searchable record for one FARA registrant bundle."""
+
+    registrant = bundle.registrant
+    foreign_principals = [principal.foreign_principal_name for principal in bundle.foreign_principals]
+    short_forms = [item.full_name for item in bundle.short_forms]
+    recent_docs = [f"{item.document_type} ({item.date_stamped or 'undated'})" for item in bundle.documents[:8]]
+    content_lines = [
+        registrant.content,
+        f"Foreign principals: {', '.join(foreign_principals[:20])}" if foreign_principals else None,
+        f"Short-form registrants: {', '.join(short_forms[:20])}" if short_forms else None,
+        f"Recent filings: {', '.join(recent_docs)}" if recent_docs else None,
+    ]
+    document = Document(
+        id=f"fara-registrant-{registrant.registration_number}",
+        title=f"{registrant.name} FARA registrant profile",
+        date=registrant.registration_date,
+        source="fara",
+        category="lobbying",
+        summary=registrant.summary,
+        sourceUrl="https://efile.fara.gov/",
+        ocrText="\n".join(line for line in content_lines if line),
+        tags=[
+            "fara",
+            "foreign-agent",
+            "registrant",
+        ],
+        verificationStatus="verified",
+    )
+    return build_search_document(
+        document,
+        content=document.ocrText or "",
+        metadata={
+            "registrationNumber": registrant.registration_number,
+            "foreignPrincipals": foreign_principals,
+            "shortForms": short_forms,
+            "recentDocuments": [item.url for item in bundle.documents[:12]],
+        },
+    )
+
+
+def build_fara_member_match_search_document(
+    match: FaraMemberMatchRecord,
+    bundle: FaraRegistrantBundle,
+) -> SearchDocumentRecord:
+    """Build a cross-reference search document for an exact FARA name match."""
+
+    registrant = bundle.registrant
+    document = Document(
+        id=f"fara-match-{match.entity_key}",
+        title=f"{match.member_name} cross-reference in FARA registration {match.registration_number}",
+        source="fara",
+        category="cross-reference",
+        summary=(
+            f"{match.member_name} exactly matches a FARA {match.entity_kind.replace('_', ' ')} "
+            f"linked to {registrant.name}."
+        ),
+        memberIds=[match.member_id],
+        sourceUrl="https://efile.fara.gov/",
+        ocrText="\n".join(
+            [
+                f"Matched member: {match.member_name}",
+                f"Match value: {match.match_value}",
+                f"Entity kind: {match.entity_kind}",
+                f"Registrant: {registrant.name}",
+                registrant.content,
+            ]
+        ),
+        tags=["fara", "cross-reference", match.entity_kind],
+        verificationStatus="unverified",
+    )
+    return build_search_document(
+        document,
+        content=document.ocrText or "",
+        metadata={
+            "registrationNumber": match.registration_number,
+            "entityKind": match.entity_kind,
+            "entityKey": match.entity_key,
+            "matchType": match.match_type,
+            "matchValue": match.match_value,
+            "memberSlug": match.member_slug,
+            "registrantName": registrant.name,
         },
     )

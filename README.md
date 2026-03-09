@@ -21,6 +21,7 @@ PTR filings and asset normalization.
 - Dedicated pipeline search tables with `tsvector` and optional `pgvector` indexing
 - Hybrid retrieval commands for lexical search now and semantic search when embeddings are enabled
 - ICIJ Offshore Leaks ingestion into dedicated raw corpus tables plus Congress match extraction
+- Official FARA ingestion into dedicated raw corpus tables plus registrant search documents
 
 ## Why This Repo Matters
 
@@ -97,6 +98,15 @@ capitol-pipeline ensure-offshore-schema
 # Ingest the full official ICIJ Offshore Leaks database into raw Neon tables,
 # derive exact Congress matches, and index those matches for retrieval
 capitol-pipeline ingest-offshore-leaks --with-match-index
+
+# Create the dedicated FARA corpus tables
+capitol-pipeline ensure-fara-schema
+
+# Ingest the official FARA registrant corpus into raw Neon tables and search
+capitol-pipeline ingest-fara --with-match-index
+
+# Backfill missing embeddings on already-indexed search chunks
+capitol-pipeline embed-search-backfill --limit 100
 ```
 
 ## Search Layer
@@ -117,8 +127,9 @@ Embeddings are optional. The lexical path works immediately. To enable OpenAI
 embeddings, set:
 
 - `CAPITOL_EMBEDDING_PROVIDER=openai`
-- `CAPITOL_OPENAI_API_KEY=...`
-- optionally `CAPITOL_OPENAI_EMBEDDING_MODEL` and `CAPITOL_OPENAI_EMBEDDING_DIMENSIONS`
+- `CAPITOL_OPENAI_API_KEY=...` or reuse `OPENAI_API_KEY`
+- `CAPITOL_OPENAI_EMBEDDING_DIMENSIONS=768` if you are writing into the current Neon search schema
+- optionally `CAPITOL_OPENAI_EMBEDDING_MODEL`
 
 ## Offshore Leaks Layer
 
@@ -133,6 +144,20 @@ corpus into dedicated raw tables:
 That design keeps the full public corpus available without flooding the main
 site retrieval tables with millions of low-signal rows. Congress-facing search
 documents are only created for matched records.
+
+## FARA Layer
+
+Capitol Pipeline now ingests the official FARA API into dedicated raw tables:
+
+- `pipeline_fara_registrants`
+- `pipeline_fara_foreign_principals`
+- `pipeline_fara_short_forms`
+- `pipeline_fara_documents`
+- `pipeline_fara_member_matches`
+
+Each active registrant is also summarized into the shared search corpus so the
+Research Desk and future site search can retrieve FARA relationships without
+depending on the public API at request time.
 
 ## Retrofit Priorities
 
