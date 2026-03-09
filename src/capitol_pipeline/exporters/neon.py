@@ -1642,6 +1642,283 @@ def fetch_published_dossiers(
             return list(cursor.fetchall())
 
 
+def fetch_members_for_search(
+    settings: Settings,
+    *,
+    limit: int = 0,
+    only_missing: bool = True,
+) -> list[dict[str, object]]:
+    """Load in-office member profiles for shared search indexing."""
+
+    ensure_search_schema(settings)
+    with neon_connection(settings) as connection:
+        with connection.cursor() as cursor:
+            query = """
+                SELECT
+                    m.id,
+                    m.slug,
+                    m.name,
+                    m.party,
+                    m.state,
+                    m.district,
+                    m.chamber,
+                    m.office,
+                    m.website,
+                    m.twitter_handle,
+                    COALESCE(
+                        (
+                            SELECT jsonb_agg(
+                                jsonb_build_object(
+                                    'id', c.id,
+                                    'name', c.name,
+                                    'role', mc.role
+                                )
+                                ORDER BY c.name
+                            )
+                            FROM member_committees mc
+                            JOIN committees c ON c.id = mc.committee_id
+                            WHERE mc.member_id = m.id
+                              AND (mc.end_date IS NULL OR mc.end_date >= CURRENT_DATE)
+                        ),
+                        '[]'::jsonb
+                    ) AS committees,
+                    COALESCE(
+                        (
+                            SELECT jsonb_agg(
+                                jsonb_build_object(
+                                    'ticker', ticker_counts.ticker,
+                                    'tradeCount', ticker_counts.trade_count
+                                )
+                                ORDER BY ticker_counts.trade_count DESC, ticker_counts.ticker
+                            )
+                            FROM (
+                                SELECT
+                                    UPPER(t.ticker) AS ticker,
+                                    COUNT(*)::int AS trade_count
+                                FROM trades t
+                                WHERE t.member_id = m.id
+                                  AND COALESCE(t.ticker, '') <> ''
+                                GROUP BY UPPER(t.ticker)
+                                ORDER BY trade_count DESC, UPPER(t.ticker)
+                                LIMIT 8
+                            ) AS ticker_counts
+                        ),
+                        '[]'::jsonb
+                    ) AS top_tickers
+                FROM members m
+                WHERE m.in_office = TRUE
+                  AND COALESCE(m.slug, '') <> ''
+            """
+            if only_missing:
+                query += """
+                  AND NOT EXISTS (
+                        SELECT 1
+                        FROM pipeline_search_documents d
+                        WHERE d.source_document_id = CONCAT('capitol-member-', m.slug)
+                    )
+                """
+            query += """
+                ORDER BY m.last_name ASC, m.first_name ASC
+            """
+            params: list[object] = []
+            if limit > 0:
+                query += " LIMIT %s"
+                params.append(limit)
+            cursor.execute(query, tuple(params))
+            return list(cursor.fetchall())
+
+
+def fetch_committees_for_search(
+    settings: Settings,
+    *,
+    limit: int = 0,
+    only_missing: bool = True,
+) -> list[dict[str, object]]:
+    """Load committee profiles for shared search indexing."""
+
+    ensure_search_schema(settings)
+    with neon_connection(settings) as connection:
+        with connection.cursor() as cursor:
+            query = """
+                SELECT
+                    c.id,
+                    c.name,
+                    c.chamber,
+                    c.code,
+                    c.parent_id,
+                    c.url,
+                    c.jurisdiction_industries,
+                    COALESCE(
+                        (
+                            SELECT jsonb_agg(
+                                jsonb_build_object(
+                                    'id', m.id,
+                                    'name', m.name,
+                                    'party', m.party,
+                                    'role', mc.role
+                                )
+                                ORDER BY
+                                    CASE
+                                        WHEN mc.role ILIKE '%%chair%%' THEN 0
+                                        WHEN mc.role ILIKE '%%ranking%%' THEN 1
+                                        ELSE 2
+                                    END,
+                                    m.last_name,
+                                    m.first_name
+                            )
+                            FROM member_committees mc
+                            JOIN members m ON m.id = mc.member_id
+                            WHERE mc.committee_id = c.id
+                              AND (mc.end_date IS NULL OR mc.end_date >= CURRENT_DATE)
+                        ),
+                        '[]'::jsonb
+                    ) AS members
+                FROM committees c
+                WHERE COALESCE(c.id, '') <> ''
+            """
+            if only_missing:
+                query += """
+                  AND NOT EXISTS (
+                        SELECT 1
+                        FROM pipeline_search_documents d
+                        WHERE d.source_document_id = CONCAT('capitol-committee-', c.id)
+                    )
+                """
+            query += """
+                ORDER BY c.chamber ASC, c.name ASC
+            """
+            params: list[object] = []
+            if limit > 0:
+                query += " LIMIT %s"
+                params.append(limit)
+            cursor.execute(query, tuple(params))
+            return list(cursor.fetchall())
+
+
+def fetch_bills_for_search(
+    settings: Settings,
+    *,
+    limit: int = 0,
+    only_missing: bool = True,
+) -> list[dict[str, object]]:
+    """Load bill records for shared search indexing."""
+
+    ensure_search_schema(settings)
+    with neon_connection(settings) as connection:
+        with connection.cursor() as cursor:
+            query = """
+                SELECT
+                    b.id,
+                    b.congress,
+                    b.bill_type,
+                    b.number,
+                    b.title,
+                    b.short_title,
+                    b.subjects,
+                    b.sponsor_id,
+                    m.name AS sponsor_name,
+                    m.slug AS sponsor_slug,
+                    b.committees,
+                    b.status,
+                    b.introduced_date,
+                    b.last_action_date,
+                    b.text_url,
+                    b.industries
+                FROM bills b
+                LEFT JOIN members m ON m.id = b.sponsor_id
+                WHERE COALESCE(b.title, '') <> ''
+            """
+            if only_missing:
+                query += """
+                  AND NOT EXISTS (
+                        SELECT 1
+                        FROM pipeline_search_documents d
+                        WHERE d.source_document_id = CONCAT('capitol-bill-', b.id)
+                    )
+                """
+            query += """
+                ORDER BY b.last_action_date DESC NULLS LAST, b.introduced_date DESC NULLS LAST, b.id ASC
+            """
+            params: list[object] = []
+            if limit > 0:
+                query += " LIMIT %s"
+                params.append(limit)
+            cursor.execute(query, tuple(params))
+            return list(cursor.fetchall())
+
+
+def fetch_alerts_for_search(
+    settings: Settings,
+    *,
+    limit: int = 0,
+    only_missing: bool = True,
+) -> list[dict[str, object]]:
+    """Load active alert records for shared search indexing."""
+
+    ensure_search_schema(settings)
+    with neon_connection(settings) as connection:
+        with connection.cursor() as cursor:
+            query = """
+                SELECT
+                    a.id,
+                    a.alert_type,
+                    a.severity,
+                    a.title,
+                    a.summary,
+                    a.member_id,
+                    m.name AS member_name,
+                    m.slug AS member_slug,
+                    a.trade_ids,
+                    a.vote_ids,
+                    a.bill_ids,
+                    a.company_ids,
+                    a.evidence,
+                    a.confidence,
+                    a.status,
+                    a.created_at,
+                    a.updated_at,
+                    COALESCE(
+                        (
+                            SELECT array_agg(DISTINCT UPPER(t.ticker))
+                            FROM trades t
+                            WHERE t.id = ANY(COALESCE(a.trade_ids, ARRAY[]::text[]))
+                              AND COALESCE(t.ticker, '') <> ''
+                        ),
+                        ARRAY[]::text[]
+                    ) AS trade_tickers,
+                    COALESCE(
+                        (
+                            SELECT array_agg(DISTINCT b.title)
+                            FROM bills b
+                            WHERE b.id = ANY(COALESCE(a.bill_ids, ARRAY[]::text[]))
+                              AND COALESCE(b.title, '') <> ''
+                        ),
+                        ARRAY[]::text[]
+                    ) AS bill_titles
+                FROM alerts a
+                LEFT JOIN members m ON m.id = a.member_id
+                WHERE COALESCE(a.title, '') <> ''
+                  AND COALESCE(a.status, '') <> 'dismissed'
+            """
+            if only_missing:
+                query += """
+                  AND NOT EXISTS (
+                        SELECT 1
+                        FROM pipeline_search_documents d
+                        WHERE d.source_document_id = CONCAT('capitol-alert-', a.id)
+                    )
+                """
+            query += """
+                ORDER BY a.updated_at DESC NULLS LAST, a.created_at DESC NULLS LAST
+            """
+            params: list[object] = []
+            if limit > 0:
+                query += " LIMIT %s"
+                params.append(limit)
+            cursor.execute(query, tuple(params))
+            return list(cursor.fetchall())
+
+
 def fetch_search_chunk_embedding_backfill(
     settings: Settings,
     *,

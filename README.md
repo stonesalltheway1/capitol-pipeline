@@ -22,6 +22,7 @@ PTR filings and asset normalization.
 - Hybrid retrieval commands for lexical search now and semantic search when embeddings are enabled
 - ICIJ Offshore Leaks ingestion into dedicated raw corpus tables plus Congress match extraction
 - Official FARA ingestion into dedicated raw corpus tables plus registrant search documents
+- Core CapitolExposed entity indexing for members, committees, bills, and alerts
 
 ## Why This Repo Matters
 
@@ -120,6 +121,9 @@ capitol-pipeline ingest-fara --mode api --limit-registrants 25
 # Index CapitolExposed's own published stories and dossiers into the shared corpus
 capitol-pipeline index-site-editorial --only-missing
 
+# Index core CapitolExposed entities into the shared corpus
+capitol-pipeline index-site-core --only-missing
+
 # Backfill missing embeddings on already-indexed search chunks
 capitol-pipeline embed-search-backfill --limit 100
 
@@ -156,7 +160,7 @@ That search layer supports:
 1. `tsvector` indexes for exact and lexical retrieval
 2. `pgvector` indexes for semantic retrieval
 3. Hybrid ranking across title, summary, document body, and indexed chunks
-4. A shared corpus that can mix CapitolExposed editorial, House PTRs, FARA, and ICIJ cross-references
+4. A shared corpus that can mix CapitolExposed editorial, members, committees, bills, alerts, House PTRs, FARA, and ICIJ cross-references
 
 Embeddings are optional. The lexical path works immediately. To enable OpenAI
 embeddings, set:

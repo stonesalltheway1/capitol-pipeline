@@ -32,6 +32,8 @@ DocumentCategory = Literal[
     "bill",
     "vote",
     "committee",
+    "member",
+    "alert",
     "newsroom",
     "cross-reference",
     "other",

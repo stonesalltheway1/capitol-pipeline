@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from datetime import datetime
+import json
 from typing import Any
 
 from capitol_pipeline.models.congress import FilingStub, HousePtrParseResult, MemberMatch, NormalizedTradeRow
@@ -11,6 +12,49 @@ from capitol_pipeline.models.fara import FaraMemberMatchRecord, FaraRegistrantBu
 from capitol_pipeline.models.offshore import OffshoreNodeRecord
 from capitol_pipeline.models.search import SearchDocumentRecord, build_search_document
 from capitol_pipeline.registries.members import MemberRegistry
+
+
+def ensure_list_of_strings(value: Any) -> list[str]:
+    """Normalize a mixed value into a compact list of strings."""
+
+    if value is None:
+        return []
+    if isinstance(value, list):
+        return [str(item).strip() for item in value if str(item).strip()]
+    if isinstance(value, tuple):
+        return [str(item).strip() for item in value if str(item).strip()]
+    if isinstance(value, str):
+        text = value.strip()
+        if not text:
+            return []
+        try:
+            parsed = json.loads(text)
+        except json.JSONDecodeError:
+            return [text]
+        if isinstance(parsed, list):
+            return [str(item).strip() for item in parsed if str(item).strip()]
+        return [text]
+    return [str(value).strip()] if str(value).strip() else []
+
+
+def ensure_list_of_dicts(value: Any) -> list[dict[str, Any]]:
+    """Normalize a JSON-like value into a list of dicts."""
+
+    if value is None:
+        return []
+    if isinstance(value, list):
+        return [item for item in value if isinstance(item, dict)]
+    if isinstance(value, str):
+        text = value.strip()
+        if not text:
+            return []
+        try:
+            parsed = json.loads(text)
+        except json.JSONDecodeError:
+            return []
+        if isinstance(parsed, list):
+            return [item for item in parsed if isinstance(item, dict)]
+    return []
 
 
 def build_house_ptr_search_document(
@@ -448,5 +492,337 @@ def build_dossier_search_document(
                 for finding in findings
                 if isinstance(finding, dict) and str(finding.get("title") or "").strip()
             ],
+        },
+    )
+
+
+def build_member_search_document(
+    row: dict[str, Any],
+    *,
+    base_url: str,
+) -> SearchDocumentRecord:
+    """Build a searchable profile record from a CapitolExposed member page."""
+
+    slug = str(row.get("slug") or "").strip()
+    member_id = str(row.get("id") or "").strip()
+    name = str(row.get("name") or "").strip()
+    party = str(row.get("party") or "").strip()
+    state = str(row.get("state") or "").strip()
+    district = str(row.get("district") or "").strip()
+    chamber = str(row.get("chamber") or "").strip()
+    office = str(row.get("office") or "").strip()
+    website = str(row.get("website") or "").strip()
+    twitter_handle = str(row.get("twitter_handle") or "").strip()
+    committees = ensure_list_of_dicts(row.get("committees"))
+    top_tickers = ensure_list_of_dicts(row.get("top_tickers"))
+    committee_names = [
+        str(item.get("name") or "").strip()
+        for item in committees
+        if str(item.get("name") or "").strip()
+    ]
+    committee_ids = [
+        str(item.get("id") or "").strip()
+        for item in committees
+        if str(item.get("id") or "").strip()
+    ]
+    asset_tickers = [
+        str(item.get("ticker") or "").strip().upper()
+        for item in top_tickers
+        if str(item.get("ticker") or "").strip()
+    ]
+    chamber_label = chamber.title() if chamber else "Congress"
+    district_label = f"-{district}" if district else ""
+    summary = f"{name} is a {party} {chamber_label.lower()} member from {state}{district_label}."
+
+    content_lines = [
+        summary,
+        f"Office: {office}" if office else None,
+        f"Website: {website}" if website else None,
+        f"Twitter: @{twitter_handle}" if twitter_handle else None,
+        f"Committees: {', '.join(committee_names)}" if committee_names else None,
+        (
+            "Most active disclosed tickers: "
+            + ", ".join(
+                f"{item.get('ticker')} ({item.get('tradeCount')} trades)"
+                for item in top_tickers
+                if item.get("ticker")
+            )
+        )
+        if top_tickers
+        else None,
+    ]
+    document = Document(
+        id=f"capitol-member-{slug or member_id}",
+        title=f"{name} member profile",
+        source="capitol-exposed",
+        category="member",
+        summary=summary,
+        memberIds=[member_id] if member_id else [],
+        committeeIds=committee_ids,
+        assetTickers=asset_tickers,
+        tags=list(
+            dict.fromkeys(
+                [
+                    "capitol-exposed",
+                    "member-profile",
+                    chamber,
+                    party,
+                    state,
+                    *committee_names,
+                ]
+            )
+        ),
+        sourceUrl=f"{base_url.rstrip('/')}/members/{slug}" if slug else None,
+        archiveUrl=f"{base_url.rstrip('/')}/members/{slug}" if slug else None,
+        ocrText="\n".join(line for line in content_lines if line),
+        verificationStatus="verified",
+    )
+    return build_search_document(
+        document,
+        content=document.ocrText or "",
+        metadata={
+            "slug": slug or None,
+            "party": party or None,
+            "state": state or None,
+            "district": district or None,
+            "chamber": chamber or None,
+            "committeeNames": committee_names,
+            "topTickers": top_tickers,
+            "website": website or None,
+            "twitterHandle": twitter_handle or None,
+        },
+    )
+
+
+def build_committee_search_document(
+    row: dict[str, Any],
+    *,
+    base_url: str,
+) -> SearchDocumentRecord:
+    """Build a searchable committee profile from CapitolExposed committee data."""
+
+    committee_id = str(row.get("id") or "").strip()
+    name = str(row.get("name") or "").strip()
+    chamber = str(row.get("chamber") or "").strip()
+    code = str(row.get("code") or "").strip()
+    url = str(row.get("url") or "").strip()
+    industries = ensure_list_of_strings(row.get("jurisdiction_industries"))
+    members = ensure_list_of_dicts(row.get("members"))
+    member_names = [
+        str(item.get("name") or "").strip()
+        for item in members
+        if str(item.get("name") or "").strip()
+    ]
+    member_ids = [
+        str(item.get("id") or "").strip()
+        for item in members
+        if str(item.get("id") or "").strip()
+    ]
+    summary = f"{name} is a {chamber} committee with {len(member_ids)} tracked members."
+
+    content_lines = [
+        summary,
+        f"Committee code: {code}" if code else None,
+        f"Jurisdiction industries: {', '.join(industries)}" if industries else None,
+        f"Current members: {', '.join(member_names[:40])}" if member_names else None,
+        f"Official website: {url}" if url else None,
+    ]
+    document = Document(
+        id=f"capitol-committee-{committee_id}",
+        title=f"{name} committee profile",
+        source="capitol-exposed",
+        category="committee",
+        summary=summary,
+        memberIds=member_ids,
+        committeeIds=[committee_id],
+        tags=list(
+            dict.fromkeys(
+                [
+                    "capitol-exposed",
+                    "committee-profile",
+                    chamber,
+                    code,
+                    *industries,
+                ]
+            )
+        ),
+        sourceUrl=f"{base_url.rstrip('/')}/committees/{committee_id}",
+        archiveUrl=f"{base_url.rstrip('/')}/committees/{committee_id}",
+        ocrText="\n".join(line for line in content_lines if line),
+        verificationStatus="verified",
+    )
+    return build_search_document(
+        document,
+        content=document.ocrText or "",
+        metadata={
+            "committeeId": committee_id,
+            "committeeCode": code or None,
+            "chamber": chamber or None,
+            "officialUrl": url or None,
+            "memberCount": len(member_ids),
+            "memberNames": member_names,
+            "jurisdictionIndustries": industries,
+        },
+    )
+
+
+def build_bill_search_document(
+    row: dict[str, Any],
+    *,
+    base_url: str,
+) -> SearchDocumentRecord:
+    """Build a searchable bill record from CapitolExposed bill data."""
+
+    bill_id = str(row.get("id") or "").strip()
+    bill_type = str(row.get("bill_type") or "").strip()
+    number = str(row.get("number") or "").strip()
+    title = str(row.get("title") or "").strip()
+    short_title = str(row.get("short_title") or "").strip()
+    sponsor_id = str(row.get("sponsor_id") or "").strip()
+    sponsor_name = str(row.get("sponsor_name") or "").strip()
+    sponsor_slug = str(row.get("sponsor_slug") or "").strip()
+    status = str(row.get("status") or "").strip()
+    introduced_date = normalize_document_date(row.get("introduced_date"))
+    last_action_date = normalize_document_date(row.get("last_action_date"))
+    subjects = ensure_list_of_strings(row.get("subjects"))
+    industries = ensure_list_of_strings(row.get("industries"))
+    committees = ensure_list_of_strings(row.get("committees"))
+    summary = short_title or title
+
+    content_lines = [
+        title,
+        short_title if short_title and short_title != title else None,
+        f"Sponsor: {sponsor_name}" if sponsor_name else None,
+        f"Status: {status}" if status else None,
+        f"Introduced: {introduced_date}" if introduced_date else None,
+        f"Last action: {last_action_date}" if last_action_date else None,
+        f"Subjects: {', '.join(subjects)}" if subjects else None,
+        f"Industries: {', '.join(industries)}" if industries else None,
+        f"Committees: {', '.join(committees)}" if committees else None,
+    ]
+    document = Document(
+        id=f"capitol-bill-{bill_id}",
+        title=f"{title} ({bill_type.upper()} {number})" if bill_type and number else title,
+        date=last_action_date or introduced_date,
+        source="capitol-exposed",
+        category="bill",
+        summary=summary or None,
+        memberIds=[sponsor_id] if sponsor_id else [],
+        billIds=[bill_id],
+        tags=list(
+            dict.fromkeys(
+                [
+                    "capitol-exposed",
+                    "bill",
+                    status,
+                    bill_type,
+                    *subjects,
+                    *industries,
+                ]
+            )
+        ),
+        sourceUrl=f"{base_url.rstrip('/')}/bills/{bill_id}",
+        archiveUrl=f"{base_url.rstrip('/')}/bills/{bill_id}",
+        ocrText="\n".join(line for line in content_lines if line),
+        verificationStatus="verified",
+    )
+    return build_search_document(
+        document,
+        content=document.ocrText or "",
+        metadata={
+            "billId": bill_id,
+            "billType": bill_type or None,
+            "number": number or None,
+            "status": status or None,
+            "introducedDate": introduced_date,
+            "lastActionDate": last_action_date,
+            "sponsorName": sponsor_name or None,
+            "sponsorSlug": sponsor_slug or None,
+            "subjects": subjects,
+            "industries": industries,
+            "committees": committees,
+        },
+    )
+
+
+def build_alert_search_document(
+    row: dict[str, Any],
+    *,
+    base_url: str,
+) -> SearchDocumentRecord:
+    """Build a searchable alert record from CapitolExposed alerts."""
+
+    alert_id = str(row.get("id") or "").strip()
+    title = str(row.get("title") or "").strip()
+    summary = str(row.get("summary") or "").strip()
+    alert_type = str(row.get("alert_type") or "").strip()
+    severity = str(row.get("severity") or "").strip()
+    status = str(row.get("status") or "").strip()
+    member_id = str(row.get("member_id") or "").strip()
+    member_name = str(row.get("member_name") or "").strip()
+    member_slug = str(row.get("member_slug") or "").strip()
+    confidence = row.get("confidence")
+    bill_ids = ensure_list_of_strings(row.get("bill_ids"))
+    trade_tickers = [
+        ticker.upper()
+        for ticker in ensure_list_of_strings(row.get("trade_tickers"))
+        if ticker
+    ]
+    bill_titles = ensure_list_of_strings(row.get("bill_titles"))
+    evidence_items = ensure_list_of_dicts(row.get("evidence"))
+    evidence_lines = [
+        str(item.get("description") or "").strip()
+        for item in evidence_items
+        if str(item.get("description") or "").strip()
+    ]
+
+    content_lines = [
+        summary or None,
+        f"Member: {member_name}" if member_name else None,
+        f"Severity: {severity}" if severity else None,
+        f"Confidence: {confidence}" if confidence is not None else None,
+        f"Trade tickers: {', '.join(trade_tickers)}" if trade_tickers else None,
+        f"Related bills: {', '.join(bill_titles)}" if bill_titles else None,
+        *evidence_lines,
+    ]
+    document = Document(
+        id=f"capitol-alert-{alert_id}",
+        title=title,
+        date=normalize_document_date(row.get("updated_at") or row.get("created_at")),
+        source="capitol-exposed",
+        category="alert",
+        summary=summary or None,
+        memberIds=[member_id] if member_id else [],
+        billIds=bill_ids,
+        assetTickers=trade_tickers,
+        tags=list(
+            dict.fromkeys(
+                [
+                    "capitol-exposed",
+                    "alert",
+                    alert_type,
+                    severity,
+                    status,
+                ]
+            )
+        ),
+        sourceUrl=f"{base_url.rstrip('/')}/alerts/{alert_id}",
+        archiveUrl=f"{base_url.rstrip('/')}/alerts/{alert_id}",
+        ocrText="\n".join(line for line in content_lines if line),
+        verificationStatus="verified",
+    )
+    return build_search_document(
+        document,
+        content=document.ocrText or "",
+        metadata={
+            "alertId": alert_id,
+            "alertType": alert_type or None,
+            "severity": severity or None,
+            "status": status or None,
+            "memberName": member_name or None,
+            "memberSlug": member_slug or None,
+            "confidence": confidence,
+            "billTitles": bill_titles,
+            "evidenceCount": len(evidence_items),
         },
     )

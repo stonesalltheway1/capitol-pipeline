@@ -7,17 +7,23 @@ import hashlib
 import json
 from pathlib import Path
 from tempfile import TemporaryDirectory
+import time
 from typing import Iterable, TypeVar
 
 import click
 import httpx
+import psycopg
 
 from capitol_pipeline.bridges import (
+    build_alert_search_document,
+    build_bill_search_document,
+    build_committee_search_document,
     build_dossier_search_document,
     build_fara_member_match_search_document,
     build_fara_registrant_search_document,
     build_house_ptr_search_document,
     build_house_ptr_search_document_from_stub_row,
+    build_member_search_document,
     build_news_post_search_document,
     build_offshore_match_search_document,
 )
@@ -28,8 +34,12 @@ from capitol_pipeline.exporters.neon import (
     ensure_offshore_schema,
     ensure_search_schema,
     fetch_existing_fara_registration_numbers,
+    fetch_alerts_for_search,
+    fetch_bills_for_search,
+    fetch_committees_for_search,
     fetch_published_dossiers,
     fetch_published_news_posts,
+    fetch_members_for_search,
     fetch_search_chunk_embedding_backfill,
     fetch_house_stub_search_backfill,
     fetch_house_stub_queue,
@@ -293,6 +303,35 @@ def index_search_document(
         "chunks": chunk_summary,
         "embedded": with_embeddings and any(chunk.embedding for chunk in chunks),
     }
+
+
+def index_search_document_with_retry(
+    settings: Settings,
+    document,
+    *,
+    with_embeddings: bool,
+    ensure_schema: bool = False,
+    max_attempts: int = 3,
+) -> dict[str, object]:
+    """Index one document with lightweight retry for transient Neon disconnects."""
+
+    last_error: Exception | None = None
+    for attempt in range(1, max_attempts + 1):
+        try:
+            return index_search_document(
+                settings,
+                document,
+                with_embeddings=with_embeddings,
+                ensure_schema=ensure_schema,
+            )
+        except psycopg.OperationalError as error:
+            last_error = error
+            if attempt >= max_attempts:
+                break
+            time.sleep(min(5, attempt * 2))
+    if last_error:
+        raise last_error
+    raise RuntimeError("Search indexing retry failed without a captured error.")
 
 
 def process_house_queue_rows(
@@ -1247,6 +1286,101 @@ def index_site_editorial_command(
                 "chunks": (index_summary.get("chunks") or {}).get("upserted", 0),  # type: ignore[union-attr]
             }
         )
+
+    click.echo(json.dumps(summary, indent=2))
+
+
+@cli.command("index-site-core")
+@click.option("--limit-members", type=int, default=0, show_default=True, help="0 means index every eligible member.")
+@click.option("--limit-committees", type=int, default=0, show_default=True, help="0 means index every eligible committee.")
+@click.option("--limit-bills", type=int, default=0, show_default=True, help="0 means index every eligible bill.")
+@click.option("--limit-alerts", type=int, default=0, show_default=True, help="0 means index every eligible alert.")
+@click.option("--only-missing/--reindex-all", default=True, show_default=True)
+@click.option("--with-embeddings/--no-embeddings", default=False, show_default=True)
+def index_site_core_command(
+    limit_members: int,
+    limit_committees: int,
+    limit_bills: int,
+    limit_alerts: int,
+    only_missing: bool,
+    with_embeddings: bool,
+) -> None:
+    """Index core CapitolExposed entities into the shared search corpus."""
+
+    settings = Settings()
+    ensure_search_schema(settings)
+
+    summary = {
+        "membersQueued": 0,
+        "committeesQueued": 0,
+        "billsQueued": 0,
+        "alertsQueued": 0,
+        "documentsUpserted": 0,
+        "chunksUpserted": 0,
+        "embedded": 0,
+        "processedCount": 0,
+        "processedSample": [],
+        "failed": [],
+    }
+
+    def process_rows(
+        kind: str,
+        rows: list[dict[str, object]],
+        build_document,
+        label_key: str,
+    ) -> None:
+        summary[f"{kind}sQueued"] += len(rows)
+        for row in rows:
+            search_document = build_document(row, base_url=settings.site_base_url)
+            try:
+                index_summary = index_search_document_with_retry(
+                    settings,
+                    search_document,
+                    with_embeddings=with_embeddings,
+                    ensure_schema=False,
+                )
+            except Exception as error:
+                summary["failed"].append(
+                    {
+                        "kind": kind,
+                        label_key: row.get(label_key),
+                        "error": str(error)[:240],
+                    }
+                )
+                continue
+            summary["documentsUpserted"] += int(
+                (index_summary.get("document") or {}).get("upserted", 0)  # type: ignore[union-attr]
+            )
+            summary["chunksUpserted"] += int(
+                (index_summary.get("chunks") or {}).get("upserted", 0)  # type: ignore[union-attr]
+            )
+            summary["embedded"] += 1 if index_summary.get("embedded") else 0
+            summary["processedCount"] += 1
+            if len(summary["processedSample"]) < 40:
+                summary["processedSample"].append(
+                    {
+                        "kind": kind,
+                        label_key: row.get(label_key),
+                        "documentId": (index_summary.get("document") or {}).get("document_id"),  # type: ignore[union-attr]
+                        "chunks": (index_summary.get("chunks") or {}).get("upserted", 0),  # type: ignore[union-attr]
+                    }
+                )
+
+    def drain_rows(kind: str, fetch_rows, limit: int, batch_size: int, build_document, label_key: str) -> None:
+        if only_missing and limit <= 0:
+            while True:
+                rows = fetch_rows(settings, limit=batch_size, only_missing=True)
+                if not rows:
+                    break
+                process_rows(kind, rows, build_document, label_key)
+        else:
+            rows = fetch_rows(settings, limit=limit, only_missing=only_missing)
+            process_rows(kind, rows, build_document, label_key)
+
+    drain_rows("member", fetch_members_for_search, limit_members, 50, build_member_search_document, "slug")
+    drain_rows("committee", fetch_committees_for_search, limit_committees, 50, build_committee_search_document, "id")
+    drain_rows("bill", fetch_bills_for_search, limit_bills, 100, build_bill_search_document, "id")
+    drain_rows("alert", fetch_alerts_for_search, limit_alerts, 100, build_alert_search_document, "id")
 
     click.echo(json.dumps(summary, indent=2))
 

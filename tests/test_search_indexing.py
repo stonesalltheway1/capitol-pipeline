@@ -4,9 +4,13 @@ from capitol_pipeline.models.document import Document
 from capitol_pipeline.models.search import build_search_document
 from capitol_pipeline.processors.chunking import build_search_chunks
 from capitol_pipeline.bridges.search_documents import (
+    build_alert_search_document,
+    build_bill_search_document,
+    build_committee_search_document,
     build_dossier_search_document,
     build_house_ptr_search_document,
     build_house_ptr_search_document_from_stub_row,
+    build_member_search_document,
     build_news_post_search_document,
 )
 from capitol_pipeline.registries.members import MemberRegistry
@@ -217,3 +221,120 @@ def test_build_dossier_search_document_includes_findings() -> None:
     assert document.member_ids == ["m-F000459"]
     assert "Narrative text." in document.content
     assert "trade_conflict" in document.tags
+
+
+def test_build_member_search_document_includes_committees_and_tickers() -> None:
+    row = {
+        "id": "m-M001111",
+        "slug": "patty-murray",
+        "name": "Patty Murray",
+        "party": "D",
+        "state": "WA",
+        "district": "",
+        "chamber": "senate",
+        "office": "154 Russell Senate Office Building",
+        "website": "https://www.murray.senate.gov",
+        "twitter_handle": "PattyMurray",
+        "committees": [
+            {"id": "cmt-APPROPS", "name": "Senate Appropriations Committee", "role": "Chair"},
+        ],
+        "top_tickers": [
+            {"ticker": "AMGN", "tradeCount": 4},
+            {"ticker": "MRK", "tradeCount": 4},
+        ],
+    }
+
+    document = build_member_search_document(
+        row,
+        base_url="https://www.capitolexposed.com",
+    )
+    assert document.source_document_id == "capitol-member-patty-murray"
+    assert document.member_ids == ["m-M001111"]
+    assert document.committee_ids == ["cmt-APPROPS"]
+    assert document.asset_tickers == ["AMGN", "MRK"]
+    assert "Senate Appropriations Committee" in document.content
+
+
+def test_build_committee_search_document_includes_members() -> None:
+    row = {
+        "id": "cmt-HSPW",
+        "name": "House Committee on Transportation and Infrastructure",
+        "chamber": "house",
+        "code": "HSPW",
+        "url": "https://transportation.house.gov/",
+        "jurisdiction_industries": ["transportation", "infrastructure"],
+        "members": [
+            {"id": "m-C000000", "name": "Sample Chair", "party": "R", "role": "Chair"},
+            {"id": "m-D000000", "name": "Sample Ranking", "party": "D", "role": "Ranking Member"},
+        ],
+    }
+
+    document = build_committee_search_document(
+        row,
+        base_url="https://www.capitolexposed.com",
+    )
+    assert document.source_document_id == "capitol-committee-cmt-HSPW"
+    assert document.committee_ids == ["cmt-HSPW"]
+    assert document.member_ids == ["m-C000000", "m-D000000"]
+    assert "transportation" in document.tags
+
+
+def test_build_bill_search_document_includes_sponsor_and_subjects() -> None:
+    row = {
+        "id": "hr-119-390",
+        "bill_type": "hr",
+        "number": 390,
+        "title": "ACERO Act",
+        "short_title": "",
+        "subjects": ["Science, Technology, Communications"],
+        "sponsor_id": "m-F000480",
+        "sponsor_name": "Vince Fong",
+        "sponsor_slug": "vince-fong",
+        "status": "referred",
+        "introduced_date": "2025-01-14",
+        "last_action_date": "2026-02-24",
+        "industries": ["technology"],
+        "committees": [],
+    }
+
+    document = build_bill_search_document(
+        row,
+        base_url="https://www.capitolexposed.com",
+    )
+    assert document.source_document_id == "capitol-bill-hr-119-390"
+    assert document.bill_ids == ["hr-119-390"]
+    assert document.member_ids == ["m-F000480"]
+    assert "technology" in document.tags
+    assert "Sponsor: Vince Fong" in document.content
+
+
+def test_build_alert_search_document_includes_evidence_and_tickers() -> None:
+    row = {
+        "id": "alert-123",
+        "alert_type": "committee_trade",
+        "severity": "critical",
+        "title": "ORCL purchase days before related committee vote",
+        "summary": "An Oracle trade landed inside a committee vote window.",
+        "member_id": "m-K000398",
+        "member_name": "Thomas H. Kean, Jr.",
+        "member_slug": "thomas-h-kean-jr",
+        "bill_ids": ["hr-119-390"],
+        "trade_tickers": ["ORCL"],
+        "bill_titles": ["ACERO Act"],
+        "confidence": 0.83,
+        "status": "active",
+        "evidence": [
+            {"description": "Purchased ORCL two days before the vote."},
+            {"description": "Member serves on the relevant committee."},
+        ],
+        "updated_at": "2026-03-09T02:00:00Z",
+    }
+
+    document = build_alert_search_document(
+        row,
+        base_url="https://www.capitolexposed.com",
+    )
+    assert document.source_document_id == "capitol-alert-alert-123"
+    assert document.asset_tickers == ["ORCL"]
+    assert document.bill_ids == ["hr-119-390"]
+    assert "Purchased ORCL two days before the vote." in document.content
