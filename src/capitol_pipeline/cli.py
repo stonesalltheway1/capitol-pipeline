@@ -26,6 +26,8 @@ from capitol_pipeline.bridges import (
     build_member_search_document,
     build_news_post_search_document,
     build_offshore_match_search_document,
+    build_senate_trade_search_document,
+    build_trade_payload,
 )
 from capitol_pipeline.config import OcrBackend, Settings
 from capitol_pipeline.exporters.neon import (
@@ -33,6 +35,7 @@ from capitol_pipeline.exporters.neon import (
     ensure_fara_schema,
     ensure_offshore_schema,
     ensure_search_schema,
+    fetch_existing_trade_ids,
     fetch_existing_fara_registration_numbers,
     fetch_alerts_for_search,
     fetch_bills_for_search,
@@ -91,7 +94,11 @@ from capitol_pipeline.sources.fara import (
     fetch_short_forms,
 )
 from capitol_pipeline.sources.icij_offshore_leaks import iter_offshore_nodes, iter_offshore_relationships
-from capitol_pipeline.sources.senate_ethics import fetch_senate_watcher_feed
+from capitol_pipeline.sources.senate_ethics import (
+    fetch_senate_watcher_feed,
+    normalize_senate_date,
+    normalize_senate_watcher_trade,
+)
 
 
 T = TypeVar("T")
@@ -561,6 +568,102 @@ def senate_feed(limit: int) -> None:
 
     rows = fetch_senate_watcher_feed()
     click.echo(json.dumps([row.model_dump() for row in rows[:limit]], indent=2))
+
+
+@cli.command("senate-ingest")
+@click.option("--limit", type=int, default=0, show_default=True, help="0 means ingest every newly detected Senate row.")
+@click.option("--export-registry/--no-export-registry", default=True, show_default=True)
+@click.option("--with-search-index/--no-search-index", default=True, show_default=True)
+@click.option("--with-embeddings/--no-embeddings", default=False, show_default=True)
+def senate_ingest_command(
+    limit: int,
+    export_registry: bool,
+    with_search_index: bool,
+    with_embeddings: bool,
+) -> None:
+    """Normalize new Senate watcher rows and upsert them into CapitolExposed."""
+
+    settings = Settings()
+    registry = load_registry_if_available(settings, export_cache=export_registry)
+    if not registry:
+        raise click.ClickException("Member registry is required for Senate ingest.")
+
+    feed_rows = sorted(
+        fetch_senate_watcher_feed(settings),
+        key=lambda row: normalize_senate_date(row.transaction_date) or "",
+        reverse=True,
+    )
+    existing_trade_ids = fetch_existing_trade_ids(
+        settings,
+        sources=["senate_watcher", "senate-watcher"],
+    )
+    if with_search_index:
+        ensure_search_schema(settings)
+
+    summary: dict[str, object] = {
+        "fetched": len(feed_rows),
+        "normalized": 0,
+        "skippedExisting": 0,
+        "skippedUnresolved": 0,
+        "tradesUpserted": 0,
+        "searchDocumentsUpserted": 0,
+        "searchChunksUpserted": 0,
+        "embedded": 0,
+        "processedSample": [],
+    }
+
+    normalized_rows: list[NormalizedTradeRow] = []
+    search_documents = []
+
+    for feed_row in feed_rows:
+        normalized = normalize_senate_watcher_trade(feed_row, registry)
+        if normalized is None:
+            summary["skippedUnresolved"] = int(summary["skippedUnresolved"]) + 1
+            continue
+        trade_id = build_trade_payload(normalized)["id"]
+        if trade_id in existing_trade_ids:
+            summary["skippedExisting"] = int(summary["skippedExisting"]) + 1
+            continue
+        normalized_rows.append(normalized)
+        summary["normalized"] = int(summary["normalized"]) + 1
+        if with_search_index:
+            search_documents.append(build_senate_trade_search_document(normalized))
+        if limit > 0 and len(normalized_rows) >= limit:
+            break
+
+    if normalized_rows:
+        trade_summary = upsert_trade_rows_to_neon(settings, normalized_rows)
+        summary["tradesUpserted"] = int(trade_summary.get("upserted", 0))
+
+        if with_search_index:
+            for search_document in search_documents:
+                index_summary = index_search_document_with_retry(
+                    settings,
+                    search_document,
+                    with_embeddings=with_embeddings,
+                    ensure_schema=False,
+                )
+                summary["searchDocumentsUpserted"] = int(summary["searchDocumentsUpserted"]) + int(
+                    (index_summary.get("document") or {}).get("upserted", 0)  # type: ignore[union-attr]
+                )
+                summary["searchChunksUpserted"] = int(summary["searchChunksUpserted"]) + int(
+                    (index_summary.get("chunks") or {}).get("upserted", 0)  # type: ignore[union-attr]
+                )
+                summary["embedded"] = int(summary["embedded"]) + (
+                    1 if index_summary.get("embedded") else 0
+                )
+    for row in normalized_rows[:20]:
+        summary["processedSample"].append(  # type: ignore[union-attr]
+            {
+                "id": build_trade_payload(row)["id"],
+                "member": row.member.name,
+                "ticker": row.ticker,
+                "transactionDate": row.transaction_date,
+                "transactionType": row.transaction_type,
+            }
+        )
+
+    click.echo(json.dumps(summary, indent=2))
 
 
 @cli.command("classify-crypto")

@@ -57,6 +57,11 @@ jobs:
           python -u -m capitol_pipeline index-site-editorial \
             --only-missing
 
+      - name: Refresh CapitolExposed core entity corpus
+        run: |
+          python -u -m capitol_pipeline index-site-core \
+            --only-missing
+
       - name: Refresh Offshore match index when requested
         if: env.RUN_OFFSHORE_MATCH_REFRESH == 'true'
         run: |

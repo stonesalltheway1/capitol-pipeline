@@ -1642,6 +1642,33 @@ def fetch_published_dossiers(
             return list(cursor.fetchall())
 
 
+def fetch_existing_trade_ids(
+    settings: Settings,
+    *,
+    sources: list[str] | tuple[str, ...],
+) -> set[str]:
+    """Load existing trade ids for one or more source families."""
+
+    normalized_sources = [source.strip() for source in sources if source.strip()]
+    if not normalized_sources:
+        return set()
+    with neon_connection(settings) as connection:
+        with connection.cursor() as cursor:
+            cursor.execute(
+                """
+                SELECT id
+                FROM trades
+                WHERE source = ANY(%s)
+                """,
+                (normalized_sources,),
+            )
+            return {
+                str(row["id"])
+                for row in cursor.fetchall()
+                if row.get("id") is not None
+            }
+
+
 def fetch_members_for_search(
     settings: Settings,
     *,

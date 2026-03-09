@@ -14,7 +14,7 @@ CapitolExposed's Neon database. The production path should be:
 
 ## Scheduled workflows
 
-### House Refresh
+### Filings Refresh
 
 File: `.github/workflows/house-refresh.yml`
 
@@ -22,8 +22,9 @@ Runs every 15 minutes and:
 
 1. syncs the current House Clerk XML feed
 2. processes queued PTRs
-3. writes parsed trades and stub state back into Neon
-4. indexes newly parsed PTRs into the shared search corpus
+3. normalizes new Senate watcher rows into site-ready trades
+4. writes parsed trades and stub state back into Neon
+5. indexes newly parsed PTRs and Senate trades into the shared search corpus
 
 This workflow intentionally does not create embeddings. It keeps the live filing
 loop fast and cheap.
@@ -39,6 +40,16 @@ Runs twice per day and:
 3. embeds queued search chunks into `pipeline_search_chunks`
 4. can optionally refresh the Offshore match index on manual dispatch
 
+### Offshore Match Refresh
+
+File: `.github/workflows/offshore-match-refresh.yml`
+
+Runs weekly and:
+
+1. re-evaluates Congress name matches against the already-ingested Offshore corpus
+2. refreshes shared search documents for newly matched records
+3. avoids reloading the multi-million-row raw Offshore tables when no upstream change occurred
+
 ### Offshore Full Refresh
 
 File: `.github/workflows/offshore-full-refresh.yml`
@@ -48,8 +59,9 @@ Offshore corpus needs a fresh rebuild.
 
 ## Recommended operating rhythm
 
-- House refresh every 15 minutes
+- Filings refresh every 15 minutes
 - Corpus refresh twice daily
+- Offshore match refresh weekly
 - Offshore full raw ingest only when the upstream ICIJ archive changes
 
 ## Manual recovery commands
@@ -57,6 +69,7 @@ Offshore corpus needs a fresh rebuild.
 ```bash
 python -u -m capitol_pipeline corpus-status
 python -u -m capitol_pipeline house-ingest --year 2026 --batch-size 25 --max-batches 6
+python -u -m capitol_pipeline senate-ingest --with-search-index --no-embeddings
 python -u -m capitol_pipeline ingest-fara --mode bulk --skip-existing --with-match-index
 python -u -m capitol_pipeline index-site-editorial --only-missing
 python -u -m capitol_pipeline index-site-core --only-missing
@@ -71,6 +84,7 @@ python -u -m capitol_pipeline ingest-fara --mode bulk --with-match-index
 python -u -m capitol_pipeline index-house-search-backfill --only-missing
 python -u -m capitol_pipeline index-site-editorial --reindex-all
 python -u -m capitol_pipeline index-site-core --reindex-all
+python -u -m capitol_pipeline ingest-offshore-leaks --skip-nodes --skip-relationships --with-match-index
 python -u -m capitol_pipeline embed-search-corpus --batch-size 100 --max-batches 0
 ```
 
@@ -78,7 +92,9 @@ python -u -m capitol_pipeline embed-search-corpus --batch-size 100 --max-batches
 
 - If `corpus-status` shows embedded chunks stalling while documents continue to
   rise, check `OPENAI_API_KEY` first.
-- If `house_filing_stubs` stalls in `pending_extraction`, run the House workflow
+- If `house_filing_stubs` stalls in `pending_extraction`, run the filings workflow
   manually and inspect the summary JSON for deferred or failed documents.
+- If Senate trades stop moving while House continues, run `senate-ingest` manually
+  and inspect the fetched and skipped counts.
 - If the House Clerk feed references a PDF before it is published, the stub is
   deferred and retried later. That is expected behavior.

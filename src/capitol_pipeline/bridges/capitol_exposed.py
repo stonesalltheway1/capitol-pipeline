@@ -5,11 +5,27 @@ from __future__ import annotations
 from capitol_pipeline.models.congress import FilingStub, NormalizedTradeRow
 
 
+SOURCE_EXPORT_MAP = {
+    "house-clerk": "house_clerk",
+    "senate-watcher": "senate_watcher",
+    "senate-ethics": "senate_efd",
+    "congress-gov": "congress_gov",
+}
+
+
+def normalize_trade_source_for_site(source: str) -> str:
+    """Map pipeline source ids to the source values CapitolExposed stores in trades."""
+
+    return SOURCE_EXPORT_MAP.get(source, source.replace("-", "_"))
+
+
 def build_trade_id(row: NormalizedTradeRow) -> str:
     """Create the canonical CapitolExposed trade id for a normalized row."""
 
     if row.disclosure_kind == "house-ptr":
         return f"tr-house-{row.source_id.replace(':', '-')}"
+    if row.disclosure_kind == "senate-trade" and row.source == "senate-watcher":
+        return f"tr-{row.source_id.replace(':', '-')}"
     if row.disclosure_kind == "senate-trade":
         return f"tr-senate-{row.source_id.replace(':', '-')}"
     return f"tr-{row.source.replace(':', '-')}-{row.source_id.replace(':', '-')}"
@@ -68,7 +84,7 @@ def build_trade_payload(row: NormalizedTradeRow) -> dict[str, object]:
         "amount_max": row.amount_max,
         "owner": row.owner,
         "comment": row.comment,
-        "source": row.source,
+        "source": normalize_trade_source_for_site(row.source),
         "source_url": row.source_url or "",
         "conflict_score": 0.0,
         "conflict_flags": [],

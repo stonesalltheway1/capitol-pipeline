@@ -104,6 +104,81 @@ def build_house_ptr_search_document(
     )
 
 
+def build_senate_trade_search_document(
+    trade: NormalizedTradeRow,
+) -> SearchDocumentRecord:
+    """Build a searchable document record from one normalized Senate trade."""
+
+    ticker = trade.ticker or "asset"
+    action = "purchase" if trade.transaction_type == "purchase" else trade.transaction_type
+    amount_label = (
+        "Pending amount normalization"
+        if trade.amount_min <= 0 and trade.amount_max <= 0
+        else (
+            f"${trade.amount_min:,}"
+            if trade.amount_min == trade.amount_max
+            else f"${trade.amount_min:,} to ${trade.amount_max:,}"
+        )
+    )
+    summary = (
+        f"Senate trade disclosure for {trade.member.name}: {action} of {ticker} on "
+        f"{trade.transaction_date or 'unknown date'}."
+    )
+    content_lines = [
+        summary,
+        f"Ticker: {ticker}" if trade.ticker else None,
+        f"Asset description: {trade.asset_description}" if trade.asset_description else None,
+        f"Transaction type: {trade.transaction_type}",
+        f"Transaction date: {trade.transaction_date}" if trade.transaction_date else None,
+        f"Amount range: {amount_label}",
+        f"Owner: {trade.owner}",
+        f"Comment: {trade.comment}" if trade.comment else None,
+    ]
+    document = Document(
+        id=f"senate-trade-{trade.source_id}",
+        title=f"{trade.member.name} Senate trade disclosure",
+        date=trade.transaction_date,
+        source="senate-watcher",
+        category="stock-act",
+        summary=summary,
+        memberIds=[trade.member.id] if trade.member.id else [],
+        assetTickers=[trade.ticker] if trade.ticker else [],
+        sourceUrl=trade.source_url,
+        archiveUrl=trade.source_url,
+        tags=list(
+            dict.fromkeys(
+                [
+                    "senate-trade",
+                    "stock-act",
+                    "congressional-trades",
+                    trade.transaction_type,
+                    trade.asset_type.lower().replace(" ", "-"),
+                ]
+            )
+        ),
+        ocrText="\n".join(line for line in content_lines if line),
+        verificationStatus="verified",
+    )
+
+    return build_search_document(
+        document,
+        content=document.ocrText or "",
+        metadata={
+            "sourceId": trade.source_id,
+            "memberSlug": trade.member.slug,
+            "party": trade.member.party,
+            "state": trade.member.state,
+            "amountMin": trade.amount_min,
+            "amountMax": trade.amount_max,
+            "owner": trade.owner,
+            "assetType": trade.asset_type,
+            "comment": trade.comment,
+            "cryptoKind": trade.normalized_asset.kind if trade.normalized_asset else None,
+            "cryptoSymbol": trade.normalized_asset.canonical_symbol if trade.normalized_asset else None,
+        },
+    )
+
+
 def build_house_ptr_search_document_from_stub_row(
     row: dict[str, Any],
 ) -> SearchDocumentRecord:

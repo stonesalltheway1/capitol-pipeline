@@ -49,6 +49,9 @@ capitol-pipeline sync-house-feed --year 2026
 # Inspect the current Senate watcher aggregate feed
 capitol-pipeline senate-feed
 
+# Normalize new Senate watcher rows and write them into CapitolExposed
+capitol-pipeline senate-ingest --with-search-index
+
 # Classify a raw asset
 capitol-pipeline classify-crypto --ticker IBIT --description "iShares Bitcoin Trust ETF"
 
@@ -137,6 +140,7 @@ This repo now includes GitHub Actions for unattended refresh:
 
 - `.github/workflows/house-refresh.yml`
 - `.github/workflows/corpus-refresh.yml`
+- `.github/workflows/offshore-match-refresh.yml`
 - `.github/workflows/offshore-full-refresh.yml`
 
 Set these repository secrets before enabling the schedules:
@@ -201,8 +205,8 @@ depending on a live API call at request time.
 ## Retrofit Priorities
 
 1. Replace the current House PTR OCR and extraction path in CapitolExposed
-2. Backfill crypto-linked trades already present in the database
-3. Replace the site-side House extraction cron path with this package
+2. Replace the site-side House and Senate ingest loops with this package
+3. Backfill crypto-linked trades already present in the database
 4. Expand indexed search across filings, stories, and official source documents
 5. Add fixture-driven regression tests from real House and Senate disclosures
 

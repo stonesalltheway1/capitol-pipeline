@@ -1,21 +1,23 @@
-name: Filings Refresh
+name: Offshore Match Refresh
 
 on:
   workflow_dispatch:
   schedule:
-    - cron: "*/15 * * * *"
+    - cron: "17 7 * * 1"
 
 concurrency:
-  group: filings-refresh
+  group: offshore-match-refresh
   cancel-in-progress: false
 
 jobs:
-  ingest:
+  refresh:
     runs-on: ubuntu-latest
-    timeout-minutes: 25
+    timeout-minutes: 45
     env:
       DATABASE_URL: ${{ secrets.DATABASE_URL }}
-      CAPITOL_EMBEDDING_PROVIDER: none
+      OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
+      CAPITOL_EMBEDDING_PROVIDER: openai
+      CAPITOL_OPENAI_EMBEDDING_DIMENSIONS: "768"
       PYTHONUNBUFFERED: "1"
     steps:
       - name: Checkout
@@ -31,20 +33,12 @@ jobs:
           python -m pip install --upgrade pip
           python -m pip install -e ".[neon]"
 
-      - name: Run House ingest
+      - name: Refresh Offshore Congress matches
         run: |
-          HOUSE_YEAR="$(date -u +%Y)"
-          python -u -m capitol_pipeline house-ingest \
-            --year "$HOUSE_YEAR" \
-            --batch-size 25 \
-            --max-batches 6 \
-            --with-search-index \
-            --no-embeddings
-
-      - name: Run Senate ingest
-        run: |
-          python -u -m capitol_pipeline senate-ingest \
-            --with-search-index \
+          python -u -m capitol_pipeline ingest-offshore-leaks \
+            --skip-nodes \
+            --skip-relationships \
+            --with-match-index \
             --no-embeddings
 
       - name: Print corpus status
