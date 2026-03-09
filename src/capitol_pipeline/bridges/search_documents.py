@@ -11,6 +11,10 @@ from capitol_pipeline.models.document import Document
 from capitol_pipeline.models.fara import FaraMemberMatchRecord, FaraRegistrantBundle
 from capitol_pipeline.models.offshore import OffshoreNodeRecord
 from capitol_pipeline.models.search import SearchDocumentRecord, build_search_document
+from capitol_pipeline.models.usaspending import (
+    UsaspendingAwardRecord,
+    UsaspendingCompanyMatchRecord,
+)
 from capitol_pipeline.registries.members import MemberRegistry
 
 
@@ -899,5 +903,80 @@ def build_alert_search_document(
             "confidence": confidence,
             "billTitles": bill_titles,
             "evidenceCount": len(evidence_items),
+        },
+    )
+
+
+def build_usaspending_company_match_search_document(
+    match: UsaspendingCompanyMatchRecord,
+    awards: list[UsaspendingAwardRecord],
+) -> SearchDocumentRecord:
+    """Build a searchable federal-spending record for one site company match."""
+
+    award_lines = [
+        " | ".join(
+            part
+            for part in [
+                award.award_id,
+                award.awarding_agency,
+                f"${award.award_amount:,.0f}" if award.award_amount is not None else None,
+                award.description,
+            ]
+            if part
+        )
+        for award in awards[:12]
+    ]
+    document = Document(
+        id=f"usaspending-match-{match.match_key}",
+        title=f"{match.company_name} federal spending profile",
+        date=None,
+        source="usaspending",
+        category="contracts",
+        summary=match.summary,
+        assetTickers=[match.ticker] if match.ticker else [],
+        sourceUrl=match.source_url,
+        archiveUrl=match.source_url,
+        ocrText="\n".join(
+            line
+            for line in [
+                match.content,
+                f"Recipient name: {match.recipient_name}",
+                f"Top agencies: {', '.join(match.top_agencies)}" if match.top_agencies else None,
+                f"Recipient code: {match.recipient_code}" if match.recipient_code else None,
+                f"UEI: {match.uei}" if match.uei else None,
+                *award_lines,
+            ]
+            if line
+        ),
+        tags=list(
+            dict.fromkeys(
+                [
+                    "usaspending",
+                    "federal-spending",
+                    "contracts",
+                    match.ticker or "",
+                    *match.top_agencies,
+                ]
+            )
+        ),
+        verificationStatus="verified",
+    )
+    return build_search_document(
+        document,
+        content=document.ocrText or "",
+        metadata={
+            "companyId": match.company_id,
+            "companyName": match.company_name,
+            "ticker": match.ticker,
+            "queryName": match.query_name,
+            "recipientId": match.canonical_recipient_id,
+            "recipientName": match.recipient_name,
+            "recipientCode": match.recipient_code,
+            "uei": match.uei,
+            "totalAmount": match.total_amount,
+            "awardCount": match.award_count,
+            "topAgencies": match.top_agencies,
+            "matchType": match.match_type,
+            "matchValue": match.match_value,
         },
     )

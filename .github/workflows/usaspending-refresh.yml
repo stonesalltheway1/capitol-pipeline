@@ -1,0 +1,67 @@
+name: USAspending Refresh
+
+on:
+  workflow_dispatch:
+    inputs:
+      limit_companies:
+        description: Max tracked companies to refresh in this run
+        required: false
+        default: "40"
+      stale_after_days:
+        description: Only revisit companies older than this many days
+        required: false
+        default: "14"
+  schedule:
+    - cron: "17 5 * * *"
+
+concurrency:
+  group: usaspending-refresh
+  cancel-in-progress: false
+
+jobs:
+  refresh:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    env:
+      DATABASE_URL: ${{ secrets.DATABASE_URL }}
+      OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
+      CAPITOL_EMBEDDING_PROVIDER: none
+      CAPITOL_OPENAI_EMBEDDING_DIMENSIONS: "768"
+      PYTHONUNBUFFERED: "1"
+      LIMIT_COMPANIES: ${{ github.event.inputs.limit_companies || '40' }}
+      STALE_AFTER_DAYS: ${{ github.event.inputs.stale_after_days || '14' }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install pipeline
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install -e ".[neon]"
+
+      - name: Refresh USAspending contract corpus
+        run: |
+          python -u -m capitol_pipeline ingest-usaspending \
+            --limit-companies "${LIMIT_COMPANIES}" \
+            --stale-after-days "${STALE_AFTER_DAYS}" \
+            --only-stale \
+            --with-search-index \
+            --no-embeddings
+
+      - name: Embed queued USAspending chunks
+        if: env.OPENAI_API_KEY != ''
+        env:
+          CAPITOL_EMBEDDING_PROVIDER: openai
+        run: |
+          python -u -m capitol_pipeline embed-search-corpus \
+            --source usaspending \
+            --batch-size 50 \
+            --max-batches 4
+
+      - name: Print corpus status
+        run: python -u -m capitol_pipeline corpus-status

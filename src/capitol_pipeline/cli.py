@@ -27,6 +27,7 @@ from capitol_pipeline.bridges import (
     build_news_post_search_document,
     build_offshore_match_search_document,
     build_senate_trade_search_document,
+    build_usaspending_company_match_search_document,
     build_trade_payload,
 )
 from capitol_pipeline.config import OcrBackend, Settings
@@ -35,10 +36,12 @@ from capitol_pipeline.exporters.neon import (
     ensure_fara_schema,
     ensure_offshore_schema,
     ensure_search_schema,
+    ensure_usaspending_schema,
     fetch_existing_trade_ids,
     fetch_existing_fara_registration_numbers,
     fetch_alerts_for_search,
     fetch_bills_for_search,
+    fetch_company_candidates_for_usaspending,
     fetch_committees_for_search,
     fetch_published_dossiers,
     fetch_published_news_posts,
@@ -60,6 +63,10 @@ from capitol_pipeline.exporters.neon import (
     upsert_offshore_member_matches,
     upsert_offshore_nodes,
     upsert_offshore_relationships,
+    upsert_usaspending_awards,
+    upsert_usaspending_company_matches,
+    upsert_usaspending_company_sync,
+    upsert_usaspending_recipients,
     update_house_stub_state,
     upsert_search_chunks,
     upsert_search_document,
@@ -75,6 +82,11 @@ from capitol_pipeline.models.fara import (
     FaraShortFormRecord,
 )
 from capitol_pipeline.models.offshore import OffshoreMemberMatchRecord, OffshoreNodeRecord
+from capitol_pipeline.models.usaspending import (
+    UsaspendingAwardRecord,
+    UsaspendingCompanyMatchRecord,
+    UsaspendingRecipientRecord,
+)
 from capitol_pipeline.normalizers.crypto_assets import classify_crypto_asset
 from capitol_pipeline.parsers.house_ptr import parse_house_ptr_pdf
 from capitol_pipeline.processors.chunking import build_search_chunks
@@ -98,6 +110,18 @@ from capitol_pipeline.sources.senate_ethics import (
     fetch_senate_watcher_feed,
     normalize_senate_date,
     normalize_senate_watcher_trade,
+)
+from capitol_pipeline.sources.usaspending import (
+    DEFAULT_USASPENDING_END_DATE,
+    DEFAULT_USASPENDING_START_DATE,
+    UsaspendingApiClient,
+    build_company_search_queries,
+    build_usaspending_company_match_record,
+    build_usaspending_recipient_record,
+    fetch_recipient_profile,
+    search_awarding_agencies_for_recipient_name,
+    search_recipient_summaries,
+    select_recipient_matches,
 )
 
 
@@ -789,6 +813,288 @@ def corpus_status_command() -> None:
 
     settings = Settings()
     summary = fetch_pipeline_corpus_status(settings)
+    click.echo(json.dumps(summary, indent=2))
+
+
+@cli.command("ingest-usaspending")
+@click.option("--limit-companies", type=int, default=25, show_default=True)
+@click.option("--stale-after-days", type=int, default=30, show_default=True)
+@click.option("--recipient-limit", type=int, default=8, show_default=True)
+@click.option("--match-limit", type=int, default=2, show_default=True)
+@click.option("--award-limit", type=int, default=12, show_default=True)
+@click.option("--start-date", type=str, default=DEFAULT_USASPENDING_START_DATE, show_default=True)
+@click.option("--end-date", type=str, default=DEFAULT_USASPENDING_END_DATE, show_default=True)
+@click.option("--only-stale/--include-fresh", default=True, show_default=True)
+@click.option("--with-search-index/--no-search-index", default=True, show_default=True)
+@click.option("--with-embeddings/--no-embeddings", default=False, show_default=True)
+def ingest_usaspending_command(
+    limit_companies: int,
+    stale_after_days: int,
+    recipient_limit: int,
+    match_limit: int,
+    award_limit: int,
+    start_date: str,
+    end_date: str,
+    only_stale: bool,
+    with_search_index: bool,
+    with_embeddings: bool,
+) -> None:
+    """Ingest federal recipient and award data from USAspending for tracked site companies."""
+
+    settings = Settings()
+    ensure_usaspending_schema(settings)
+    if with_search_index:
+        ensure_search_schema(settings)
+
+    api_client = UsaspendingApiClient(settings)
+    company_rows = fetch_company_candidates_for_usaspending(
+        settings,
+        limit=limit_companies,
+        only_stale=only_stale,
+        stale_after_days=stale_after_days,
+    )
+
+    summary = {
+        "companiesQueued": len(company_rows),
+        "companiesMatched": 0,
+        "recipientsUpserted": 0,
+        "companyMatchesUpserted": 0,
+        "awardsUpserted": 0,
+        "searchDocumentsUpserted": 0,
+        "searchChunksUpserted": 0,
+        "embedded": 0,
+        "processed": [],
+        "failed": [],
+    }
+
+    for row in company_rows:
+        company_id = str(row.get("id") or "").strip()
+        ticker = str(row.get("ticker") or "").strip().upper() or None
+        company_name = str(row.get("name") or "").strip()
+        sample_asset_description = str(row.get("sample_asset_description") or "").strip() or None
+        queries = build_company_search_queries(
+            raw_name=company_name,
+            asset_description=sample_asset_description,
+            ticker=ticker,
+        )
+        if not queries:
+            upsert_usaspending_company_sync(
+                settings,
+                company_id=company_id,
+                ticker=ticker,
+                company_name=company_name,
+                query_name=None,
+                status="no_query",
+                result_count=0,
+                metadata={"sampleAssetDescription": sample_asset_description},
+            )
+            summary["processed"].append(
+                {
+                    "companyId": company_id,
+                    "ticker": ticker,
+                    "status": "no_query",
+                }
+            )
+            continue
+
+        try:
+            recipient_records_by_id: dict[str, UsaspendingRecipientRecord] = {}
+            recipient_query_map: dict[str, str] = {}
+            attempted_queries: list[str] = []
+
+            for query_name in queries[:4]:
+                attempted_queries.append(query_name)
+                recipient_rows = search_recipient_summaries(
+                    settings,
+                    query_name=query_name,
+                    start_date=start_date,
+                    end_date=end_date,
+                    limit=recipient_limit,
+                    client=api_client,
+                )
+                strong_rows = select_recipient_matches(
+                    query_name=query_name,
+                    rows=recipient_rows,
+                    limit=match_limit,
+                )
+                for recipient_row in strong_rows:
+                    recipient_record = build_usaspending_recipient_record(
+                        recipient_row,
+                        query_name=query_name,
+                    )
+                    profile = fetch_recipient_profile(
+                        settings,
+                        recipient_id=recipient_record.recipient_id,
+                        client=api_client,
+                    )
+                    if profile:
+                        merged_metadata = {
+                            **recipient_record.metadata,
+                            "recipientProfile": profile,
+                            "totalTransactions": profile.get("total_transactions"),
+                            "parentName": profile.get("parent_name"),
+                            "recipientState": ((profile.get("location") or {}) if isinstance(profile.get("location"), dict) else {}).get("state_code"),
+                        }
+                        recipient_record = recipient_record.model_copy(
+                            update={
+                                "uei": str(profile.get("uei") or recipient_record.uei or "").strip() or recipient_record.uei,
+                                "recipient_code": str(profile.get("duns") or recipient_record.recipient_code or "").strip() or recipient_record.recipient_code,
+                                "total_amount": (
+                                    float(profile.get("total_transaction_amount"))
+                                    if isinstance(profile.get("total_transaction_amount"), (int, float))
+                                    else recipient_record.total_amount
+                                ),
+                                "metadata": merged_metadata,
+                            }
+                        )
+                    existing = recipient_records_by_id.get(recipient_record.recipient_id)
+                    if existing is None or (recipient_record.total_amount or 0) > (existing.total_amount or 0):
+                        recipient_records_by_id[recipient_record.recipient_id] = recipient_record
+                        recipient_query_map[recipient_record.recipient_id] = query_name
+
+            recipient_records = sorted(
+                recipient_records_by_id.values(),
+                key=lambda record: (-(record.total_amount or 0), record.name),
+            )[: max(1, match_limit)]
+
+            if not recipient_records:
+                upsert_usaspending_company_sync(
+                    settings,
+                    company_id=company_id,
+                    ticker=ticker,
+                    company_name=company_name,
+                    query_name=queries[0],
+                    status="no_match",
+                    result_count=0,
+                    metadata={
+                        "attemptedQueries": attempted_queries,
+                        "sampleAssetDescription": sample_asset_description,
+                    },
+                )
+                summary["processed"].append(
+                    {
+                        "companyId": company_id,
+                        "ticker": ticker,
+                        "status": "no_match",
+                        "attemptedQueries": attempted_queries,
+                    }
+                )
+                continue
+
+            recipient_summary = upsert_usaspending_recipients(
+                settings,
+                recipient_records,
+                ensure_schema=False,
+            )
+            summary["recipientsUpserted"] += int(recipient_summary["upserted"])
+
+            company_match_records: list[UsaspendingCompanyMatchRecord] = []
+            award_records: list[UsaspendingAwardRecord] = []
+
+            for recipient_record in recipient_records:
+                agency_rows = search_awarding_agencies_for_recipient_name(
+                    settings,
+                    recipient_name=recipient_record.name,
+                    start_date=start_date,
+                    end_date=end_date,
+                    limit=max(5, award_limit),
+                    client=api_client,
+                )
+                match_record = build_usaspending_company_match_record(
+                    company_id=company_id,
+                    company_name=company_name,
+                    ticker=ticker,
+                    query_name=recipient_query_map.get(recipient_record.recipient_id, recipient_record.query_name),
+                    recipient=recipient_record,
+                    awards=[],
+                    agencies=agency_rows,
+                )
+                company_match_records.append(match_record)
+
+            company_match_summary = upsert_usaspending_company_matches(
+                settings,
+                company_match_records,
+                ensure_schema=False,
+            )
+            summary["companyMatchesUpserted"] += int(company_match_summary["upserted"])
+
+            awards_summary = upsert_usaspending_awards(
+                settings,
+                award_records,
+                ensure_schema=False,
+            )
+            summary["awardsUpserted"] += int(awards_summary["upserted"])
+
+            if with_search_index:
+                for match_record in company_match_records:
+                    match_awards = [
+                        award
+                        for award in award_records
+                        if award.match_key == match_record.match_key
+                    ]
+                    index_summary = index_search_document(
+                        settings,
+                        build_usaspending_company_match_search_document(match_record, match_awards),
+                        with_embeddings=with_embeddings,
+                        ensure_schema=False,
+                    )
+                    summary["searchDocumentsUpserted"] += int(
+                        (index_summary.get("document") or {}).get("upserted", 0)  # type: ignore[union-attr]
+                    )
+                    summary["searchChunksUpserted"] += int(
+                        (index_summary.get("chunks") or {}).get("upserted", 0)  # type: ignore[union-attr]
+                    )
+                    summary["embedded"] += 1 if index_summary.get("embedded") else 0
+
+            upsert_usaspending_company_sync(
+                settings,
+                company_id=company_id,
+                ticker=ticker,
+                company_name=company_name,
+                query_name=queries[0],
+                status="matched",
+                result_count=len(company_match_records),
+                metadata={
+                    "attemptedQueries": attempted_queries,
+                    "recipientIds": [record.recipient_id for record in recipient_records],
+                    "sampleAssetDescription": sample_asset_description,
+                },
+            )
+            summary["companiesMatched"] += 1
+            summary["processed"].append(
+                {
+                    "companyId": company_id,
+                    "ticker": ticker,
+                    "status": "matched",
+                    "recipientCount": len(recipient_records),
+                    "federalAwardCount": sum(record.award_count for record in company_match_records),
+                    "topAgencies": company_match_records[0].top_agencies[:3] if company_match_records else [],
+                    "queries": attempted_queries,
+                }
+            )
+        except Exception as error:
+            upsert_usaspending_company_sync(
+                settings,
+                company_id=company_id,
+                ticker=ticker,
+                company_name=company_name,
+                query_name=queries[0] if queries else None,
+                status="error",
+                result_count=0,
+                last_error=str(error)[:500],
+                metadata={
+                    "attemptedQueries": queries,
+                    "sampleAssetDescription": sample_asset_description,
+                },
+            )
+            summary["failed"].append(
+                {
+                    "companyId": company_id,
+                    "ticker": ticker,
+                    "error": str(error)[:240],
+                }
+            )
+
     click.echo(json.dumps(summary, indent=2))
 
 

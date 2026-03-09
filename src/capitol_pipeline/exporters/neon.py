@@ -26,6 +26,11 @@ from capitol_pipeline.models.offshore import (
     OffshoreRelationshipRecord,
 )
 from capitol_pipeline.models.search import SearchChunkRecord, SearchDocumentRecord, SearchHit
+from capitol_pipeline.models.usaspending import (
+    UsaspendingAwardRecord,
+    UsaspendingCompanyMatchRecord,
+    UsaspendingRecipientRecord,
+)
 from capitol_pipeline.normalizers.crypto_assets import (
     CRYPTO_EQUITY_TICKERS,
     CRYPTO_ETF_TICKERS,
@@ -59,6 +64,10 @@ PIPELINE_FARA_FOREIGN_PRINCIPALS_TABLE = "pipeline_fara_foreign_principals"
 PIPELINE_FARA_SHORT_FORMS_TABLE = "pipeline_fara_short_forms"
 PIPELINE_FARA_DOCUMENTS_TABLE = "pipeline_fara_documents"
 PIPELINE_FARA_MEMBER_MATCHES_TABLE = "pipeline_fara_member_matches"
+PIPELINE_USASPENDING_RECIPIENTS_TABLE = "pipeline_usaspending_recipients"
+PIPELINE_USASPENDING_COMPANY_MATCHES_TABLE = "pipeline_usaspending_company_matches"
+PIPELINE_USASPENDING_AWARDS_TABLE = "pipeline_usaspending_awards"
+PIPELINE_USASPENDING_COMPANY_SYNCS_TABLE = "pipeline_usaspending_company_syncs"
 CRYPTO_TRADE_SCAN_REGEX = (
     "(bitcoin|ethereum|ether|solana|xrp|cardano|dogecoin|litecoin|polkadot|"
     "avalanche|chainlink|crypto|digital asset|coinbase|microstrategy|"
@@ -523,6 +532,140 @@ def ensure_fara_schema(settings: Settings) -> dict[str, object]:
             PIPELINE_FARA_SHORT_FORMS_TABLE,
             PIPELINE_FARA_DOCUMENTS_TABLE,
             PIPELINE_FARA_MEMBER_MATCHES_TABLE,
+        ]
+    }
+
+
+def ensure_usaspending_schema(settings: Settings) -> dict[str, object]:
+    """Create the USAspending recipient, match, award, and sync tables."""
+
+    with neon_connection(settings) as connection:
+        with advisory_lock(connection, "pipeline-usaspending-schema"):
+            with connection.cursor() as cursor:
+                cursor.execute(
+                    f"""
+                    CREATE TABLE IF NOT EXISTS {PIPELINE_USASPENDING_RECIPIENTS_TABLE} (
+                        recipient_id TEXT PRIMARY KEY,
+                        name TEXT NOT NULL,
+                        normalized_name TEXT NOT NULL,
+                        query_name TEXT NOT NULL,
+                        recipient_code TEXT NULL,
+                        uei TEXT NULL,
+                        total_amount DOUBLE PRECISION NULL,
+                        total_outlays DOUBLE PRECISION NULL,
+                        source_url TEXT NULL,
+                        summary TEXT NOT NULL,
+                        content TEXT NOT NULL,
+                        metadata JSONB NOT NULL DEFAULT '{{}}'::jsonb,
+                        content_tsv tsvector GENERATED ALWAYS AS (
+                            to_tsvector('english', coalesce(name, '') || ' ' || coalesce(summary, '') || ' ' || coalesce(content, ''))
+                        ) STORED,
+                        created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+                        updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+                    )
+                    """
+                )
+                cursor.execute(
+                    f"""
+                    CREATE TABLE IF NOT EXISTS {PIPELINE_USASPENDING_COMPANY_MATCHES_TABLE} (
+                        match_key TEXT PRIMARY KEY,
+                        company_id TEXT NOT NULL,
+                        company_name TEXT NOT NULL,
+                        ticker TEXT NULL,
+                        query_name TEXT NOT NULL,
+                        canonical_recipient_id TEXT NOT NULL REFERENCES {PIPELINE_USASPENDING_RECIPIENTS_TABLE}(recipient_id) ON DELETE CASCADE,
+                        recipient_name TEXT NOT NULL,
+                        normalized_recipient_name TEXT NOT NULL,
+                        recipient_code TEXT NULL,
+                        uei TEXT NULL,
+                        match_type TEXT NOT NULL,
+                        match_value TEXT NOT NULL,
+                        total_amount DOUBLE PRECISION NULL,
+                        award_count INT NOT NULL DEFAULT 0,
+                        top_agencies TEXT[] NOT NULL DEFAULT '{{}}'::text[],
+                        source_url TEXT NULL,
+                        summary TEXT NOT NULL,
+                        content TEXT NOT NULL,
+                        metadata JSONB NOT NULL DEFAULT '{{}}'::jsonb,
+                        content_tsv tsvector GENERATED ALWAYS AS (
+                            to_tsvector('english', coalesce(company_name, '') || ' ' || coalesce(recipient_name, '') || ' ' || coalesce(summary, '') || ' ' || coalesce(content, ''))
+                        ) STORED,
+                        created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+                        updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+                    )
+                    """
+                )
+                cursor.execute(
+                    f"""
+                    CREATE TABLE IF NOT EXISTS {PIPELINE_USASPENDING_AWARDS_TABLE} (
+                        award_key TEXT PRIMARY KEY,
+                        match_key TEXT NOT NULL REFERENCES {PIPELINE_USASPENDING_COMPANY_MATCHES_TABLE}(match_key) ON DELETE CASCADE,
+                        canonical_recipient_id TEXT NOT NULL REFERENCES {PIPELINE_USASPENDING_RECIPIENTS_TABLE}(recipient_id) ON DELETE CASCADE,
+                        recipient_name TEXT NOT NULL,
+                        award_id TEXT NOT NULL,
+                        internal_id BIGINT NULL,
+                        generated_internal_id TEXT NULL,
+                        action_date DATE NULL,
+                        award_amount DOUBLE PRECISION NULL,
+                        award_type TEXT NULL,
+                        awarding_agency TEXT NULL,
+                        awarding_agency_id INT NULL,
+                        agency_slug TEXT NULL,
+                        description TEXT NULL,
+                        source_url TEXT NULL,
+                        metadata JSONB NOT NULL DEFAULT '{{}}'::jsonb,
+                        created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+                        updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+                    )
+                    """
+                )
+                cursor.execute(
+                    f"""
+                    CREATE TABLE IF NOT EXISTS {PIPELINE_USASPENDING_COMPANY_SYNCS_TABLE} (
+                        company_id TEXT PRIMARY KEY,
+                        ticker TEXT NULL,
+                        company_name TEXT NOT NULL,
+                        query_name TEXT NULL,
+                        status TEXT NOT NULL,
+                        result_count INT NOT NULL DEFAULT 0,
+                        last_error TEXT NULL,
+                        synced_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+                        metadata JSONB NOT NULL DEFAULT '{{}}'::jsonb
+                    )
+                    """
+                )
+                cursor.execute(
+                    f"CREATE INDEX IF NOT EXISTS idx_pipeline_usaspending_recipients_name ON {PIPELINE_USASPENDING_RECIPIENTS_TABLE} USING BTREE (normalized_name)"
+                )
+                cursor.execute(
+                    f"CREATE INDEX IF NOT EXISTS idx_pipeline_usaspending_recipients_tsv ON {PIPELINE_USASPENDING_RECIPIENTS_TABLE} USING GIN (content_tsv)"
+                )
+                cursor.execute(
+                    f"CREATE INDEX IF NOT EXISTS idx_pipeline_usaspending_matches_company ON {PIPELINE_USASPENDING_COMPANY_MATCHES_TABLE} USING BTREE (company_id, ticker)"
+                )
+                cursor.execute(
+                    f"CREATE INDEX IF NOT EXISTS idx_pipeline_usaspending_matches_recipient ON {PIPELINE_USASPENDING_COMPANY_MATCHES_TABLE} USING BTREE (canonical_recipient_id)"
+                )
+                cursor.execute(
+                    f"CREATE INDEX IF NOT EXISTS idx_pipeline_usaspending_matches_tsv ON {PIPELINE_USASPENDING_COMPANY_MATCHES_TABLE} USING GIN (content_tsv)"
+                )
+                cursor.execute(
+                    f"CREATE INDEX IF NOT EXISTS idx_pipeline_usaspending_awards_match ON {PIPELINE_USASPENDING_AWARDS_TABLE} USING BTREE (match_key, award_amount DESC)"
+                )
+                cursor.execute(
+                    f"CREATE INDEX IF NOT EXISTS idx_pipeline_usaspending_awards_recipient ON {PIPELINE_USASPENDING_AWARDS_TABLE} USING BTREE (canonical_recipient_id, action_date DESC)"
+                )
+                cursor.execute(
+                    f"CREATE INDEX IF NOT EXISTS idx_pipeline_usaspending_syncs_status ON {PIPELINE_USASPENDING_COMPANY_SYNCS_TABLE} USING BTREE (status, synced_at DESC)"
+                )
+            connection.commit()
+
+    return {
+        "tables": [
+            PIPELINE_USASPENDING_RECIPIENTS_TABLE,
+            PIPELINE_USASPENDING_COMPANY_MATCHES_TABLE,
+            PIPELINE_USASPENDING_AWARDS_TABLE,
+            PIPELINE_USASPENDING_COMPANY_SYNCS_TABLE,
         ]
     }
 
@@ -1490,6 +1633,394 @@ def upsert_fara_member_matches(
     return {"upserted": len(rows)}
 
 
+def upsert_usaspending_recipients(
+    settings: Settings,
+    rows: list[UsaspendingRecipientRecord],
+    *,
+    ensure_schema: bool = True,
+) -> dict[str, int]:
+    """Upsert USAspending recipient summaries into the raw corpus table."""
+
+    if not rows:
+        return {"upserted": 0}
+    if ensure_schema:
+        ensure_usaspending_schema(settings)
+    with neon_connection(settings) as connection:
+        with connection.cursor() as cursor:
+            cursor.executemany(
+                f"""
+                INSERT INTO {PIPELINE_USASPENDING_RECIPIENTS_TABLE} (
+                    recipient_id,
+                    name,
+                    normalized_name,
+                    query_name,
+                    recipient_code,
+                    uei,
+                    total_amount,
+                    total_outlays,
+                    source_url,
+                    summary,
+                    content,
+                    metadata,
+                    updated_at
+                )
+                VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, NOW())
+                ON CONFLICT (recipient_id) DO UPDATE SET
+                    name = EXCLUDED.name,
+                    normalized_name = EXCLUDED.normalized_name,
+                    query_name = EXCLUDED.query_name,
+                    recipient_code = EXCLUDED.recipient_code,
+                    uei = EXCLUDED.uei,
+                    total_amount = EXCLUDED.total_amount,
+                    total_outlays = EXCLUDED.total_outlays,
+                    source_url = EXCLUDED.source_url,
+                    summary = EXCLUDED.summary,
+                    content = EXCLUDED.content,
+                    metadata = EXCLUDED.metadata,
+                    updated_at = NOW()
+                """,
+                [
+                    (
+                        row.recipient_id,
+                        row.name,
+                        row.normalized_name,
+                        row.query_name,
+                        row.recipient_code,
+                        row.uei,
+                        row.total_amount,
+                        row.total_outlays,
+                        row.source_url,
+                        row.summary,
+                        row.content,
+                        Jsonb(row.metadata),  # type: ignore[arg-type]
+                    )
+                    for row in rows
+                ],
+            )
+        connection.commit()
+    return {"upserted": len(rows)}
+
+
+def upsert_usaspending_company_matches(
+    settings: Settings,
+    rows: list[UsaspendingCompanyMatchRecord],
+    *,
+    ensure_schema: bool = True,
+) -> dict[str, int]:
+    """Upsert site-company to USAspending recipient matches."""
+
+    if not rows:
+        return {"upserted": 0}
+    if ensure_schema:
+        ensure_usaspending_schema(settings)
+    with neon_connection(settings) as connection:
+        with connection.cursor() as cursor:
+            cursor.executemany(
+                f"""
+                INSERT INTO {PIPELINE_USASPENDING_COMPANY_MATCHES_TABLE} (
+                    match_key,
+                    company_id,
+                    company_name,
+                    ticker,
+                    query_name,
+                    canonical_recipient_id,
+                    recipient_name,
+                    normalized_recipient_name,
+                    recipient_code,
+                    uei,
+                    match_type,
+                    match_value,
+                    total_amount,
+                    award_count,
+                    top_agencies,
+                    source_url,
+                    summary,
+                    content,
+                    metadata,
+                    updated_at
+                )
+                VALUES (
+                    %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, NOW()
+                )
+                ON CONFLICT (match_key) DO UPDATE SET
+                    company_name = EXCLUDED.company_name,
+                    ticker = EXCLUDED.ticker,
+                    query_name = EXCLUDED.query_name,
+                    canonical_recipient_id = EXCLUDED.canonical_recipient_id,
+                    recipient_name = EXCLUDED.recipient_name,
+                    normalized_recipient_name = EXCLUDED.normalized_recipient_name,
+                    recipient_code = EXCLUDED.recipient_code,
+                    uei = EXCLUDED.uei,
+                    match_type = EXCLUDED.match_type,
+                    match_value = EXCLUDED.match_value,
+                    total_amount = EXCLUDED.total_amount,
+                    award_count = EXCLUDED.award_count,
+                    top_agencies = EXCLUDED.top_agencies,
+                    source_url = EXCLUDED.source_url,
+                    summary = EXCLUDED.summary,
+                    content = EXCLUDED.content,
+                    metadata = EXCLUDED.metadata,
+                    updated_at = NOW()
+                """,
+                [
+                    (
+                        row.match_key,
+                        row.company_id,
+                        row.company_name,
+                        row.ticker,
+                        row.query_name,
+                        row.canonical_recipient_id,
+                        row.recipient_name,
+                        row.normalized_recipient_name,
+                        row.recipient_code,
+                        row.uei,
+                        row.match_type,
+                        row.match_value,
+                        row.total_amount,
+                        row.award_count,
+                        row.top_agencies,
+                        row.source_url,
+                        row.summary,
+                        row.content,
+                        Jsonb(row.metadata),  # type: ignore[arg-type]
+                    )
+                    for row in rows
+                ],
+            )
+        connection.commit()
+    return {"upserted": len(rows)}
+
+
+def upsert_usaspending_awards(
+    settings: Settings,
+    rows: list[UsaspendingAwardRecord],
+    *,
+    ensure_schema: bool = True,
+) -> dict[str, int]:
+    """Upsert USAspending awards tied to company matches."""
+
+    if not rows:
+        return {"upserted": 0}
+    if ensure_schema:
+        ensure_usaspending_schema(settings)
+    with neon_connection(settings) as connection:
+        with connection.cursor() as cursor:
+            cursor.executemany(
+                f"""
+                INSERT INTO {PIPELINE_USASPENDING_AWARDS_TABLE} (
+                    award_key,
+                    match_key,
+                    canonical_recipient_id,
+                    recipient_name,
+                    award_id,
+                    internal_id,
+                    generated_internal_id,
+                    action_date,
+                    award_amount,
+                    award_type,
+                    awarding_agency,
+                    awarding_agency_id,
+                    agency_slug,
+                    description,
+                    source_url,
+                    metadata,
+                    updated_at
+                )
+                VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, NOW())
+                ON CONFLICT (award_key) DO UPDATE SET
+                    match_key = EXCLUDED.match_key,
+                    canonical_recipient_id = EXCLUDED.canonical_recipient_id,
+                    recipient_name = EXCLUDED.recipient_name,
+                    award_id = EXCLUDED.award_id,
+                    internal_id = EXCLUDED.internal_id,
+                    generated_internal_id = EXCLUDED.generated_internal_id,
+                    action_date = EXCLUDED.action_date,
+                    award_amount = EXCLUDED.award_amount,
+                    award_type = EXCLUDED.award_type,
+                    awarding_agency = EXCLUDED.awarding_agency,
+                    awarding_agency_id = EXCLUDED.awarding_agency_id,
+                    agency_slug = EXCLUDED.agency_slug,
+                    description = EXCLUDED.description,
+                    source_url = EXCLUDED.source_url,
+                    metadata = EXCLUDED.metadata,
+                    updated_at = NOW()
+                """,
+                [
+                    (
+                        row.award_key,
+                        row.match_key,
+                        row.canonical_recipient_id,
+                        row.recipient_name,
+                        row.award_id,
+                        row.internal_id,
+                        row.generated_internal_id,
+                        row.action_date,
+                        row.award_amount,
+                        row.award_type,
+                        row.awarding_agency,
+                        row.awarding_agency_id,
+                        row.agency_slug,
+                        row.description,
+                        row.source_url,
+                        Jsonb(row.metadata),  # type: ignore[arg-type]
+                    )
+                    for row in rows
+                ],
+            )
+        connection.commit()
+    return {"upserted": len(rows)}
+
+
+def upsert_usaspending_company_sync(
+    settings: Settings,
+    *,
+    company_id: str,
+    ticker: str | None,
+    company_name: str,
+    query_name: str | None,
+    status: str,
+    result_count: int,
+    last_error: str | None = None,
+    metadata: dict[str, object] | None = None,
+) -> dict[str, int]:
+    """Record the last USAspending sync result for one tracked company."""
+
+    ensure_usaspending_schema(settings)
+    with neon_connection(settings) as connection:
+        with connection.cursor() as cursor:
+            cursor.execute(
+                f"""
+                INSERT INTO {PIPELINE_USASPENDING_COMPANY_SYNCS_TABLE} (
+                    company_id,
+                    ticker,
+                    company_name,
+                    query_name,
+                    status,
+                    result_count,
+                    last_error,
+                    synced_at,
+                    metadata
+                )
+                VALUES (%s, %s, %s, %s, %s, %s, %s, NOW(), %s)
+                ON CONFLICT (company_id) DO UPDATE SET
+                    ticker = EXCLUDED.ticker,
+                    company_name = EXCLUDED.company_name,
+                    query_name = EXCLUDED.query_name,
+                    status = EXCLUDED.status,
+                    result_count = EXCLUDED.result_count,
+                    last_error = EXCLUDED.last_error,
+                    synced_at = NOW(),
+                    metadata = EXCLUDED.metadata
+                """,
+                (
+                    company_id,
+                    ticker,
+                    company_name,
+                    query_name,
+                    status,
+                    result_count,
+                    last_error,
+                    Jsonb(metadata or {}),  # type: ignore[arg-type]
+                ),
+            )
+        connection.commit()
+    return {"upserted": 1}
+
+
+def fetch_company_candidates_for_usaspending(
+    settings: Settings,
+    *,
+    limit: int = 0,
+    only_stale: bool = True,
+    stale_after_days: int = 30,
+) -> list[dict[str, object]]:
+    """Load the highest-value tracked companies for USAspending recipient matching."""
+
+    ensure_usaspending_schema(settings)
+    with neon_connection(settings) as connection:
+        with connection.cursor() as cursor:
+            query = f"""
+                WITH trade_company_activity AS (
+                    SELECT
+                        c.id AS company_id,
+                        COUNT(t.id)::int AS trade_count,
+                        MAX(
+                            COALESCE(
+                                t.created_at,
+                                t.disclosure_date::timestamp,
+                                t.transaction_date::timestamp
+                            )
+                        ) AS latest_trade_at
+                    FROM companies c
+                    JOIN trades t
+                      ON (
+                            t.company_id = c.id
+                            OR (
+                                COALESCE(t.company_id, '') = ''
+                                AND COALESCE(c.ticker, '') <> ''
+                                AND UPPER(COALESCE(t.ticker, '')) = UPPER(c.ticker)
+                            )
+                        )
+                    GROUP BY c.id
+                ),
+                trade_company_sample AS (
+                    SELECT DISTINCT ON (c.id)
+                        c.id AS company_id,
+                        t.asset_description,
+                        COALESCE(
+                            t.created_at,
+                            t.disclosure_date::timestamp,
+                            t.transaction_date::timestamp
+                        ) AS activity_at
+                    FROM companies c
+                    JOIN trades t
+                      ON (
+                            t.company_id = c.id
+                            OR (
+                                COALESCE(t.company_id, '') = ''
+                                AND COALESCE(c.ticker, '') <> ''
+                                AND UPPER(COALESCE(t.ticker, '')) = UPPER(c.ticker)
+                            )
+                        )
+                    WHERE COALESCE(t.asset_description, '') <> ''
+                    ORDER BY c.id, activity_at DESC NULLS LAST
+                )
+                SELECT
+                    c.id,
+                    c.ticker,
+                    c.name,
+                    COALESCE(a.trade_count, 0) AS trade_count,
+                    a.latest_trade_at,
+                    s.asset_description AS sample_asset_description,
+                    sync.synced_at,
+                    sync.status AS sync_status,
+                    sync.result_count,
+                    sync.last_error
+                FROM companies c
+                JOIN trade_company_activity a ON a.company_id = c.id
+                LEFT JOIN trade_company_sample s ON s.company_id = c.id
+                LEFT JOIN {PIPELINE_USASPENDING_COMPANY_SYNCS_TABLE} sync ON sync.company_id = c.id
+                WHERE COALESCE(c.ticker, '') <> ''
+                  AND COALESCE(a.trade_count, 0) > 0
+                  AND (
+                        NOT %s
+                        OR sync.synced_at IS NULL
+                        OR sync.status IN ('error', 'no_match')
+                        OR sync.synced_at < (NOW() - (%s * INTERVAL '1 day'))
+                  )
+                ORDER BY
+                    COALESCE(a.trade_count, 0) DESC,
+                    a.latest_trade_at DESC NULLS LAST,
+                    c.name ASC
+            """
+            params: list[object] = [only_stale, max(1, stale_after_days)]
+            if limit > 0:
+                query += " LIMIT %s"
+                params.append(limit)
+            cursor.execute(query, tuple(params))
+            return list(cursor.fetchall())
+
+
 def fetch_house_stub_search_backfill(
     settings: Settings,
     *,
@@ -2031,6 +2562,7 @@ def fetch_pipeline_corpus_status(settings: Settings) -> dict[str, object]:
     ensure_search_schema(settings)
     ensure_offshore_schema(settings)
     ensure_fara_schema(settings)
+    ensure_usaspending_schema(settings)
     with neon_connection(settings) as connection:
         with connection.cursor() as cursor:
             cursor.execute(
@@ -2044,6 +2576,14 @@ def fetch_pipeline_corpus_status(settings: Settings) -> dict[str, object]:
                     (SELECT COUNT(*)::int FROM {PIPELINE_FARA_SHORT_FORMS_TABLE}) AS fara_short_forms,
                     (SELECT COUNT(*)::int FROM {PIPELINE_FARA_DOCUMENTS_TABLE}) AS fara_documents,
                     (SELECT COUNT(*)::int FROM {PIPELINE_FARA_MEMBER_MATCHES_TABLE}) AS fara_matches,
+                    (SELECT COUNT(*)::int FROM {PIPELINE_USASPENDING_RECIPIENTS_TABLE}) AS usaspending_recipients,
+                    (SELECT COUNT(*)::int FROM {PIPELINE_USASPENDING_COMPANY_MATCHES_TABLE}) AS usaspending_company_matches,
+                    (SELECT COUNT(*)::int FROM {PIPELINE_USASPENDING_AWARDS_TABLE}) AS usaspending_awards,
+                    (
+                        SELECT COUNT(*)::int
+                        FROM {PIPELINE_USASPENDING_COMPANY_SYNCS_TABLE}
+                        WHERE status = 'matched'
+                    ) AS usaspending_matched_syncs,
                     (SELECT COUNT(*)::int FROM {PIPELINE_SEARCH_DOCUMENTS_TABLE}) AS search_documents,
                     (SELECT COUNT(*)::int FROM {PIPELINE_SEARCH_CHUNKS_TABLE}) AS search_chunks,
                     (
@@ -2101,6 +2641,12 @@ def fetch_pipeline_corpus_status(settings: Settings) -> dict[str, object]:
             "shortForms": int(status.get("fara_short_forms") or 0),
             "documents": int(status.get("fara_documents") or 0),
             "matches": int(status.get("fara_matches") or 0),
+        },
+        "usaspending": {
+            "recipients": int(status.get("usaspending_recipients") or 0),
+            "companyMatches": int(status.get("usaspending_company_matches") or 0),
+            "awards": int(status.get("usaspending_awards") or 0),
+            "matchedSyncs": int(status.get("usaspending_matched_syncs") or 0),
         },
         "search": {
             "documents": int(status.get("search_documents") or 0),

@@ -116,6 +116,8 @@ class Settings(BaseSettings):
     fara_bulk_short_forms_zip_url: str = "https://efile.fara.gov/bulk/zip/FARA_All_ShortForms.csv.zip"
     fara_bulk_documents_zip_url: str = "https://efile.fara.gov/bulk/zip/FARA_All_RegistrantDocs.csv.zip"
     fara_request_interval_seconds: float = 2.05
+    usaspending_base_url: str = "https://api.usaspending.gov/api/v2"
+    usaspending_request_interval_seconds: float = 0.35
     site_base_url: str = "https://www.capitolexposed.com"
 
     # ── Document classifier settings ─────────────────────────────────────

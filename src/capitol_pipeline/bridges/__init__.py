@@ -14,6 +14,7 @@ from .search_documents import (
     build_news_post_search_document,
     build_offshore_match_search_document,
     build_senate_trade_search_document,
+    build_usaspending_company_match_search_document,
 )
 
 __all__ = [
@@ -29,6 +30,7 @@ __all__ = [
     "build_news_post_search_document",
     "build_offshore_match_search_document",
     "build_senate_trade_search_document",
+    "build_usaspending_company_match_search_document",
     "build_house_stub_payload",
     "build_trade_payload",
 ]

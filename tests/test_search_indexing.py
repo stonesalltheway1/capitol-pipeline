@@ -12,8 +12,17 @@ from capitol_pipeline.bridges.search_documents import (
     build_house_ptr_search_document_from_stub_row,
     build_member_search_document,
     build_news_post_search_document,
+    build_usaspending_company_match_search_document,
+)
+from capitol_pipeline.models.usaspending import (
+    UsaspendingAwardRecord,
+    UsaspendingCompanyMatchRecord,
 )
 from capitol_pipeline.registries.members import MemberRegistry
+from capitol_pipeline.sources.usaspending import (
+    build_company_search_queries,
+    select_recipient_matches,
+)
 
 
 def test_build_search_document_preserves_core_metadata() -> None:
@@ -338,3 +347,88 @@ def test_build_alert_search_document_includes_evidence_and_tickers() -> None:
     assert document.asset_tickers == ["ORCL"]
     assert document.bill_ids == ["hr-119-390"]
     assert "Purchased ORCL two days before the vote." in document.content
+
+
+def test_build_company_search_queries_cleans_noisy_asset_labels() -> None:
+    queries = build_company_search_queries(
+        raw_name="SP\r MicroStrategy Incorporated - Class A",
+        asset_description="JT\r MicroStrategy Incorporated - Class A Common Stock (MSTR)",
+        ticker="MSTR",
+    )
+
+    assert queries[0] == "MicroStrategy Incorporated"
+    assert "MicroStrategy" in queries
+
+
+def test_build_company_search_queries_decodes_html_entities() -> None:
+    queries = build_company_search_queries(
+        raw_name="Johnson &amp; Johnson",
+        asset_description=None,
+        ticker="JNJ",
+    )
+
+    assert queries[0] == "Johnson & Johnson"
+    assert "Johnson & Johnson" in queries
+
+
+def test_build_company_search_queries_strips_brokerage_prefixes() -> None:
+    queries = build_company_search_queries(
+        raw_name="VISA INC",
+        asset_description="David Taylor Trust > Schwab Joint Brokerage #1 (Home Grown) Visa Inc",
+        ticker="V",
+    )
+
+    assert queries[0] == "Visa Inc"
+    assert "Visa" in queries
+
+
+def test_build_usaspending_company_match_search_document_includes_awards() -> None:
+    match = UsaspendingCompanyMatchRecord(
+        match_key="match-1",
+        company_id="co-lmt",
+        company_name="Lockheed Martin Corporation",
+        ticker="LMT",
+        query_name="Lockheed Martin",
+        canonical_recipient_id="12345",
+        recipient_name="LOCKHEED MARTIN CORPORATION",
+        normalized_recipient_name="lockheed martin corporation",
+        recipient_code="ABC123",
+        uei="UEI123456789",
+        match_type="recipient_name",
+        match_value="LOCKHEED MARTIN CORPORATION",
+        total_amount=125000000.0,
+        award_count=2,
+        top_agencies=["Department of Defense", "NASA"],
+        source_url="https://www.usaspending.gov/recipient/12345/latest",
+        summary="Lockheed Martin matched a large federal recipient profile.",
+        content="Contracts and federal award summary.",
+    )
+    awards = [
+        UsaspendingAwardRecord(
+            award_key="award-1",
+            match_key="match-1",
+            canonical_recipient_id="12345",
+            recipient_name="LOCKHEED MARTIN CORPORATION",
+            award_id="FA-0001",
+            award_amount=55000000.0,
+            awarding_agency="Department of Defense",
+            description="Missile systems contract",
+        )
+    ]
+
+    document = build_usaspending_company_match_search_document(match, awards)
+    assert document.source == "usaspending"
+    assert document.asset_tickers == ["LMT"]
+    assert document.metadata["recipientId"] == "12345"
+    assert "Missile systems contract" in document.content
+
+
+def test_select_recipient_matches_prefers_strong_name_matches() -> None:
+    rows = [
+        {"recipient_id": "1", "name": "LOCKHEED MARTIN CORPORATION", "amount": 1000},
+        {"recipient_id": "2", "name": "LOCKHEED TECHNOLOGY SERVICES", "amount": 2000},
+        {"recipient_id": "3", "name": "MARTIN COUNTY UTILITIES", "amount": 5000},
+    ]
+
+    matches = select_recipient_matches(query_name="Lockheed Martin", rows=rows, limit=2)
+    assert [row["recipient_id"] for row in matches] == ["1"]
