@@ -1,24 +1,53 @@
 # Capitol Pipeline
 
-Open-source data processing pipeline for Congressional financial disclosures, campaign finance, lobbying records, and voting data.
+Capitol Pipeline is the document and disclosure ingestion engine for
+[CapitolExposed.com](https://www.capitolexposed.com).
 
-Powers [CapitolGraph.com](https://capitolgraph.com) — a real-time knowledge graph that cross-references Congressional stock trades, lobbying disclosures, campaign donations, and voting records.
+It is being retrofitted from the stronger OCR core in Epstein-Pipeline so the
+Congress site stops depending on a thinner, route-local parsing path for House
+PTR filings and asset normalization.
 
-## Features
+## What Exists Now
 
-- **Multi-source ingestion**: STOCK Act (House/Senate), FEC, LDA, Congress.gov, SEC EDGAR
-- **OCR processing**: Handwritten STOCK Act PDF filings (multi-backend: PyMuPDF, Surya, Docling)
-- **Entity extraction**: NER for tickers, trade amounts, committee names, bill numbers
-- **Conflict detection**: AI-powered cross-referencing of trades vs. votes vs. lobbying
-- **Knowledge graph**: Entity relationship mapping (member → company → committee → bill)
-- **Deduplication**: 3-pass dedup for amended/corrected filings
-- **Neon Postgres export**: pgvector semantic search + FTS
+- Transplanted multi-backend OCR core from Epstein-Pipeline
+- Capitol-specific package and settings
+- House Clerk XML source adapter
+- Senate watcher source adapter
+- Crypto asset classifier for direct coins, ETFs and trusts, and adjacent equities
+- Bridge helpers that emit shapes compatible with CapitolExposed database tables
 
-## From the creators of
+## Why This Repo Matters
 
-- [EpsteinExposed.com](https://epsteinexposed.com) — 2M+ document investigative database
-- [Epstein-Pipeline](https://github.com/stonesalltheway1/Epstein-Pipeline) — the open-source pipeline this project is based on
+CapitolExposed already has live filing polling and a site-side parser, but that
+logic currently lives inside the web app. This repo is the path to:
 
-## License
+1. Move filing extraction out of the app layer
+2. Reuse the stronger OCR fallback stack already proven on EpsteinExposed
+3. Normalize tricky assets, especially crypto, before they reach the site
+4. Export site-ready trade and stub payloads with less brittle parsing logic
 
-MIT
+## Commands
+
+```bash
+# Inspect the House annual disclosure feed
+capitol-pipeline house-feed --year 2026
+
+# Inspect the current Senate watcher aggregate feed
+capitol-pipeline senate-feed
+
+# Classify a raw asset
+capitol-pipeline classify-crypto --ticker IBIT --description "iShares Bitcoin Trust ETF"
+
+# OCR a single PDF through the fallback chain
+capitol-pipeline ocr ./sample.pdf
+```
+
+## Retrofit Priorities
+
+1. Replace the current House PTR OCR and extraction path in CapitolExposed
+2. Backfill crypto-linked trades already present in the database
+3. Add Capitol-specific Neon exporters and scheduled runners
+4. Add fixture-driven regression tests from real House and Senate disclosures
+
+See [docs/RETROFIT_PLAN.md](docs/RETROFIT_PLAN.md) for the full implementation
+plan.

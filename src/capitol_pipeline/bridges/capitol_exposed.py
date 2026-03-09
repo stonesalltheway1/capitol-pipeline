@@ -1,0 +1,64 @@
+"""Bridge functions that shape Capitol Pipeline output for CapitolExposed."""
+
+from __future__ import annotations
+
+from capitol_pipeline.models.congress import FilingStub, NormalizedTradeRow
+
+
+def build_house_stub_payload(stub: FilingStub) -> dict[str, object]:
+    """Build a row payload compatible with the site's house_filing_stubs table."""
+
+    return {
+        "doc_id": stub.doc_id,
+        "filing_year": stub.filing_year,
+        "source": stub.source,
+        "source_url": stub.source_url,
+        "status": "pending_extraction",
+        "metadata": {
+            "docId": stub.doc_id,
+            "filingYear": stub.filing_year,
+            "filingType": stub.filing_type,
+            "filingDate": stub.filing_date,
+            "firstName": stub.first_name,
+            "lastName": stub.last_name,
+            "memberId": stub.member.id,
+            "memberName": stub.member.name,
+            "memberSlug": stub.member.slug,
+            "party": stub.member.party,
+            "state": stub.member.state,
+            "district": stub.member.district,
+            "rawStateDistrict": stub.raw_state_district,
+        },
+    }
+
+
+def build_trade_payload(row: NormalizedTradeRow) -> dict[str, object]:
+    """Build a row payload compatible with the site's trades table."""
+
+    normalized_asset = row.normalized_asset
+    asset_type = row.asset_type
+    if normalized_asset:
+        if normalized_asset.kind == "direct_crypto":
+            asset_type = "Cryptocurrency"
+        elif normalized_asset.kind == "crypto_etf":
+            asset_type = "Crypto ETF"
+        elif normalized_asset.kind == "crypto_equity":
+            asset_type = "Crypto-Adjacent Equity"
+
+    return {
+        "member_id": row.member.id,
+        "ticker": row.ticker,
+        "asset_description": row.asset_description,
+        "asset_type": asset_type,
+        "transaction_type": row.transaction_type,
+        "transaction_date": row.transaction_date,
+        "disclosure_date": row.disclosure_date,
+        "amount_min": row.amount_min,
+        "amount_max": row.amount_max,
+        "owner": row.owner,
+        "source": row.source,
+        "source_id": row.source_id,
+        "crypto_kind": normalized_asset.kind if normalized_asset else None,
+        "crypto_symbol": normalized_asset.canonical_symbol if normalized_asset else None,
+        "crypto_match_confidence": normalized_asset.confidence if normalized_asset else None,
+    }

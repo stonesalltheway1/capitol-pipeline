@@ -1,0 +1,82 @@
+[build-system]
+requires = ["setuptools>=68.0", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "capitol-pipeline"
+version = "0.1.0"
+description = "Document and disclosure processing pipeline for CapitolExposed"
+readme = "README.md"
+license = {text = "MIT"}
+requires-python = ">=3.10"
+authors = [
+    {name = "CapitolExposed", email = "contact@capitolexposed.com"},
+]
+keywords = [
+    "congress",
+    "stock-act",
+    "ocr",
+    "lobbying",
+    "campaign-finance",
+    "crypto",
+    "pipeline",
+]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Intended Audience :: Science/Research",
+    "License :: OSI Approved :: MIT License",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Topic :: Scientific/Engineering :: Information Analysis",
+]
+dependencies = [
+    "click>=8.1",
+    "httpx>=0.25",
+    "pydantic>=2.0",
+    "pydantic-settings>=2.0",
+    "rich>=13.0",
+]
+
+[project.optional-dependencies]
+pymupdf = [
+    "pymupdf>=1.24",
+]
+ocr = [
+    "docling>=2.0",
+]
+ocr-surya = [
+    "surya-ocr>=0.8",
+]
+ocr-gpu = [
+    "olmocr>=0.1",
+]
+neon = [
+    "psycopg[binary]>=3.1",
+    "pgvector>=0.3",
+]
+dev = [
+    "pytest>=7.0",
+    "ruff>=0.4",
+]
+all = [
+    "capitol-pipeline[pymupdf,ocr,ocr-surya,neon]",
+]
+
+[project.scripts]
+capitol-pipeline = "capitol_pipeline.cli:cli"
+
+[project.urls]
+Homepage = "https://www.capitolexposed.com"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.ruff]
+target-version = "py310"
+line-length = 100
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["src"]
