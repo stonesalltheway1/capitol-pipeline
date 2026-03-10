@@ -150,7 +150,12 @@ class Settings(BaseSettings):
     def resolved_congress_api_key(self) -> str:
         """Return the configured Congress.gov key, falling back to DEMO_KEY for light usage."""
 
-        value = self.congress_api_key or os.getenv("CONGRESS_API_KEY") or "DEMO_KEY"
+        value = (
+            self.congress_api_key
+            or os.getenv("CONGRESS_API_KEY")
+            or os.getenv("CONGRESS_GOV_API_KEY")
+            or "DEMO_KEY"
+        )
         return value.strip()
 
     @property
