@@ -26,6 +26,7 @@ jobs:
     env:
       DATABASE_URL: ${{ secrets.DATABASE_URL }}
       OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
+      CAPITOL_CONGRESS_API_KEY: ${{ secrets.CAPITOL_CONGRESS_API_KEY }}
       CAPITOL_EMBEDDING_PROVIDER: openai
       CAPITOL_OPENAI_EMBEDDING_DIMENSIONS: "768"
       PYTHONUNBUFFERED: "1"
@@ -61,6 +62,19 @@ jobs:
         run: |
           python -u -m capitol_pipeline index-site-core \
             --only-missing
+
+      - name: Refresh official Congress bill context
+        run: |
+          if [ -z "${CAPITOL_CONGRESS_API_KEY}" ]; then
+            echo "Skipping Congress.gov refresh because CAPITOL_CONGRESS_API_KEY is not configured."
+            exit 0
+          fi
+          python -u -m capitol_pipeline sync-congress-bills \
+            --limit-bills 75 \
+            --only-stale \
+            --rate-limit-cooldown-hours 6 \
+            --with-search-index \
+            --no-embeddings
 
       - name: Refresh Offshore match index when requested
         if: env.RUN_OFFSHORE_MATCH_REFRESH == 'true'

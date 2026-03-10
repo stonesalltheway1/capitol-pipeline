@@ -18,6 +18,7 @@ from capitol_pipeline.bridges import (
     build_alert_search_document,
     build_bill_search_document,
     build_committee_search_document,
+    build_congress_bill_context_search_document,
     build_dossier_search_document,
     build_fara_member_match_search_document,
     build_fara_registrant_search_document,
@@ -33,6 +34,7 @@ from capitol_pipeline.bridges import (
 from capitol_pipeline.config import OcrBackend, Settings
 from capitol_pipeline.exporters.neon import (
     backfill_crypto_trade_classification,
+    ensure_congress_schema,
     ensure_fara_schema,
     ensure_offshore_schema,
     ensure_search_schema,
@@ -40,6 +42,7 @@ from capitol_pipeline.exporters.neon import (
     fetch_existing_trade_ids,
     fetch_existing_fara_registration_numbers,
     fetch_alerts_for_search,
+    fetch_bills_for_congress_sync,
     fetch_bills_for_search,
     fetch_company_candidates_for_usaspending,
     fetch_committees_for_search,
@@ -63,6 +66,10 @@ from capitol_pipeline.exporters.neon import (
     upsert_offshore_member_matches,
     upsert_offshore_nodes,
     upsert_offshore_relationships,
+    upsert_congress_bill_actions,
+    upsert_congress_bill_summaries,
+    upsert_congress_bill_sync,
+    upsert_congress_bills,
     upsert_usaspending_awards,
     upsert_usaspending_company_matches,
     upsert_usaspending_company_sync,
@@ -81,6 +88,11 @@ from capitol_pipeline.models.fara import (
     FaraRegistrantRecord,
     FaraShortFormRecord,
 )
+from capitol_pipeline.models.legislation import (
+    CongressBillActionRecord,
+    CongressBillRecord,
+    CongressBillSummaryRecord,
+)
 from capitol_pipeline.models.offshore import OffshoreMemberMatchRecord, OffshoreNodeRecord
 from capitol_pipeline.models.usaspending import (
     UsaspendingAwardRecord,
@@ -93,6 +105,12 @@ from capitol_pipeline.processors.chunking import build_search_chunks
 from capitol_pipeline.processors.embeddings import get_embedder
 from capitol_pipeline.processors.ocr import OcrProcessor
 from capitol_pipeline.registries.members import MemberRegistry, load_member_registry_from_json
+from capitol_pipeline.sources.congress_gov import (
+    CongressGovApiClient,
+    build_congress_bill_action_records,
+    build_congress_bill_record,
+    build_congress_bill_summary_records,
+)
 from capitol_pipeline.sources.house_clerk import fetch_house_feed
 from capitol_pipeline.sources.fara import (
     FaraApiClient,
@@ -809,6 +827,15 @@ def ensure_fara_schema_command() -> None:
     click.echo(json.dumps(summary, indent=2))
 
 
+@cli.command("ensure-congress-schema")
+def ensure_congress_schema_command() -> None:
+    """Create the official Congress.gov bill context tables."""
+
+    settings = Settings()
+    summary = ensure_congress_schema(settings)
+    click.echo(json.dumps(summary, indent=2))
+
+
 @cli.command("corpus-status")
 def corpus_status_command() -> None:
     """Print a compact status snapshot for pipeline-managed corpora and retrieval."""
@@ -1184,6 +1211,239 @@ def ingest_usaspending_command(
                 {
                     "companyId": company_id,
                     "ticker": ticker,
+                    "error": str(error)[:240],
+                }
+            )
+
+    click.echo(json.dumps(summary, indent=2))
+
+
+@cli.command("sync-congress-bills")
+@click.option("--limit-bills", type=int, default=50, show_default=True)
+@click.option("--stale-after-days", type=int, default=7, show_default=True)
+@click.option("--rate-limit-cooldown-hours", type=int, default=12, show_default=True)
+@click.option("--only-stale/--include-fresh", default=True, show_default=True)
+@click.option("--with-search-index/--no-search-index", default=True, show_default=True)
+@click.option("--with-embeddings/--no-embeddings", default=False, show_default=True)
+def sync_congress_bills_command(
+    limit_bills: int,
+    stale_after_days: int,
+    rate_limit_cooldown_hours: int,
+    only_stale: bool,
+    with_search_index: bool,
+    with_embeddings: bool,
+) -> None:
+    """Sync official Congress.gov bill summaries and actions for tracked bills."""
+
+    settings = Settings()
+    ensure_congress_schema(settings)
+    if with_search_index:
+        ensure_search_schema(settings)
+
+    effective_limit = limit_bills
+    if settings.using_demo_congress_api_key and effective_limit > 5:
+        effective_limit = 5
+
+    client = CongressGovApiClient(settings)
+    bill_rows = fetch_bills_for_congress_sync(
+        settings,
+        limit=effective_limit,
+        only_stale=only_stale,
+        stale_after_days=stale_after_days,
+        rate_limit_cooldown_hours=rate_limit_cooldown_hours,
+    )
+
+    summary = {
+        "billsQueued": len(bill_rows),
+        "billLimitRequested": limit_bills,
+        "billLimitUsed": effective_limit,
+        "rateLimitCooldownHours": rate_limit_cooldown_hours,
+        "usingDemoKey": settings.using_demo_congress_api_key,
+        "billsSynced": 0,
+        "billsErrored": 0,
+        "rateLimited": False,
+        "billRecordsUpserted": 0,
+        "summariesUpserted": 0,
+        "actionsUpserted": 0,
+        "searchDocumentsUpserted": 0,
+        "searchChunksUpserted": 0,
+        "embedded": 0,
+        "processed": [],
+        "failed": [],
+    }
+
+    for row in bill_rows:
+        site_bill_id = str(row.get("id") or "").strip()
+        congress = int(row.get("congress") or 0)
+        bill_type = str(row.get("bill_type") or "").strip()
+        bill_number = str(row.get("number") or "").strip()
+        try:
+            bill_payload = client.fetch_bill_detail(congress, bill_type, bill_number)
+            summary_items = client.fetch_bill_summaries(congress, bill_type, bill_number)
+            action_items = client.fetch_bill_actions(congress, bill_type, bill_number)
+
+            bill_record: CongressBillRecord = build_congress_bill_record(
+                site_bill_row=row,
+                bill_payload=bill_payload,
+                summaries=summary_items,
+                actions=action_items,
+            )
+            summary_records: list[CongressBillSummaryRecord] = build_congress_bill_summary_records(
+                site_bill_id=site_bill_id,
+                congress=bill_record.congress,
+                bill_type=bill_record.bill_type,
+                bill_number=bill_record.bill_number,
+                bill_key=bill_record.bill_key,
+                source_url=bill_record.legislation_url,
+                items=summary_items,
+            )
+            action_records: list[CongressBillActionRecord] = build_congress_bill_action_records(
+                site_bill_id=site_bill_id,
+                congress=bill_record.congress,
+                bill_type=bill_record.bill_type,
+                bill_number=bill_record.bill_number,
+                bill_key=bill_record.bill_key,
+                source_url=bill_record.legislation_url,
+                items=action_items,
+            )
+
+            bill_upsert_summary = upsert_congress_bills(settings, [bill_record])
+            summaries_upsert_summary = upsert_congress_bill_summaries(settings, summary_records)
+            actions_upsert_summary = upsert_congress_bill_actions(settings, action_records)
+
+            index_summary: dict[str, object] | None = None
+            if with_search_index:
+                search_document = build_congress_bill_context_search_document(
+                    bill_record,
+                    summary_records,
+                    action_records,
+                    site_row=row,
+                )
+                index_summary = index_search_document_with_retry(
+                    settings,
+                    search_document,
+                    with_embeddings=with_embeddings,
+                    ensure_schema=False,
+                )
+                summary["searchDocumentsUpserted"] += int(
+                    (index_summary.get("document") or {}).get("upserted", 0)  # type: ignore[union-attr]
+                )
+                summary["searchChunksUpserted"] += int(
+                    (index_summary.get("chunks") or {}).get("upserted", 0)  # type: ignore[union-attr]
+                )
+                summary["embedded"] += 1 if index_summary.get("embedded") else 0
+
+            upsert_congress_bill_sync(
+                settings,
+                site_bill_id=site_bill_id,
+                bill_key=bill_record.bill_key,
+                congress=bill_record.congress,
+                bill_type=bill_record.bill_type,
+                bill_number=bill_record.bill_number,
+                last_status="ok",
+                source_update_date=bill_record.update_date,
+                source_update_date_including_text=bill_record.update_date_including_text,
+                summaries_count=len(summary_records),
+                actions_count=len(action_records),
+                metadata={
+                    "title": bill_record.title,
+                    "policyArea": bill_record.policy_area,
+                    "legislationUrl": bill_record.legislation_url,
+                },
+            )
+
+            summary["billsSynced"] += 1
+            summary["billRecordsUpserted"] += int(bill_upsert_summary["upserted"])
+            summary["summariesUpserted"] += int(summaries_upsert_summary["upserted"])
+            summary["actionsUpserted"] += int(actions_upsert_summary["upserted"])
+            summary["processed"].append(
+                {
+                    "siteBillId": site_bill_id,
+                    "billKey": bill_record.bill_key,
+                    "title": bill_record.title,
+                    "summaries": len(summary_records),
+                    "actions": len(action_records),
+                    "policyArea": bill_record.policy_area,
+                    "documentId": (index_summary.get("document") or {}).get("document_id") if index_summary else None,  # type: ignore[union-attr]
+                }
+            )
+        except httpx.HTTPStatusError as error:
+            status_code = error.response.status_code if error.response is not None else None
+            if status_code == 429:
+                upsert_congress_bill_sync(
+                    settings,
+                    site_bill_id=site_bill_id,
+                    bill_key=None,
+                    congress=congress,
+                    bill_type=bill_type,
+                    bill_number=bill_number,
+                    last_status="rate_limited",
+                    source_update_date=None,
+                    source_update_date_including_text=None,
+                    summaries_count=0,
+                    actions_count=0,
+                    last_error=str(error)[:500],
+                    metadata={"title": row.get("title"), "apiKeyMode": "demo" if settings.using_demo_congress_api_key else "configured"},
+                )
+                summary["rateLimited"] = True
+                summary["failed"].append(
+                    {
+                        "siteBillId": site_bill_id,
+                        "congress": congress,
+                        "billType": bill_type,
+                        "billNumber": bill_number,
+                        "error": str(error)[:240],
+                    }
+                )
+                break
+            upsert_congress_bill_sync(
+                settings,
+                site_bill_id=site_bill_id,
+                bill_key=None,
+                congress=congress,
+                bill_type=bill_type,
+                bill_number=bill_number,
+                last_status="error",
+                source_update_date=None,
+                source_update_date_including_text=None,
+                summaries_count=0,
+                actions_count=0,
+                last_error=str(error)[:500],
+                metadata={"title": row.get("title")},
+            )
+            summary["billsErrored"] += 1
+            summary["failed"].append(
+                {
+                    "siteBillId": site_bill_id,
+                    "congress": congress,
+                    "billType": bill_type,
+                    "billNumber": bill_number,
+                    "error": str(error)[:240],
+                }
+            )
+        except Exception as error:
+            upsert_congress_bill_sync(
+                settings,
+                site_bill_id=site_bill_id,
+                bill_key=None,
+                congress=congress,
+                bill_type=bill_type,
+                bill_number=bill_number,
+                last_status="error",
+                source_update_date=None,
+                source_update_date_including_text=None,
+                summaries_count=0,
+                actions_count=0,
+                last_error=str(error)[:500],
+                metadata={"title": row.get("title")},
+            )
+            summary["billsErrored"] += 1
+            summary["failed"].append(
+                {
+                    "siteBillId": site_bill_id,
+                    "congress": congress,
+                    "billType": bill_type,
+                    "billNumber": bill_number,
                     "error": str(error)[:240],
                 }
             )

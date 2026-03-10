@@ -116,6 +116,9 @@ class Settings(BaseSettings):
     fara_bulk_short_forms_zip_url: str = "https://efile.fara.gov/bulk/zip/FARA_All_ShortForms.csv.zip"
     fara_bulk_documents_zip_url: str = "https://efile.fara.gov/bulk/zip/FARA_All_RegistrantDocs.csv.zip"
     fara_request_interval_seconds: float = 2.05
+    congress_gov_base_url: str = "https://api.congress.gov/v3"
+    congress_gov_request_interval_seconds: float = 0.85
+    congress_api_key: str | None = None
     usaspending_base_url: str = "https://api.usaspending.gov/api/v2"
     usaspending_request_interval_seconds: float = 0.35
     site_base_url: str = "https://www.capitolexposed.com"
@@ -142,6 +145,19 @@ class Settings(BaseSettings):
 
         value = self.openai_api_key or os.getenv("OPENAI_API_KEY")
         return value.strip() if value else None
+
+    @property
+    def resolved_congress_api_key(self) -> str:
+        """Return the configured Congress.gov key, falling back to DEMO_KEY for light usage."""
+
+        value = self.congress_api_key or os.getenv("CONGRESS_API_KEY") or "DEMO_KEY"
+        return value.strip()
+
+    @property
+    def using_demo_congress_api_key(self) -> bool:
+        """Return whether the pipeline is currently falling back to the demo Congress.gov key."""
+
+        return self.resolved_congress_api_key.upper() == "DEMO_KEY"
 
     def ensure_dirs(self) -> None:
         """Create data, output, and cache directories if they don't exist."""

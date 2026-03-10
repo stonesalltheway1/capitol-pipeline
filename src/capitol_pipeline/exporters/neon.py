@@ -20,6 +20,11 @@ from capitol_pipeline.models.fara import (
     FaraRegistrantRecord,
     FaraShortFormRecord,
 )
+from capitol_pipeline.models.legislation import (
+    CongressBillActionRecord,
+    CongressBillRecord,
+    CongressBillSummaryRecord,
+)
 from capitol_pipeline.models.offshore import (
     OffshoreMemberMatchRecord,
     OffshoreNodeRecord,
@@ -68,6 +73,10 @@ PIPELINE_USASPENDING_RECIPIENTS_TABLE = "pipeline_usaspending_recipients"
 PIPELINE_USASPENDING_COMPANY_MATCHES_TABLE = "pipeline_usaspending_company_matches"
 PIPELINE_USASPENDING_AWARDS_TABLE = "pipeline_usaspending_awards"
 PIPELINE_USASPENDING_COMPANY_SYNCS_TABLE = "pipeline_usaspending_company_syncs"
+PIPELINE_CONGRESS_BILLS_TABLE = "pipeline_congress_bills"
+PIPELINE_CONGRESS_BILL_SUMMARIES_TABLE = "pipeline_congress_bill_summaries"
+PIPELINE_CONGRESS_BILL_ACTIONS_TABLE = "pipeline_congress_bill_actions"
+PIPELINE_CONGRESS_BILL_SYNCS_TABLE = "pipeline_congress_bill_syncs"
 CRYPTO_TRADE_SCAN_REGEX = (
     "(bitcoin|ethereum|ether|solana|xrp|cardano|dogecoin|litecoin|polkadot|"
     "avalanche|chainlink|crypto|digital asset|coinbase|microstrategy|"
@@ -666,6 +675,169 @@ def ensure_usaspending_schema(settings: Settings) -> dict[str, object]:
             PIPELINE_USASPENDING_COMPANY_MATCHES_TABLE,
             PIPELINE_USASPENDING_AWARDS_TABLE,
             PIPELINE_USASPENDING_COMPANY_SYNCS_TABLE,
+        ]
+    }
+
+
+def ensure_congress_schema(settings: Settings) -> dict[str, object]:
+    """Create the official Congress.gov bill-context tables."""
+
+    with neon_connection(settings) as connection:
+        with advisory_lock(connection, "pipeline-congress-schema"):
+            with connection.cursor() as cursor:
+                cursor.execute(
+                    f"""
+                    CREATE TABLE IF NOT EXISTS {PIPELINE_CONGRESS_BILLS_TABLE} (
+                        bill_key TEXT PRIMARY KEY,
+                        site_bill_id TEXT NOT NULL UNIQUE,
+                        congress INT NOT NULL,
+                        bill_type TEXT NOT NULL,
+                        bill_number TEXT NOT NULL,
+                        title TEXT NOT NULL,
+                        short_title TEXT NULL,
+                        origin_chamber TEXT NULL,
+                        policy_area TEXT NULL,
+                        sponsor_bioguide_id TEXT NULL,
+                        sponsor_full_name TEXT NULL,
+                        sponsor_party TEXT NULL,
+                        sponsor_state TEXT NULL,
+                        sponsor_district TEXT NULL,
+                        introduced_date DATE NULL,
+                        latest_action_date DATE NULL,
+                        latest_action_text TEXT NULL,
+                        update_date TIMESTAMPTZ NULL,
+                        update_date_including_text TIMESTAMPTZ NULL,
+                        legislation_url TEXT NULL,
+                        api_url TEXT NULL,
+                        summaries_count INT NOT NULL DEFAULT 0,
+                        actions_count INT NOT NULL DEFAULT 0,
+                        committees_count INT NOT NULL DEFAULT 0,
+                        cosponsors_count INT NOT NULL DEFAULT 0,
+                        subject_count INT NOT NULL DEFAULT 0,
+                        text_version_count INT NOT NULL DEFAULT 0,
+                        summary TEXT NULL,
+                        content TEXT NOT NULL DEFAULT '',
+                        committee_names TEXT[] NOT NULL DEFAULT '{{}}'::text[],
+                        committee_codes TEXT[] NOT NULL DEFAULT '{{}}'::text[],
+                        subjects TEXT[] NOT NULL DEFAULT '{{}}'::text[],
+                        metadata JSONB NOT NULL DEFAULT '{{}}'::jsonb,
+                        content_tsv tsvector GENERATED ALWAYS AS (
+                            to_tsvector('english', coalesce(title, '') || ' ' || coalesce(summary, '') || ' ' || coalesce(content, ''))
+                        ) STORED,
+                        created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+                        updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+                    )
+                    """
+                )
+                cursor.execute(
+                    f"""
+                    CREATE TABLE IF NOT EXISTS {PIPELINE_CONGRESS_BILL_SUMMARIES_TABLE} (
+                        summary_key TEXT PRIMARY KEY,
+                        bill_key TEXT NOT NULL REFERENCES {PIPELINE_CONGRESS_BILLS_TABLE}(bill_key) ON DELETE CASCADE,
+                        site_bill_id TEXT NOT NULL,
+                        congress INT NOT NULL,
+                        bill_type TEXT NOT NULL,
+                        bill_number TEXT NOT NULL,
+                        version_code TEXT NULL,
+                        action_date DATE NULL,
+                        action_desc TEXT NULL,
+                        update_date TIMESTAMPTZ NULL,
+                        text TEXT NOT NULL,
+                        source_url TEXT NULL,
+                        metadata JSONB NOT NULL DEFAULT '{{}}'::jsonb,
+                        text_tsv tsvector GENERATED ALWAYS AS (
+                            to_tsvector('english', coalesce(text, ''))
+                        ) STORED,
+                        created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+                        updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+                    )
+                    """
+                )
+                cursor.execute(
+                    f"""
+                    CREATE TABLE IF NOT EXISTS {PIPELINE_CONGRESS_BILL_ACTIONS_TABLE} (
+                        action_key TEXT PRIMARY KEY,
+                        bill_key TEXT NOT NULL REFERENCES {PIPELINE_CONGRESS_BILLS_TABLE}(bill_key) ON DELETE CASCADE,
+                        site_bill_id TEXT NOT NULL,
+                        congress INT NOT NULL,
+                        bill_type TEXT NOT NULL,
+                        bill_number TEXT NOT NULL,
+                        action_date DATE NULL,
+                        action_time TEXT NULL,
+                        action_code TEXT NULL,
+                        action_type TEXT NULL,
+                        text TEXT NOT NULL,
+                        source_system_name TEXT NULL,
+                        source_system_code INT NULL,
+                        committee_names TEXT[] NOT NULL DEFAULT '{{}}'::text[],
+                        committee_codes TEXT[] NOT NULL DEFAULT '{{}}'::text[],
+                        source_url TEXT NULL,
+                        metadata JSONB NOT NULL DEFAULT '{{}}'::jsonb,
+                        text_tsv tsvector GENERATED ALWAYS AS (
+                            to_tsvector('english', coalesce(text, ''))
+                        ) STORED,
+                        created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+                        updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+                    )
+                    """
+                )
+                cursor.execute(
+                    f"""
+                    CREATE TABLE IF NOT EXISTS {PIPELINE_CONGRESS_BILL_SYNCS_TABLE} (
+                        site_bill_id TEXT PRIMARY KEY,
+                        bill_key TEXT NULL UNIQUE,
+                        congress INT NOT NULL,
+                        bill_type TEXT NOT NULL,
+                        bill_number TEXT NOT NULL,
+                        last_status TEXT NOT NULL,
+                        last_error TEXT NULL,
+                        source_update_date TIMESTAMPTZ NULL,
+                        source_update_date_including_text TIMESTAMPTZ NULL,
+                        summaries_count INT NOT NULL DEFAULT 0,
+                        actions_count INT NOT NULL DEFAULT 0,
+                        synced_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+                        metadata JSONB NOT NULL DEFAULT '{{}}'::jsonb
+                    )
+                    """
+                )
+                cursor.execute(
+                    f"CREATE INDEX IF NOT EXISTS idx_pipeline_congress_bills_type ON {PIPELINE_CONGRESS_BILLS_TABLE} USING BTREE (congress, bill_type, bill_number)"
+                )
+                cursor.execute(
+                    f"CREATE INDEX IF NOT EXISTS idx_pipeline_congress_bills_action_date ON {PIPELINE_CONGRESS_BILLS_TABLE} USING BTREE (latest_action_date DESC)"
+                )
+                cursor.execute(
+                    f"CREATE INDEX IF NOT EXISTS idx_pipeline_congress_bills_tsv ON {PIPELINE_CONGRESS_BILLS_TABLE} USING GIN (content_tsv)"
+                )
+                cursor.execute(
+                    f"CREATE INDEX IF NOT EXISTS idx_pipeline_congress_bills_committee_codes ON {PIPELINE_CONGRESS_BILLS_TABLE} USING GIN (committee_codes)"
+                )
+                cursor.execute(
+                    f"CREATE INDEX IF NOT EXISTS idx_pipeline_congress_bills_subjects ON {PIPELINE_CONGRESS_BILLS_TABLE} USING GIN (subjects)"
+                )
+                cursor.execute(
+                    f"CREATE INDEX IF NOT EXISTS idx_pipeline_congress_bill_summaries_bill ON {PIPELINE_CONGRESS_BILL_SUMMARIES_TABLE} USING BTREE (bill_key, action_date DESC, update_date DESC)"
+                )
+                cursor.execute(
+                    f"CREATE INDEX IF NOT EXISTS idx_pipeline_congress_bill_summaries_tsv ON {PIPELINE_CONGRESS_BILL_SUMMARIES_TABLE} USING GIN (text_tsv)"
+                )
+                cursor.execute(
+                    f"CREATE INDEX IF NOT EXISTS idx_pipeline_congress_bill_actions_bill ON {PIPELINE_CONGRESS_BILL_ACTIONS_TABLE} USING BTREE (bill_key, action_date DESC)"
+                )
+                cursor.execute(
+                    f"CREATE INDEX IF NOT EXISTS idx_pipeline_congress_bill_actions_tsv ON {PIPELINE_CONGRESS_BILL_ACTIONS_TABLE} USING GIN (text_tsv)"
+                )
+                cursor.execute(
+                    f"CREATE INDEX IF NOT EXISTS idx_pipeline_congress_bill_syncs_status ON {PIPELINE_CONGRESS_BILL_SYNCS_TABLE} USING BTREE (last_status, synced_at ASC)"
+                )
+            connection.commit()
+
+    return {
+        "tables": [
+            PIPELINE_CONGRESS_BILLS_TABLE,
+            PIPELINE_CONGRESS_BILL_SUMMARIES_TABLE,
+            PIPELINE_CONGRESS_BILL_ACTIONS_TABLE,
+            PIPELINE_CONGRESS_BILL_SYNCS_TABLE,
         ]
     }
 
@@ -1927,6 +2099,354 @@ def upsert_usaspending_company_sync(
     return {"upserted": 1}
 
 
+def upsert_congress_bills(
+    settings: Settings,
+    rows: list[CongressBillRecord],
+) -> dict[str, int]:
+    """Upsert canonical Congress.gov bill records."""
+
+    if not rows:
+        return {"upserted": 0}
+    ensure_congress_schema(settings)
+    with neon_connection(settings) as connection:
+        with connection.cursor() as cursor:
+            cursor.executemany(
+                f"""
+                INSERT INTO {PIPELINE_CONGRESS_BILLS_TABLE} (
+                    bill_key,
+                    site_bill_id,
+                    congress,
+                    bill_type,
+                    bill_number,
+                    title,
+                    short_title,
+                    origin_chamber,
+                    policy_area,
+                    sponsor_bioguide_id,
+                    sponsor_full_name,
+                    sponsor_party,
+                    sponsor_state,
+                    sponsor_district,
+                    introduced_date,
+                    latest_action_date,
+                    latest_action_text,
+                    update_date,
+                    update_date_including_text,
+                    legislation_url,
+                    api_url,
+                    summaries_count,
+                    actions_count,
+                    committees_count,
+                    cosponsors_count,
+                    subject_count,
+                    text_version_count,
+                    summary,
+                    content,
+                    committee_names,
+                    committee_codes,
+                    subjects,
+                    metadata
+                )
+                VALUES (
+                    %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s,
+                    %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s
+                )
+                ON CONFLICT (bill_key) DO UPDATE SET
+                    site_bill_id = EXCLUDED.site_bill_id,
+                    congress = EXCLUDED.congress,
+                    bill_type = EXCLUDED.bill_type,
+                    bill_number = EXCLUDED.bill_number,
+                    title = EXCLUDED.title,
+                    short_title = EXCLUDED.short_title,
+                    origin_chamber = EXCLUDED.origin_chamber,
+                    policy_area = EXCLUDED.policy_area,
+                    sponsor_bioguide_id = EXCLUDED.sponsor_bioguide_id,
+                    sponsor_full_name = EXCLUDED.sponsor_full_name,
+                    sponsor_party = EXCLUDED.sponsor_party,
+                    sponsor_state = EXCLUDED.sponsor_state,
+                    sponsor_district = EXCLUDED.sponsor_district,
+                    introduced_date = EXCLUDED.introduced_date,
+                    latest_action_date = EXCLUDED.latest_action_date,
+                    latest_action_text = EXCLUDED.latest_action_text,
+                    update_date = EXCLUDED.update_date,
+                    update_date_including_text = EXCLUDED.update_date_including_text,
+                    legislation_url = EXCLUDED.legislation_url,
+                    api_url = EXCLUDED.api_url,
+                    summaries_count = EXCLUDED.summaries_count,
+                    actions_count = EXCLUDED.actions_count,
+                    committees_count = EXCLUDED.committees_count,
+                    cosponsors_count = EXCLUDED.cosponsors_count,
+                    subject_count = EXCLUDED.subject_count,
+                    text_version_count = EXCLUDED.text_version_count,
+                    summary = EXCLUDED.summary,
+                    content = EXCLUDED.content,
+                    committee_names = EXCLUDED.committee_names,
+                    committee_codes = EXCLUDED.committee_codes,
+                    subjects = EXCLUDED.subjects,
+                    metadata = EXCLUDED.metadata,
+                    updated_at = NOW()
+                """,
+                [
+                    (
+                        row.bill_key,
+                        row.site_bill_id,
+                        row.congress,
+                        row.bill_type,
+                        row.bill_number,
+                        row.title,
+                        row.short_title,
+                        row.origin_chamber,
+                        row.policy_area,
+                        row.sponsor_bioguide_id,
+                        row.sponsor_full_name,
+                        row.sponsor_party,
+                        row.sponsor_state,
+                        row.sponsor_district,
+                        row.introduced_date,
+                        row.latest_action_date,
+                        row.latest_action_text,
+                        row.update_date,
+                        row.update_date_including_text,
+                        row.legislation_url,
+                        row.api_url,
+                        row.summaries_count,
+                        row.actions_count,
+                        row.committees_count,
+                        row.cosponsors_count,
+                        row.subject_count,
+                        row.text_version_count,
+                        row.summary,
+                        row.content,
+                        row.committee_names,
+                        row.committee_codes,
+                        row.subjects,
+                        Jsonb(row.metadata),  # type: ignore[arg-type]
+                    )
+                    for row in rows
+                ],
+            )
+        connection.commit()
+    return {"upserted": len(rows)}
+
+
+def upsert_congress_bill_summaries(
+    settings: Settings,
+    rows: list[CongressBillSummaryRecord],
+) -> dict[str, int]:
+    """Upsert official bill summary versions."""
+
+    if not rows:
+        return {"upserted": 0}
+    ensure_congress_schema(settings)
+    with neon_connection(settings) as connection:
+        with connection.cursor() as cursor:
+            cursor.executemany(
+                f"""
+                INSERT INTO {PIPELINE_CONGRESS_BILL_SUMMARIES_TABLE} (
+                    summary_key,
+                    bill_key,
+                    site_bill_id,
+                    congress,
+                    bill_type,
+                    bill_number,
+                    version_code,
+                    action_date,
+                    action_desc,
+                    update_date,
+                    text,
+                    source_url,
+                    metadata
+                )
+                VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+                ON CONFLICT (summary_key) DO UPDATE SET
+                    bill_key = EXCLUDED.bill_key,
+                    site_bill_id = EXCLUDED.site_bill_id,
+                    congress = EXCLUDED.congress,
+                    bill_type = EXCLUDED.bill_type,
+                    bill_number = EXCLUDED.bill_number,
+                    version_code = EXCLUDED.version_code,
+                    action_date = EXCLUDED.action_date,
+                    action_desc = EXCLUDED.action_desc,
+                    update_date = EXCLUDED.update_date,
+                    text = EXCLUDED.text,
+                    source_url = EXCLUDED.source_url,
+                    metadata = EXCLUDED.metadata,
+                    updated_at = NOW()
+                """,
+                [
+                    (
+                        row.summary_key,
+                        row.bill_key,
+                        row.site_bill_id,
+                        row.congress,
+                        row.bill_type,
+                        row.bill_number,
+                        row.version_code,
+                        row.action_date,
+                        row.action_desc,
+                        row.update_date,
+                        row.text,
+                        row.source_url,
+                        Jsonb(row.metadata),  # type: ignore[arg-type]
+                    )
+                    for row in rows
+                ],
+            )
+        connection.commit()
+    return {"upserted": len(rows)}
+
+
+def upsert_congress_bill_actions(
+    settings: Settings,
+    rows: list[CongressBillActionRecord],
+) -> dict[str, int]:
+    """Upsert official bill actions."""
+
+    if not rows:
+        return {"upserted": 0}
+    ensure_congress_schema(settings)
+    with neon_connection(settings) as connection:
+        with connection.cursor() as cursor:
+            cursor.executemany(
+                f"""
+                INSERT INTO {PIPELINE_CONGRESS_BILL_ACTIONS_TABLE} (
+                    action_key,
+                    bill_key,
+                    site_bill_id,
+                    congress,
+                    bill_type,
+                    bill_number,
+                    action_date,
+                    action_time,
+                    action_code,
+                    action_type,
+                    text,
+                    source_system_name,
+                    source_system_code,
+                    committee_names,
+                    committee_codes,
+                    source_url,
+                    metadata
+                )
+                VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+                ON CONFLICT (action_key) DO UPDATE SET
+                    bill_key = EXCLUDED.bill_key,
+                    site_bill_id = EXCLUDED.site_bill_id,
+                    congress = EXCLUDED.congress,
+                    bill_type = EXCLUDED.bill_type,
+                    bill_number = EXCLUDED.bill_number,
+                    action_date = EXCLUDED.action_date,
+                    action_time = EXCLUDED.action_time,
+                    action_code = EXCLUDED.action_code,
+                    action_type = EXCLUDED.action_type,
+                    text = EXCLUDED.text,
+                    source_system_name = EXCLUDED.source_system_name,
+                    source_system_code = EXCLUDED.source_system_code,
+                    committee_names = EXCLUDED.committee_names,
+                    committee_codes = EXCLUDED.committee_codes,
+                    source_url = EXCLUDED.source_url,
+                    metadata = EXCLUDED.metadata,
+                    updated_at = NOW()
+                """,
+                [
+                    (
+                        row.action_key,
+                        row.bill_key,
+                        row.site_bill_id,
+                        row.congress,
+                        row.bill_type,
+                        row.bill_number,
+                        row.action_date,
+                        row.action_time,
+                        row.action_code,
+                        row.action_type,
+                        row.text,
+                        row.source_system_name,
+                        row.source_system_code,
+                        row.committee_names,
+                        row.committee_codes,
+                        row.source_url,
+                        Jsonb(row.metadata),  # type: ignore[arg-type]
+                    )
+                    for row in rows
+                ],
+            )
+        connection.commit()
+    return {"upserted": len(rows)}
+
+
+def upsert_congress_bill_sync(
+    settings: Settings,
+    *,
+    site_bill_id: str,
+    congress: int,
+    bill_type: str,
+    bill_number: str,
+    bill_key: str | None,
+    last_status: str,
+    source_update_date: str | None,
+    source_update_date_including_text: str | None,
+    summaries_count: int,
+    actions_count: int,
+    last_error: str | None = None,
+    metadata: dict[str, object] | None = None,
+) -> dict[str, int]:
+    """Record the last Congress.gov sync result for one tracked bill."""
+
+    ensure_congress_schema(settings)
+    with neon_connection(settings) as connection:
+        with connection.cursor() as cursor:
+            cursor.execute(
+                f"""
+                INSERT INTO {PIPELINE_CONGRESS_BILL_SYNCS_TABLE} (
+                    site_bill_id,
+                    bill_key,
+                    congress,
+                    bill_type,
+                    bill_number,
+                    last_status,
+                    last_error,
+                    source_update_date,
+                    source_update_date_including_text,
+                    summaries_count,
+                    actions_count,
+                    synced_at,
+                    metadata
+                )
+                VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, NOW(), %s)
+                ON CONFLICT (site_bill_id) DO UPDATE SET
+                    bill_key = EXCLUDED.bill_key,
+                    congress = EXCLUDED.congress,
+                    bill_type = EXCLUDED.bill_type,
+                    bill_number = EXCLUDED.bill_number,
+                    last_status = EXCLUDED.last_status,
+                    last_error = EXCLUDED.last_error,
+                    source_update_date = EXCLUDED.source_update_date,
+                    source_update_date_including_text = EXCLUDED.source_update_date_including_text,
+                    summaries_count = EXCLUDED.summaries_count,
+                    actions_count = EXCLUDED.actions_count,
+                    synced_at = NOW(),
+                    metadata = EXCLUDED.metadata
+                """,
+                (
+                    site_bill_id,
+                    bill_key,
+                    congress,
+                    bill_type,
+                    bill_number,
+                    last_status,
+                    last_error,
+                    source_update_date,
+                    source_update_date_including_text,
+                    summaries_count,
+                    actions_count,
+                    Jsonb(metadata or {}),  # type: ignore[arg-type]
+                ),
+            )
+        connection.commit()
+    return {"upserted": 1}
+
+
 def fetch_company_candidates_for_usaspending(
     settings: Settings,
     *,
@@ -2417,6 +2937,83 @@ def fetch_bills_for_search(
             return list(cursor.fetchall())
 
 
+def fetch_bills_for_congress_sync(
+    settings: Settings,
+    *,
+    limit: int = 0,
+    only_stale: bool = True,
+    stale_after_days: int = 7,
+    rate_limit_cooldown_hours: int = 12,
+) -> list[dict[str, object]]:
+    """Load tracked bills that should be refreshed from Congress.gov."""
+
+    ensure_congress_schema(settings)
+    with neon_connection(settings) as connection:
+        with connection.cursor() as cursor:
+            query = f"""
+                SELECT
+                    b.id,
+                    b.congress,
+                    b.bill_type,
+                    b.number,
+                    b.title,
+                    b.short_title,
+                    b.subjects,
+                    b.sponsor_id,
+                    m.name AS sponsor_name,
+                    m.slug AS sponsor_slug,
+                    b.committees,
+                    b.status,
+                    b.introduced_date,
+                    b.last_action_date,
+                    b.text_url,
+                    b.industries,
+                    sync.bill_key,
+                    sync.last_status,
+                    sync.last_error,
+                    sync.source_update_date,
+                    sync.source_update_date_including_text,
+                    sync.synced_at
+                FROM bills b
+                LEFT JOIN members m ON m.id = b.sponsor_id
+                LEFT JOIN {PIPELINE_CONGRESS_BILL_SYNCS_TABLE} sync ON sync.site_bill_id = b.id
+                WHERE COALESCE(b.title, '') <> ''
+                  AND COALESCE(b.congress, 0) > 0
+                  AND COALESCE(b.bill_type, '') <> ''
+                  AND COALESCE(CAST(b.number AS TEXT), '') <> ''
+                  AND (
+                        NOT %s
+                        OR sync.site_bill_id IS NULL
+                        OR (
+                            COALESCE(sync.last_status, '') NOT IN ('ok', 'rate_limited')
+                        )
+                        OR (
+                            COALESCE(sync.last_status, '') = 'ok'
+                            AND sync.synced_at < (NOW() - (%s * INTERVAL '1 day'))
+                        )
+                        OR (
+                            COALESCE(sync.last_status, '') = 'rate_limited'
+                            AND sync.synced_at < (NOW() - (%s * INTERVAL '1 hour'))
+                        )
+                  )
+                ORDER BY
+                    COALESCE(sync.synced_at, TO_TIMESTAMP(0)) ASC,
+                    b.last_action_date DESC NULLS LAST,
+                    b.introduced_date DESC NULLS LAST,
+                    b.id ASC
+            """
+            params: list[object] = [
+                only_stale,
+                max(1, stale_after_days),
+                max(1, rate_limit_cooldown_hours),
+            ]
+            if limit > 0:
+                query += " LIMIT %s"
+                params.append(limit)
+            cursor.execute(query, tuple(params))
+            return list(cursor.fetchall())
+
+
 def fetch_alerts_for_search(
     settings: Settings,
     *,
@@ -2563,6 +3160,7 @@ def fetch_pipeline_corpus_status(settings: Settings) -> dict[str, object]:
     ensure_offshore_schema(settings)
     ensure_fara_schema(settings)
     ensure_usaspending_schema(settings)
+    ensure_congress_schema(settings)
     with neon_connection(settings) as connection:
         with connection.cursor() as cursor:
             cursor.execute(
@@ -2584,6 +3182,14 @@ def fetch_pipeline_corpus_status(settings: Settings) -> dict[str, object]:
                         FROM {PIPELINE_USASPENDING_COMPANY_SYNCS_TABLE}
                         WHERE status = 'matched'
                     ) AS usaspending_matched_syncs,
+                    (SELECT COUNT(*)::int FROM {PIPELINE_CONGRESS_BILLS_TABLE}) AS congress_bills,
+                    (SELECT COUNT(*)::int FROM {PIPELINE_CONGRESS_BILL_SUMMARIES_TABLE}) AS congress_summaries,
+                    (SELECT COUNT(*)::int FROM {PIPELINE_CONGRESS_BILL_ACTIONS_TABLE}) AS congress_actions,
+                    (
+                        SELECT COUNT(*)::int
+                        FROM {PIPELINE_CONGRESS_BILL_SYNCS_TABLE}
+                        WHERE last_status = 'ok'
+                    ) AS congress_synced_bills,
                     (SELECT COUNT(*)::int FROM {PIPELINE_SEARCH_DOCUMENTS_TABLE}) AS search_documents,
                     (SELECT COUNT(*)::int FROM {PIPELINE_SEARCH_CHUNKS_TABLE}) AS search_chunks,
                     (
@@ -2647,6 +3253,12 @@ def fetch_pipeline_corpus_status(settings: Settings) -> dict[str, object]:
             "companyMatches": int(status.get("usaspending_company_matches") or 0),
             "awards": int(status.get("usaspending_awards") or 0),
             "matchedSyncs": int(status.get("usaspending_matched_syncs") or 0),
+        },
+        "congress": {
+            "bills": int(status.get("congress_bills") or 0),
+            "summaries": int(status.get("congress_summaries") or 0),
+            "actions": int(status.get("congress_actions") or 0),
+            "syncedBills": int(status.get("congress_synced_bills") or 0),
         },
         "search": {
             "documents": int(status.get("search_documents") or 0),

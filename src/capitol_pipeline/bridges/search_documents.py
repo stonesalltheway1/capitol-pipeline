@@ -9,6 +9,11 @@ from typing import Any
 from capitol_pipeline.models.congress import FilingStub, HousePtrParseResult, MemberMatch, NormalizedTradeRow
 from capitol_pipeline.models.document import Document
 from capitol_pipeline.models.fara import FaraMemberMatchRecord, FaraRegistrantBundle
+from capitol_pipeline.models.legislation import (
+    CongressBillActionRecord,
+    CongressBillRecord,
+    CongressBillSummaryRecord,
+)
 from capitol_pipeline.models.offshore import OffshoreNodeRecord
 from capitol_pipeline.models.search import SearchDocumentRecord, build_search_document
 from capitol_pipeline.models.usaspending import (
@@ -903,6 +908,94 @@ def build_alert_search_document(
             "confidence": confidence,
             "billTitles": bill_titles,
             "evidenceCount": len(evidence_items),
+        },
+    )
+
+
+def build_congress_bill_context_search_document(
+    bill: CongressBillRecord,
+    summaries: list[CongressBillSummaryRecord],
+    actions: list[CongressBillActionRecord],
+    *,
+    site_row: dict[str, Any] | None = None,
+) -> SearchDocumentRecord:
+    """Build a searchable official bill-context document from Congress.gov data."""
+
+    site_row = site_row or {}
+    site_bill_id = str(site_row.get("id") or bill.site_bill_id or "").strip()
+    sponsor_id = str(site_row.get("sponsor_id") or "").strip()
+    sponsor_name = str(site_row.get("sponsor_name") or bill.sponsor_full_name or "").strip()
+    sponsor_slug = str(site_row.get("sponsor_slug") or "").strip()
+    industries = ensure_list_of_strings(site_row.get("industries"))
+    site_subjects = ensure_list_of_strings(site_row.get("subjects"))
+    subjects = list(dict.fromkeys([*bill.subjects, *site_subjects]))
+    committee_names = list(dict.fromkeys([*bill.committee_names, *ensure_list_of_strings(site_row.get("committees"))]))
+    latest_summary = summaries[0] if summaries else None
+    latest_action = actions[0] if actions else None
+    recent_actions = [
+        f"{action.action_date or 'Undated'}: {action.text}"
+        for action in actions[:8]
+        if action.text
+    ]
+    content_lines = [
+        latest_summary.text if latest_summary else bill.summary,
+        f"Latest action: {latest_action.text}" if latest_action else None,
+        f"Sponsor: {sponsor_name}" if sponsor_name else None,
+        f"Policy area: {bill.policy_area}" if bill.policy_area else None,
+        f"Committees: {', '.join(committee_names)}" if committee_names else None,
+        f"Subjects: {', '.join(subjects)}" if subjects else None,
+        f"Recent actions: {' | '.join(recent_actions)}" if recent_actions else None,
+    ]
+    document = Document(
+        id=f"congress-bill-{bill.bill_key}",
+        title=bill.title,
+        date=bill.update_date_including_text or bill.update_date or bill.latest_action_date or bill.introduced_date,
+        source="congress-gov",
+        category="bill",
+        summary=latest_summary.text if latest_summary else bill.summary,
+        memberIds=[sponsor_id] if sponsor_id else [],
+        committeeIds=[],
+        billIds=[site_bill_id] if site_bill_id else [],
+        tags=list(
+            dict.fromkeys(
+                [
+                    "congress-gov",
+                    "official-bill-context",
+                    bill.bill_type,
+                    bill.origin_chamber or "",
+                    bill.policy_area or "",
+                    *subjects,
+                    *industries,
+                ]
+            )
+        ),
+        sourceUrl=bill.legislation_url,
+        archiveUrl=bill.legislation_url,
+        ocrText="\n\n".join(line for line in content_lines if line),
+        verificationStatus="verified",
+    )
+    return build_search_document(
+        document,
+        content=document.ocrText or "",
+        metadata={
+            "billKey": bill.bill_key,
+            "siteBillId": site_bill_id or None,
+            "billType": bill.bill_type,
+            "billNumber": bill.bill_number,
+            "congress": bill.congress,
+            "originChamber": bill.origin_chamber,
+            "policyArea": bill.policy_area,
+            "committeeNames": committee_names,
+            "committeeCodes": bill.committee_codes,
+            "subjects": subjects,
+            "industries": industries,
+            "sponsorBioguideId": bill.sponsor_bioguide_id,
+            "sponsorName": sponsor_name or bill.sponsor_full_name,
+            "sponsorSlug": sponsor_slug or None,
+            "summaryVersionCode": latest_summary.version_code if latest_summary else None,
+            "summaryActionDate": latest_summary.action_date if latest_summary else None,
+            "actionsCount": len(actions),
+            "summariesCount": len(summaries),
         },
     )
 

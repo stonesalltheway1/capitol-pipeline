@@ -7,12 +7,18 @@ from capitol_pipeline.bridges.search_documents import (
     build_alert_search_document,
     build_bill_search_document,
     build_committee_search_document,
+    build_congress_bill_context_search_document,
     build_dossier_search_document,
     build_house_ptr_search_document,
     build_house_ptr_search_document_from_stub_row,
     build_member_search_document,
     build_news_post_search_document,
     build_usaspending_company_match_search_document,
+)
+from capitol_pipeline.models.legislation import (
+    CongressBillActionRecord,
+    CongressBillRecord,
+    CongressBillSummaryRecord,
 )
 from capitol_pipeline.models.usaspending import (
     UsaspendingAwardRecord,
@@ -347,6 +353,91 @@ def test_build_alert_search_document_includes_evidence_and_tickers() -> None:
     assert document.asset_tickers == ["ORCL"]
     assert document.bill_ids == ["hr-119-390"]
     assert "Purchased ORCL two days before the vote." in document.content
+
+
+def test_build_congress_bill_context_search_document_includes_summary_and_actions() -> None:
+    bill = CongressBillRecord(
+        bill_key="119-hr-390",
+        site_bill_id="hr-119-390",
+        congress=119,
+        bill_type="hr",
+        bill_number="390",
+        title="ACERO Act",
+        origin_chamber="House",
+        policy_area="Science, Technology, Communications",
+        sponsor_bioguide_id="F000480",
+        sponsor_full_name="Rep. Fong, Vince [R-CA-20]",
+        introduced_date="2025-01-14",
+        latest_action_date="2026-02-24",
+        latest_action_text="Received in the Senate and Read twice and referred to committee.",
+        update_date="2026-02-26T07:38:15Z",
+        update_date_including_text="2026-02-26T07:48:42Z",
+        legislation_url="https://www.congress.gov/bill/119th-congress/house-bill/390",
+        summaries_count=1,
+        actions_count=2,
+        committees_count=2,
+        cosponsors_count=7,
+        subject_count=9,
+        text_version_count=4,
+        summary="This bill provides statutory authority for the ACERO project.",
+        content="This bill provides statutory authority for the ACERO project.",
+        committee_names=["Science, Space, and Technology Committee"],
+        committee_codes=["hssy00"],
+        subjects=["Science, Technology, Communications"],
+    )
+    summaries = [
+        CongressBillSummaryRecord(
+            summary_key="sum-1",
+            bill_key="119-hr-390",
+            site_bill_id="hr-119-390",
+            congress=119,
+            bill_type="hr",
+            bill_number="390",
+            version_code="00",
+            action_date="2025-01-14",
+            action_desc="Introduced in House",
+            update_date="2025-03-13T19:21:12Z",
+            text="This bill provides statutory authority for the ACERO project.",
+            source_url="https://www.congress.gov/bill/119th-congress/house-bill/390",
+        )
+    ]
+    actions = [
+        CongressBillActionRecord(
+            action_key="act-1",
+            bill_key="119-hr-390",
+            site_bill_id="hr-119-390",
+            congress=119,
+            bill_type="hr",
+            bill_number="390",
+            action_date="2026-02-24",
+            action_type="IntroReferral",
+            text="Received in the Senate and Read twice and referred to the Committee on Commerce, Science, and Transportation.",
+            committee_names=["Commerce, Science, and Transportation Committee"],
+            committee_codes=["sscm00"],
+            source_url="https://www.congress.gov/bill/119th-congress/house-bill/390",
+        )
+    ]
+    site_row = {
+        "id": "hr-119-390",
+        "sponsor_id": "m-F000480",
+        "sponsor_name": "Vince Fong",
+        "sponsor_slug": "vince-fong",
+        "subjects": ["Science, Technology, Communications"],
+        "industries": ["technology"],
+        "committees": ["House Science, Space, and Technology Committee"],
+    }
+
+    document = build_congress_bill_context_search_document(
+        bill,
+        summaries,
+        actions,
+        site_row=site_row,
+    )
+    assert document.source == "congress-gov"
+    assert document.bill_ids == ["hr-119-390"]
+    assert document.member_ids == ["m-F000480"]
+    assert document.metadata["summaryVersionCode"] == "00"
+    assert "Received in the Senate" in document.content
 
 
 def test_build_company_search_queries_cleans_noisy_asset_labels() -> None:
