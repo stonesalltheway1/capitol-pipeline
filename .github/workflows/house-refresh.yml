@@ -1,4 +1,4 @@
-name: Filings Refresh
+name: House Refresh
 
 on:
   workflow_dispatch:
@@ -6,7 +6,7 @@ on:
     - cron: "*/15 * * * *"
 
 concurrency:
-  group: filings-refresh
+  group: house-refresh
   cancel-in-progress: false
 
 jobs:
@@ -43,12 +43,6 @@ jobs:
             --with-search-index \
             --no-embeddings
 
-      - name: Run Senate ingest
-        run: |
-          python -u -m capitol_pipeline senate-ingest \
-            --with-search-index \
-            --no-embeddings
-
       - name: Embed freshest House chunks
         if: env.OPENAI_API_KEY != ''
         env:
@@ -56,16 +50,6 @@ jobs:
         run: |
           python -u -m capitol_pipeline embed-search-corpus \
             --source house-clerk \
-            --batch-size 50 \
-            --max-batches 1
-
-      - name: Embed freshest Senate chunks
-        if: env.OPENAI_API_KEY != ''
-        env:
-          CAPITOL_EMBEDDING_PROVIDER: openai
-        run: |
-          python -u -m capitol_pipeline embed-search-corpus \
-            --source senate-watcher \
             --batch-size 50 \
             --max-batches 1
 
