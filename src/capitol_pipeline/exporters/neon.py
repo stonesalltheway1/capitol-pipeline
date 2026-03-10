@@ -83,6 +83,16 @@ CRYPTO_TRADE_SCAN_REGEX = (
     "marathon digital|riot platforms|bitcoin trust|bitcoin etf|ethereum trust|ethereum etf)"
 )
 
+# House filing stub doc_ids known to 404 permanently.  These are retained here
+# as a blocklist so the pipeline never re-inserts them into the queue.
+HOUSE_STUB_BLOCKLIST: frozenset[str] = frozenset({
+    "20033889",
+    "8221321",
+    "8221322",
+    "8221326",
+    "8221332",
+})
+
 
 def ensure_neon_available() -> None:
     """Raise a clear error if the optional Neon dependency is not installed."""
@@ -848,6 +858,7 @@ def sync_house_stubs_to_neon(
 ) -> dict[str, int]:
     """Upsert House filing stubs into CapitolExposed's house_filing_stubs table."""
 
+    stubs = [s for s in stubs if s.doc_id not in HOUSE_STUB_BLOCKLIST]
     payloads = [build_house_stub_payload(stub) for stub in stubs]
     if not payloads:
         return {"upserted": 0}

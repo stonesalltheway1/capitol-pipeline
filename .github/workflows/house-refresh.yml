@@ -33,6 +33,12 @@ jobs:
           python -m pip install --upgrade pip
           python -m pip install -e ".[neon,pymupdf]"
 
+      - name: Ingest Senate trades
+        run: |
+          python -u -m capitol_pipeline senate-ingest \
+            --with-search-index \
+            --no-embeddings
+
       - name: Run House ingest
         run: |
           HOUSE_YEAR="$(date -u +%Y)"

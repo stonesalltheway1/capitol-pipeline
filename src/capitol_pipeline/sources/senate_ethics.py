@@ -8,9 +8,12 @@ augment this with official Senate Ethics disclosure ingestion.
 from __future__ import annotations
 
 import hashlib
+import warnings
+
 import httpx
 from pydantic import BaseModel
 
+from capitol_pipeline.bridges.capitol_exposed import build_canonical_senate_trade_id
 from capitol_pipeline.config import Settings
 from capitol_pipeline.models.congress import NormalizedTradeRow
 from capitol_pipeline.normalizers.crypto_assets import classify_crypto_asset
@@ -96,7 +99,22 @@ def build_senate_watcher_trade_key(
     transaction_type: str,
     raw_amount: str | None,
 ) -> str:
-    """Reproduce CapitolExposed's stable Senate watcher hash id suffix."""
+    """Reproduce CapitolExposed's stable Senate watcher hash id suffix.
+
+    .. deprecated::
+        Use :func:`capitol_pipeline.bridges.capitol_exposed.build_canonical_senate_trade_id`
+        instead.  This legacy function produces IDs that diverge from the
+        canonical trade IDs actually written to the database.  It is retained
+        only for backward-compatibility with callers that still reference it
+        and will be removed in a future release.
+    """
+
+    warnings.warn(
+        "build_senate_watcher_trade_key is deprecated; use "
+        "capitol_pipeline.bridges.capitol_exposed.build_canonical_senate_trade_id instead.",
+        DeprecationWarning,
+        stacklevel=2,
+    )
 
     payload = "|".join(
         [
@@ -140,19 +158,14 @@ def normalize_senate_watcher_trade(
     elif normalized_asset.kind == "crypto_equity":
         asset_type = "Crypto-Adjacent Equity"
 
-    source_key = build_senate_watcher_trade_key(
-        member_name=senator_name,
-        ticker=ticker,
-        transaction_date=transaction_date,
-        transaction_type=(trade.type or "").strip(),
-        raw_amount=trade.amount,
-    )
-
-    return NormalizedTradeRow(
+    # Build the row with a temporary source_id, then overwrite it with the
+    # canonical ID that the bridge actually writes to the database.  This
+    # ensures source_id and the DB trade id are always in sync.
+    row = NormalizedTradeRow(
         member=member,
         source="senate-watcher",
         disclosure_kind="senate-trade",
-        source_id=source_key,
+        source_id="",  # placeholder — set below
         source_url=(trade.ptr_link or "").strip() or None,
         ticker=ticker,
         asset_description=asset_description,
@@ -166,6 +179,8 @@ def normalize_senate_watcher_trade(
         comment=(trade.comment or "").strip() or None,
         normalized_asset=None if normalized_asset.kind == "unrelated" else normalized_asset,
     )
+    row.source_id = build_canonical_senate_trade_id(row)
+    return row
 
 
 def fetch_senate_watcher_feed(
