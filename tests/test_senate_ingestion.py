@@ -1,9 +1,8 @@
-from capitol_pipeline.bridges.capitol_exposed import build_trade_payload
+from capitol_pipeline.bridges.capitol_exposed import build_trade_id, build_trade_payload
 from capitol_pipeline.bridges.search_documents import build_senate_trade_search_document
 from capitol_pipeline.registries.members import MemberRegistry
 from capitol_pipeline.sources.senate_ethics import (
     SenateWatcherTrade,
-    build_senate_watcher_trade_key,
     normalize_senate_watcher_trade,
     parse_senate_amount_range,
 )
@@ -51,7 +50,8 @@ def test_normalize_senate_watcher_trade_resolves_member_and_crypto_asset() -> No
 
     payload = build_trade_payload(normalized)
     assert payload["source"] == "senate_watcher"
-    assert payload["id"] == f"tr-{build_senate_watcher_trade_key(member_name='Cynthia M. Lummis', ticker='BTC', transaction_date='2025-08-14', transaction_type='Purchase', raw_amount='$50,001 - $100,000')}"
+    assert payload["id"] == build_trade_id(normalized)
+    assert str(payload["id"]).startswith("tr-senate-")
 
 
 def test_build_senate_trade_search_document_captures_trade_metadata() -> None:

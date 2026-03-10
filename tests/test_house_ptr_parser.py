@@ -40,6 +40,16 @@ Filing ID #20039999
 """.strip()
 
 
+DUPLICATE_AND_INVALID_PREVIEW = """
+P T R Clerk of the House of Representatives • Legislative Resource Center • B81 Cannon Building • Washington, DC 20515
+F I Name: Hon. Example Member Status: Member State/District: TX01 T ID Owner Asset Transaction Type Date Notification Date Amount Cap. Gains > $200?
+Acme Holdings (ACME) [ST] P 02/01/2026 02/04/2026 $1,001 - $15,000
+Acme Holdings (ACME) [ST] P 02/01/2026 02/04/2026 $1,001 - $15,000
+Future Corp (FUTR) [ST] P 12/26/2026 02/05/2026 $1,001 - $15,000
+Filing ID #20038888
+""".strip()
+
+
 def build_stub(doc_id: str, name: str, state: str, filing_date: str = "2026-01-10") -> FilingStub:
     return FilingStub(
         doc_id=doc_id,
@@ -100,3 +110,15 @@ def test_parse_house_ptr_crypto_row() -> None:
     assert trades[0].normalized_asset is not None
     assert trades[0].normalized_asset.kind == "direct_crypto"
     assert trades[0].asset_type == "Cryptocurrency"
+
+
+def test_parse_house_ptr_dedupes_duplicate_rows_and_filters_invalid_dates() -> None:
+    parsed, trades = parse_house_ptr_text(
+        DUPLICATE_AND_INVALID_PREVIEW,
+        build_stub("20038888", "Example Member", "TX", filing_date="2026-02-10"),
+    )
+    assert len(parsed.transactions) == 1
+    assert parsed.transactions[0].ticker == "ACME"
+    assert parsed.transactions[0].line_number == 1
+    assert len(trades) == 1
+    assert trades[0].source_id == "20038888:1"

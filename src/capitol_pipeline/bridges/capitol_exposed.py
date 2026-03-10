@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import hashlib
+
 from capitol_pipeline.models.congress import FilingStub, NormalizedTradeRow
 
 
@@ -19,15 +21,31 @@ def normalize_trade_source_for_site(source: str) -> str:
     return SOURCE_EXPORT_MAP.get(source, source.replace("-", "_"))
 
 
+def build_canonical_senate_trade_id(row: NormalizedTradeRow) -> str:
+    payload = "|".join(
+        [
+            row.member.id,
+            (row.ticker or "").strip().upper(),
+            " ".join(row.asset_description.split()).lower(),
+            (row.transaction_type or "").strip().lower(),
+            row.transaction_date or "",
+            str(row.amount_min or 0),
+            str(row.amount_max or 0),
+            (row.owner or "self").strip().lower(),
+            (row.source_url or "").strip().lower().rstrip("/"),
+        ]
+    )
+    digest = hashlib.sha256(payload.encode("utf-8")).hexdigest()[:16]
+    return f"tr-senate-{digest}"
+
+
 def build_trade_id(row: NormalizedTradeRow) -> str:
     """Create the canonical CapitolExposed trade id for a normalized row."""
 
     if row.disclosure_kind == "house-ptr":
         return f"tr-house-{row.source_id.replace(':', '-')}"
-    if row.disclosure_kind == "senate-trade" and row.source == "senate-watcher":
-        return f"tr-{row.source_id.replace(':', '-')}"
     if row.disclosure_kind == "senate-trade":
-        return f"tr-senate-{row.source_id.replace(':', '-')}"
+        return build_canonical_senate_trade_id(row)
     return f"tr-{row.source.replace(':', '-')}-{row.source_id.replace(':', '-')}"
 
 

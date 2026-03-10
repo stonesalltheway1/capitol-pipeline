@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from datetime import date
 import re
 from pathlib import Path
 
@@ -175,6 +176,57 @@ def parse_owner(asset_prefix: str, owner_hint: str | None = None) -> str:
     return "self"
 
 
+def dedupe_transactions(
+    stub: FilingStub,
+    transactions: list[HousePtrTransaction],
+) -> list[HousePtrTransaction]:
+    seen: set[tuple[str, ...]] = set()
+    unique: list[HousePtrTransaction] = []
+    for transaction in transactions:
+        canonical_asset_key = (
+            (transaction.ticker or "").strip().upper()
+            or squeeze_spaces(transaction.asset_description).lower()
+        )
+        key = (
+            stub.doc_id,
+            (stub.source_url or "").strip().lower(),
+            canonical_asset_key,
+            transaction.transaction_type,
+            transaction.transaction_date or "",
+            transaction.notification_date or "",
+            str(transaction.amount_min),
+            str(transaction.amount_max),
+            transaction.owner,
+        )
+        if key in seen:
+            continue
+        seen.add(key)
+        unique.append(transaction)
+    return unique
+
+
+def get_transaction_date_issue(
+    transaction_date: str | None,
+    filing_date: str | None,
+) -> str | None:
+    if not transaction_date:
+        return "missing"
+    try:
+        parsed_transaction = date.fromisoformat(transaction_date)
+    except ValueError:
+        return "invalid"
+    if filing_date:
+        try:
+            parsed_filing = date.fromisoformat(filing_date)
+        except ValueError:
+            parsed_filing = None
+        if parsed_filing and parsed_transaction > parsed_filing:
+            return "after_filing"
+    if parsed_transaction > date.today():
+        return "future"
+    return None
+
+
 def parse_header_name(text: str) -> str | None:
     match = re.search(r"Name:\s+([^:]+?)\s+Status:", text, flags=re.I)
     if not match:
@@ -282,16 +334,21 @@ def parse_house_ptr_text(
     stub: FilingStub,
 ) -> tuple[HousePtrParseResult, list[NormalizedTradeRow]]:
     normalized = squeeze_spaces(normalize_text(text))
-    transactions = parse_transactions(normalized)
+    transactions = dedupe_transactions(stub, parse_transactions(normalized))
+    valid_transactions = [
+        transaction
+        for transaction in transactions
+        if get_transaction_date_issue(transaction.transaction_date, stub.filing_date) is None
+    ]
     member_name = parse_header_name(normalized) or stub.member.name
     state = parse_header_state(normalized) or stub.member.state
     parsed = HousePtrParseResult(
         doc_id=stub.doc_id,
         member_name=member_name,
         state=state,
-        parser_confidence=score_confidence(transactions, stub.member),
+        parser_confidence=score_confidence(valid_transactions, stub.member),
         raw_text_preview=normalized[:1200],
-        transactions=transactions,
+        transactions=valid_transactions,
     )
     return parsed, build_trade_rows_from_house_ptr(parsed, stub)
 
