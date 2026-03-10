@@ -3,12 +3,15 @@
 from __future__ import annotations
 
 from collections import Counter
+import csv
 from datetime import date
 import html
 import hashlib
+import io
 import re
 import time
 from typing import Any
+import zipfile
 
 import httpx
 
@@ -63,6 +66,30 @@ GENERIC_COMPANY_TOKENS = {
     "system",
 }
 
+USASPENDING_COMPANY_ALIASES_BY_TICKER: dict[str, tuple[str, ...]] = {
+    "AVGO": ("AVAGO TECHNOLOGIES", "CA, INC.", "VMWARE"),
+    "CVS": ("CVS PHARMACY", "CAREMARK", "MINUTECLINIC", "CORAM"),
+    "JNJ": ("JANSSEN", "ETHICON", "DEPUY"),
+    "JPM": ("JPMORGAN CHASE BANK", "J. P. MORGAN", "JPMORGAN"),
+    "MRK": ("MERCK SHARP", "MERCK SHARP & DOHME", "MSD"),
+    "ORCL": ("ORACLE AMERICA", "ORACLE USA", "ORACLE CORPORATION"),
+    "T": ("AT&T", "AT&T CORP", "AT&T SERVICES"),
+    "UNH": ("OPTUM", "UNITED HEALTHCARE", "OPTUMSERVE", "LEWIN GROUP"),
+    "VZ": ("VERIZON BUSINESS", "CELLCO PARTNERSHIP", "VERIZON WIRELESS"),
+}
+
+USASPENDING_COMPANY_ALIASES_BY_NAME: dict[str, tuple[str, ...]] = {
+    "AT T": ("AT&T", "AT&T CORP", "AT&T SERVICES"),
+    "BROADCOM": ("AVAGO TECHNOLOGIES", "CA, INC.", "VMWARE"),
+    "CVS HEALTH": ("CVS PHARMACY", "CAREMARK", "MINUTECLINIC", "CORAM"),
+    "JOHNSON JOHNSON": ("JANSSEN", "ETHICON", "DEPUY"),
+    "JPMORGAN CHASE": ("JPMORGAN CHASE BANK", "J. P. MORGAN", "JPMORGAN"),
+    "MERCK": ("MERCK SHARP", "MERCK SHARP & DOHME", "MSD"),
+    "ORACLE": ("ORACLE AMERICA", "ORACLE USA", "ORACLE CORPORATION"),
+    "UNITEDHEALTH": ("OPTUM", "UNITED HEALTHCARE", "OPTUMSERVE", "LEWIN GROUP"),
+    "VERIZON": ("VERIZON BUSINESS", "CELLCO PARTNERSHIP", "VERIZON WIRELESS"),
+}
+
 
 def normalize_usaspending_value(value: object) -> str | None:
     """Normalize a USAspending field into trimmed text."""
@@ -71,6 +98,32 @@ def normalize_usaspending_value(value: object) -> str | None:
         return None
     text = str(value).strip()
     return text or None
+
+
+def coerce_optional_float(value: object) -> float | None:
+    """Convert a mixed USAspending amount value into float when possible."""
+
+    if value in (None, ""):
+        return None
+    if isinstance(value, (int, float)):
+        return float(value)
+    try:
+        return float(str(value).replace(",", "").strip())
+    except (TypeError, ValueError):
+        return None
+
+
+def coerce_optional_int(value: object) -> int | None:
+    """Convert a mixed USAspending id value into int when possible."""
+
+    if value in (None, ""):
+        return None
+    if isinstance(value, int):
+        return value
+    try:
+        return int(str(value).strip())
+    except (TypeError, ValueError):
+        return None
 
 
 def normalize_company_query_name(raw_name: str | None, *, ticker: str | None = None) -> str | None:
@@ -134,6 +187,45 @@ def strip_corporate_suffixes(name: str | None) -> str | None:
     return stripped or None
 
 
+def normalize_alias_lookup_key(raw_name: str | None) -> str | None:
+    """Create a stable alias-map lookup key for one company name."""
+
+    normalized = strip_corporate_suffixes(raw_name) or normalize_usaspending_value(raw_name)
+    if not normalized:
+        return None
+    cleaned = normalize_member_lookup_value(normalized)
+    cleaned = cleaned.replace("&", " ")
+    cleaned = re.sub(r"[^a-z0-9]+", " ", cleaned)
+    cleaned = re.sub(r"\s+", " ", cleaned).strip()
+    return cleaned.upper() or None
+
+
+def expand_company_query_variants(name: str) -> list[str]:
+    """Generate a few conservative text variants for one query."""
+
+    variants = [name]
+    if "&" in name:
+        variants.append(name.replace("&", "AND"))
+        variants.append(name.replace("&", " "))
+    if "." in name:
+        variants.append(name.replace(".", " "))
+    if "," in name:
+        variants.append(name.replace(",", " "))
+
+    deduped: list[str] = []
+    seen: set[str] = set()
+    for variant in variants:
+        cleaned = re.sub(r"\s+", " ", variant).strip(" ,.-")
+        if not cleaned:
+            continue
+        lowered = cleaned.lower()
+        if lowered in seen:
+            continue
+        seen.add(lowered)
+        deduped.append(cleaned)
+    return deduped
+
+
 def build_company_search_queries(
     *,
     raw_name: str | None,
@@ -146,10 +238,16 @@ def build_company_search_queries(
     for source in (asset_description, raw_name):
         cleaned = normalize_company_query_name(source, ticker=ticker)
         if cleaned:
-            candidates.append(cleaned)
+            candidates.extend(expand_company_query_variants(cleaned))
             stripped = strip_corporate_suffixes(cleaned)
             if stripped and stripped.lower() != cleaned.lower():
-                candidates.append(stripped)
+                candidates.extend(expand_company_query_variants(stripped))
+
+    if ticker:
+        candidates.extend(USASPENDING_COMPANY_ALIASES_BY_TICKER.get(ticker.upper(), ()))
+    alias_key = normalize_alias_lookup_key(raw_name)
+    if alias_key:
+        candidates.extend(USASPENDING_COMPANY_ALIASES_BY_NAME.get(alias_key, ()))
 
     deduped: list[str] = []
     seen: set[str] = set()
@@ -208,6 +306,45 @@ def score_recipient_match(query_name: str, recipient_name: str) -> int:
     if len(overlap) == 1 and len(query_tokens) == 1:
         return 55
     return 0
+
+
+def candidate_profile_names(
+    row: dict[str, Any],
+    profile: dict[str, Any] | None = None,
+) -> list[str]:
+    """Collect usable recipient and parent names for profile-aware matching."""
+
+    names: list[str] = []
+
+    def append_name(value: object) -> None:
+        normalized = normalize_usaspending_value(value)
+        if normalized and normalized not in names:
+            names.append(normalized)
+
+    append_name(row.get("name"))
+    if profile:
+        append_name(profile.get("name"))
+        append_name(profile.get("parent_name"))
+        for value in profile.get("alternate_names") or []:
+            append_name(value)
+        for parent in profile.get("parents") or []:
+            if isinstance(parent, dict):
+                append_name(parent.get("parent_name"))
+    return names
+
+
+def score_recipient_profile_match(
+    *,
+    query_name: str,
+    row: dict[str, Any],
+    profile: dict[str, Any] | None = None,
+) -> int:
+    """Score one recipient against its own name plus parent and alternate names."""
+
+    return max(
+        (score_recipient_match(query_name, candidate) for candidate in candidate_profile_names(row, profile)),
+        default=0,
+    )
 
 
 def select_recipient_matches(
@@ -379,75 +516,148 @@ def search_awards_for_recipient_name(
     limit: int = 10,
     client: UsaspendingApiClient | None = None,
 ) -> list[dict[str, Any]]:
-    """Fetch top award rows for a given recipient name."""
+    """Fetch top prime-award rows for a given recipient using the official download flow."""
 
     api_client = client or UsaspendingApiClient(settings)
-    payload_template = {
-        "fields": [
-            "Award ID",
-            "Recipient Name",
-            "Action Date",
-            "Award Amount",
-            "Awarding Agency",
-            "Award Type",
-            "Description",
-            "generated_internal_id",
-            "internal_id",
-            "awarding_agency_id",
-            "agency_slug",
-        ],
+    payload = {
         "filters": {
             "recipient_search_text": [recipient_name],
             "time_period": build_usaspending_time_period(
                 start_date=start_date,
                 end_date=end_date,
             ),
+            "award_type_codes": [
+                *DEFAULT_USASPENDING_CONTRACT_AWARD_TYPE_CODES,
+                *DEFAULT_USASPENDING_IDV_AWARD_TYPE_CODES,
+            ],
         },
-        "page": 1,
-        "limit": max(1, limit),
-        "sort": "Award Amount",
-        "order": "desc",
+        "file_format": "csv",
     }
-    results: list[dict[str, Any]] = []
-    for award_type_codes in (
-        DEFAULT_USASPENDING_CONTRACT_AWARD_TYPE_CODES,
-        DEFAULT_USASPENDING_IDV_AWARD_TYPE_CODES,
-    ):
-        payload = {
-            **payload_template,
-            "filters": {
-                **payload_template["filters"],
-                "award_type_codes": award_type_codes,
-            },
-        }
-        response = api_client.post_json("search/spending_by_award/", payload)
-        group_results = response.get("results")
-        if isinstance(group_results, list):
-            results.extend(row for row in group_results if isinstance(row, dict))
+    response = api_client.post_json("download/awards/", payload)
+    status_url = str(response.get("status_url") or "").replace(
+        "https://api.usaspending.gov/api/v2/",
+        "",
+    )
+    if not status_url:
+        return []
+
+    status_body: dict[str, Any] = {}
+    for _attempt in range(24):
+        status_body = api_client.get_json(status_url)
+        status = str(status_body.get("status") or "").lower()
+        if status == "finished":
+            break
+        if status == "failed":
+            raise RuntimeError(str(status_body.get("message") or "USAspending award download failed"))
+        time.sleep(5)
+
+    if str(status_body.get("status") or "").lower() != "finished":
+        raise RuntimeError(f"USAspending award download did not finish for {recipient_name}")
+
+    file_url = normalize_usaspending_value(status_body.get("file_url"))
+    if not file_url:
+        return []
+
+    download_response: httpx.Response | None = None
+    last_download_error: Exception | None = None
+    for attempt in range(1, 5):
+        try:
+            with httpx.Client(
+                timeout=180.0,
+                follow_redirects=True,
+                headers={"User-Agent": settings.user_agent},
+            ) as download_client:
+                download_response = download_client.get(file_url)
+                download_response.raise_for_status()
+                break
+        except httpx.HTTPError as error:
+            last_download_error = error
+            if attempt >= 4:
+                raise
+            time.sleep(min(10, attempt * 2))
+
+    if download_response is None:
+        if last_download_error:
+            raise last_download_error
+        return []
+
     normalized_name = normalize_member_lookup_value(recipient_name)
-    filtered = [
-        row
-        for row in results
-        if isinstance(row, dict)
-        and normalize_member_lookup_value(str(row.get("Recipient Name") or "")) == normalized_name
-    ]
+    results: list[dict[str, Any]] = []
+    with zipfile.ZipFile(io.BytesIO(download_response.content)) as archive:
+        prime_files = [
+            name
+            for name in archive.namelist()
+            if "PrimeAwardSummaries" in name and "Subawards" not in name
+        ]
+        seen_award_keys: set[str] = set()
+        for file_name in prime_files:
+            with archive.open(file_name) as handle:
+                reader = csv.DictReader(io.TextIOWrapper(handle, encoding="utf-8-sig"))
+                for row in reader:
+                    csv_recipient_name = normalize_usaspending_value(row.get("recipient_name"))
+                    if not csv_recipient_name:
+                        continue
+                    if normalize_member_lookup_value(csv_recipient_name) != normalized_name:
+                        continue
+
+                    award_key = (
+                        normalize_usaspending_value(row.get("contract_award_unique_key"))
+                        or normalize_usaspending_value(row.get("award_id_piid"))
+                        or normalize_usaspending_value(row.get("award_id_fain"))
+                        or ""
+                    )
+                    if not award_key or award_key in seen_award_keys:
+                        continue
+                    seen_award_keys.add(award_key)
+
+                    amount_value = None
+                    for candidate in (
+                        row.get("current_total_value_of_award"),
+                        row.get("total_obligated_amount"),
+                    ):
+                        try:
+                            if candidate not in (None, ""):
+                                amount_value = float(candidate)
+                                break
+                        except (TypeError, ValueError):
+                            continue
+
+                    results.append(
+                        {
+                            "Award ID": normalize_usaspending_value(row.get("award_id_piid"))
+                            or normalize_usaspending_value(row.get("award_id_fain"))
+                            or award_key,
+                            "Recipient Name": csv_recipient_name,
+                            "Action Date": normalize_usaspending_value(row.get("award_latest_action_date"))
+                            or normalize_usaspending_value(row.get("award_base_action_date")),
+                            "Award Amount": amount_value,
+                            "Awarding Agency": normalize_usaspending_value(row.get("awarding_agency_name")),
+                            "Award Type": normalize_usaspending_value(row.get("award_type")),
+                            "Description": normalize_usaspending_value(
+                                row.get("prime_award_base_transaction_description")
+                            ),
+                            "generated_internal_id": award_key,
+                            "internal_id": None,
+                            "awarding_agency_id": normalize_usaspending_value(
+                                row.get("awarding_agency_code")
+                            ),
+                            "agency_slug": None,
+                            "recipient_parent_name": normalize_usaspending_value(
+                                row.get("recipient_parent_name")
+                            ),
+                            "recipient_uei": normalize_usaspending_value(row.get("recipient_uei")),
+                            "recipient_duns": normalize_usaspending_value(row.get("recipient_duns")),
+                            "award_type_code": normalize_usaspending_value(row.get("award_type_code")),
+                            "contract_award_unique_key": award_key,
+                        }
+                    )
+
     deduped: list[dict[str, Any]] = []
-    seen_award_keys: set[str] = set()
     for row in sorted(
-        filtered,
+        results,
         key=lambda item: float(item.get("Award Amount") or 0),
         reverse=True,
     ):
-        award_key = "|".join(
-            [
-                str(row.get("Award ID") or ""),
-                str(row.get("generated_internal_id") or ""),
-                str(row.get("internal_id") or ""),
-            ]
-        )
-        if award_key in seen_award_keys:
-            continue
-        seen_award_keys.add(award_key)
         deduped.append(row)
         if len(deduped) >= max(1, limit):
             break
@@ -668,8 +878,26 @@ def build_usaspending_award_records(
     records: list[UsaspendingAwardRecord] = []
     for row in awards:
         award_id = normalize_usaspending_value(row.get("Award ID")) or ""
-        generated_internal_id = normalize_usaspending_value(row.get("generated_internal_id"))
+        generated_internal_id = (
+            normalize_usaspending_value(row.get("generated_internal_id"))
+            or normalize_usaspending_value(row.get("contract_award_unique_key"))
+        )
         internal_id = row.get("internal_id")
+        award_amount = coerce_optional_float(row.get("Award Amount"))
+        awarding_agency_id = coerce_optional_int(row.get("awarding_agency_id"))
+        action_date = (
+            normalize_usaspending_value(row.get("Action Date"))
+            or normalize_usaspending_value(row.get("award_latest_action_date"))
+            or normalize_usaspending_value(row.get("award_base_action_date"))
+        )
+        award_type = (
+            normalize_usaspending_value(row.get("Award Type"))
+            or normalize_usaspending_value(row.get("award_type_code"))
+        )
+        description = (
+            normalize_usaspending_value(row.get("Description"))
+            or normalize_usaspending_value(row.get("prime_award_base_transaction_description"))
+        )
         stable_key = hashlib.sha1(
             "|".join(
                 [
@@ -687,15 +915,15 @@ def build_usaspending_award_records(
                 canonical_recipient_id=match.canonical_recipient_id,
                 recipient_name=match.recipient_name,
                 award_id=award_id or f"award-{stable_key[:12]}",
-                internal_id=int(internal_id) if isinstance(internal_id, int) else None,
+                internal_id=coerce_optional_int(internal_id),
                 generated_internal_id=generated_internal_id,
-                action_date=normalize_usaspending_value(row.get("Action Date")),
-                award_amount=float(row.get("Award Amount")) if isinstance(row.get("Award Amount"), (int, float)) else None,
-                award_type=normalize_usaspending_value(row.get("Award Type")),
+                action_date=action_date,
+                award_amount=award_amount,
+                award_type=award_type,
                 awarding_agency=normalize_usaspending_value(row.get("Awarding Agency")),
-                awarding_agency_id=int(row.get("awarding_agency_id")) if isinstance(row.get("awarding_agency_id"), int) else None,
+                awarding_agency_id=awarding_agency_id,
                 agency_slug=normalize_usaspending_value(row.get("agency_slug")),
-                description=normalize_usaspending_value(row.get("Description")),
+                description=description,
                 source_url=match.source_url,
                 metadata={key: value for key, value in row.items() if value not in (None, "")},
             )

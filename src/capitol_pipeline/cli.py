@@ -116,12 +116,14 @@ from capitol_pipeline.sources.usaspending import (
     DEFAULT_USASPENDING_START_DATE,
     UsaspendingApiClient,
     build_company_search_queries,
+    build_usaspending_award_records,
     build_usaspending_company_match_record,
     build_usaspending_recipient_record,
     fetch_recipient_profile,
+    search_awards_for_recipient_name,
     search_awarding_agencies_for_recipient_name,
     search_recipient_summaries,
-    select_recipient_matches,
+    score_recipient_profile_match,
 )
 
 
@@ -898,76 +900,136 @@ def ingest_usaspending_command(
             continue
 
         try:
-            recipient_records_by_id: dict[str, UsaspendingRecipientRecord] = {}
-            recipient_query_map: dict[str, str] = {}
+            recipient_candidates_by_id: dict[str, dict[str, object]] = {}
             attempted_queries: list[str] = []
+            query_errors: list[dict[str, str]] = []
 
             for query_name in queries[:4]:
                 attempted_queries.append(query_name)
-                recipient_rows = search_recipient_summaries(
-                    settings,
-                    query_name=query_name,
-                    start_date=start_date,
-                    end_date=end_date,
-                    limit=recipient_limit,
-                    client=api_client,
-                )
-                strong_rows = select_recipient_matches(
-                    query_name=query_name,
-                    rows=recipient_rows,
-                    limit=match_limit,
-                )
-                for recipient_row in strong_rows:
-                    recipient_record = build_usaspending_recipient_record(
-                        recipient_row,
-                        query_name=query_name,
-                    )
-                    profile = fetch_recipient_profile(
+                try:
+                    recipient_rows = search_recipient_summaries(
                         settings,
-                        recipient_id=recipient_record.recipient_id,
+                        query_name=query_name,
+                        start_date=start_date,
+                        end_date=end_date,
+                        limit=recipient_limit,
                         client=api_client,
                     )
-                    if profile:
-                        merged_metadata = {
-                            **recipient_record.metadata,
-                            "recipientProfile": profile,
-                            "totalTransactions": profile.get("total_transactions"),
-                            "parentName": profile.get("parent_name"),
-                            "recipientState": ((profile.get("location") or {}) if isinstance(profile.get("location"), dict) else {}).get("state_code"),
-                        }
-                        recipient_record = recipient_record.model_copy(
-                            update={
-                                "uei": str(profile.get("uei") or recipient_record.uei or "").strip() or recipient_record.uei,
-                                "recipient_code": str(profile.get("duns") or recipient_record.recipient_code or "").strip() or recipient_record.recipient_code,
-                                "total_amount": (
-                                    float(profile.get("total_transaction_amount"))
-                                    if isinstance(profile.get("total_transaction_amount"), (int, float))
-                                    else recipient_record.total_amount
-                                ),
-                                "metadata": merged_metadata,
-                            }
+                    for recipient_row in recipient_rows:
+                        recipient_id = str(recipient_row.get("recipient_id") or "").strip()
+                        if not recipient_id:
+                            continue
+                        recipient_record = build_usaspending_recipient_record(
+                            recipient_row,
+                            query_name=query_name,
                         )
-                    existing = recipient_records_by_id.get(recipient_record.recipient_id)
-                    if existing is None or (recipient_record.total_amount or 0) > (existing.total_amount or 0):
-                        recipient_records_by_id[recipient_record.recipient_id] = recipient_record
-                        recipient_query_map[recipient_record.recipient_id] = query_name
+                        profile = fetch_recipient_profile(
+                            settings,
+                            recipient_id=recipient_record.recipient_id,
+                            client=api_client,
+                        )
+                        match_score = score_recipient_profile_match(
+                            query_name=query_name,
+                            row=recipient_row,
+                            profile=profile,
+                        )
+                        if match_score < 55:
+                            continue
+                        if profile:
+                            merged_metadata = {
+                                **recipient_record.metadata,
+                                "recipientProfile": profile,
+                                "totalTransactions": profile.get("total_transactions"),
+                                "parentName": profile.get("parent_name"),
+                                "recipientState": ((profile.get("location") or {}) if isinstance(profile.get("location"), dict) else {}).get("state_code"),
+                            }
+                            recipient_record = recipient_record.model_copy(
+                                update={
+                                    "uei": str(profile.get("uei") or recipient_record.uei or "").strip() or recipient_record.uei,
+                                    "recipient_code": str(profile.get("duns") or recipient_record.recipient_code or "").strip() or recipient_record.recipient_code,
+                                    "total_amount": (
+                                        float(profile.get("total_transaction_amount"))
+                                        if isinstance(profile.get("total_transaction_amount"), (int, float))
+                                        else recipient_record.total_amount
+                                    ),
+                                    "metadata": merged_metadata,
+                                }
+                            )
+                        candidate = {
+                            "record": recipient_record,
+                            "queryName": query_name,
+                            "score": match_score,
+                            "profile": profile,
+                        }
+                        existing = recipient_candidates_by_id.get(recipient_record.recipient_id)
+                        if existing is None:
+                            recipient_candidates_by_id[recipient_record.recipient_id] = candidate
+                            continue
+                        existing_record = existing["record"]
+                        existing_score = int(existing.get("score") or 0)
+                        existing_amount = (
+                            existing_record.total_amount
+                            if isinstance(existing_record, UsaspendingRecipientRecord)
+                            else 0
+                        ) or 0
+                        current_amount = recipient_record.total_amount or 0
+                        if match_score > existing_score or (
+                            match_score == existing_score and current_amount > existing_amount
+                        ):
+                            recipient_candidates_by_id[recipient_record.recipient_id] = candidate
+                except Exception as error:
+                    query_errors.append(
+                        {
+                            "queryName": query_name,
+                            "error": str(error)[:240],
+                        }
+                    )
+                    continue
 
-            recipient_records = sorted(
-                recipient_records_by_id.values(),
-                key=lambda record: (-(record.total_amount or 0), record.name),
+            recipient_candidates = sorted(
+                recipient_candidates_by_id.values(),
+                key=lambda item: (
+                    -int(item.get("score") or 0),
+                    -(
+                        (
+                            item["record"].total_amount
+                            if isinstance(item.get("record"), UsaspendingRecipientRecord)
+                            else 0
+                        )
+                        or 0
+                    ),
+                    (
+                        item["record"].name
+                        if isinstance(item.get("record"), UsaspendingRecipientRecord)
+                        else ""
+                    ),
+                ),
             )[: max(1, match_limit)]
+            recipient_records = [
+                item["record"]
+                for item in recipient_candidates
+                if isinstance(item.get("record"), UsaspendingRecipientRecord)
+            ]
+            recipient_query_map = {
+                item["record"].recipient_id: str(item.get("queryName") or item["record"].query_name)
+                for item in recipient_candidates
+                if isinstance(item.get("record"), UsaspendingRecipientRecord)
+            }
 
             if not recipient_records:
+                failure_status = "error" if query_errors else "no_match"
                 upsert_usaspending_company_sync(
                     settings,
                     company_id=company_id,
                     ticker=ticker,
                     company_name=company_name,
                     query_name=queries[0],
-                    status="no_match",
+                    status=failure_status,
                     result_count=0,
+                    last_error=query_errors[0]["error"] if query_errors else None,
                     metadata={
                         "attemptedQueries": attempted_queries,
+                        "queryErrors": query_errors,
                         "sampleAssetDescription": sample_asset_description,
                     },
                 )
@@ -975,8 +1037,9 @@ def ingest_usaspending_command(
                     {
                         "companyId": company_id,
                         "ticker": ticker,
-                        "status": "no_match",
+                        "status": failure_status,
                         "attemptedQueries": attempted_queries,
+                        "queryErrors": query_errors,
                     }
                 )
                 continue
@@ -990,26 +1053,53 @@ def ingest_usaspending_command(
 
             company_match_records: list[UsaspendingCompanyMatchRecord] = []
             award_records: list[UsaspendingAwardRecord] = []
+            recipient_errors: list[dict[str, str]] = []
 
             for recipient_record in recipient_records:
-                agency_rows = search_awarding_agencies_for_recipient_name(
-                    settings,
-                    recipient_name=recipient_record.name,
-                    start_date=start_date,
-                    end_date=end_date,
-                    limit=max(5, award_limit),
-                    client=api_client,
-                )
+                award_rows: list[dict[str, object]] = []
+                agency_rows: list[dict[str, object]] = []
+                try:
+                    award_rows = search_awards_for_recipient_name(
+                        settings,
+                        recipient_name=recipient_record.name,
+                        start_date=start_date,
+                        end_date=end_date,
+                        limit=max(3, award_limit),
+                        client=api_client,
+                    )
+                    if len(award_rows) < 3:
+                        agency_rows = search_awarding_agencies_for_recipient_name(
+                            settings,
+                            recipient_name=recipient_record.name,
+                            start_date=start_date,
+                            end_date=end_date,
+                            limit=max(5, award_limit),
+                            client=api_client,
+                        )
+                except Exception as error:
+                    recipient_errors.append(
+                        {
+                            "recipientId": recipient_record.recipient_id,
+                            "recipientName": recipient_record.name,
+                            "error": str(error)[:240],
+                        }
+                    )
                 match_record = build_usaspending_company_match_record(
                     company_id=company_id,
                     company_name=company_name,
                     ticker=ticker,
                     query_name=recipient_query_map.get(recipient_record.recipient_id, recipient_record.query_name),
                     recipient=recipient_record,
-                    awards=[],
+                    awards=award_rows,
                     agencies=agency_rows,
                 )
                 company_match_records.append(match_record)
+                award_records.extend(
+                    build_usaspending_award_records(
+                        match=match_record,
+                        awards=award_rows,
+                    )
+                )
 
             company_match_summary = upsert_usaspending_company_matches(
                 settings,
@@ -1056,7 +1146,10 @@ def ingest_usaspending_command(
                 result_count=len(company_match_records),
                 metadata={
                     "attemptedQueries": attempted_queries,
+                    "queryErrors": query_errors,
                     "recipientIds": [record.recipient_id for record in recipient_records],
+                    "awardCount": len(award_records),
+                    "recipientErrors": recipient_errors,
                     "sampleAssetDescription": sample_asset_description,
                 },
             )
