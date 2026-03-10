@@ -85,13 +85,8 @@ CRYPTO_TRADE_SCAN_REGEX = (
 
 # House filing stub doc_ids known to 404 permanently.  These are retained here
 # as a blocklist so the pipeline never re-inserts them into the queue.
-HOUSE_STUB_BLOCKLIST: frozenset[str] = frozenset({
-    "20033889",
-    "8221321",
-    "8221322",
-    "8221326",
-    "8221332",
-})
+# Add confirmed dead doc_ids here as they are identified.
+HOUSE_STUB_BLOCKLIST: frozenset[str] = frozenset()
 
 
 def ensure_neon_available() -> None:
