@@ -127,7 +127,9 @@ from capitol_pipeline.sources.fara import (
 from capitol_pipeline.sources.icij_offshore_leaks import iter_offshore_nodes, iter_offshore_relationships
 from capitol_pipeline.sources.senate_ethics import (
     fetch_quiver_bulk_congress_feed,
+    fetch_quiver_live_senate_feed,
     fetch_senate_watcher_feed,
+    normalize_quiver_live_senate_trade,
     normalize_quiver_senate_trade,
     normalize_senate_date,
     normalize_senate_watcher_trade,
@@ -755,7 +757,7 @@ def senate_feed(limit: int, provider: str) -> None:
 @click.option("--with-embeddings/--no-embeddings", default=False, show_default=True)
 @click.option(
     "--provider",
-    type=click.Choice(["auto", "quiver", "watcher"]),
+    type=click.Choice(["auto", "quiver", "quiver-live", "quiver-bulk", "watcher"]),
     default="auto",
     show_default=True,
 )
@@ -783,15 +785,19 @@ def senate_ingest_command(
     if not registry:
         raise click.ClickException("Member registry is required for Senate ingest.")
 
-    feed_provider = "quiver" if provider == "auto" and settings.resolved_quiver_api_token else provider
+    feed_provider = (
+        "quiver-live" if provider == "auto" and settings.resolved_quiver_api_token else provider
+    )
     if feed_provider == "auto":
         feed_provider = "watcher"
+    if feed_provider == "quiver":
+        feed_provider = "quiver-live"
 
     existing_trade_ids = fetch_existing_trade_ids(
         settings,
         sources=(
             ["senate_quiver", "senate-quiver"]
-            if feed_provider == "quiver"
+            if feed_provider in {"quiver-live", "quiver-bulk"}
             else ["senate_watcher", "senate-watcher"]
         ),
     )
@@ -833,7 +839,7 @@ def senate_ingest_command(
             search_documents.append(build_senate_trade_search_document(normalized))
         return limit > 0 and len(normalized_rows) >= limit
 
-    if feed_provider == "quiver":
+    if feed_provider == "quiver-bulk":
         page = 1
         while True:
             page_rows = fetch_quiver_bulk_congress_feed(
@@ -855,6 +861,19 @@ def senate_ingest_command(
                 break
             page += 1
             time.sleep(0.35)
+    elif feed_provider == "quiver-live":
+        feed_rows = sorted(
+            fetch_quiver_live_senate_feed(settings),
+            key=lambda row: normalize_senate_date(row.disclosure_date) or "",
+            reverse=True,
+        )
+        summary["fetched"] = len(feed_rows)
+        for feed_row in feed_rows:
+            stop = handle_normalized_row(
+                normalize_quiver_live_senate_trade(feed_row, registry),
+            )
+            if stop:
+                break
     else:
         feed_rows = sorted(
             fetch_senate_watcher_feed(settings),

@@ -1,20 +1,21 @@
-name: House Refresh
+name: Senate Refresh
 
 on:
   workflow_dispatch:
   schedule:
-    - cron: "*/15 * * * *"
+    - cron: "*/30 * * * *"
 
 concurrency:
-  group: house-refresh
+  group: senate-refresh
   cancel-in-progress: false
 
 jobs:
   ingest:
     runs-on: ubuntu-latest
-    timeout-minutes: 25
+    timeout-minutes: 20
     env:
       DATABASE_URL: ${{ secrets.DATABASE_URL }}
+      QUIVER_API_TOKEN: ${{ secrets.QUIVER_API_TOKEN }}
       OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
       CAPITOL_EMBEDDING_PROVIDER: none
       CAPITOL_OPENAI_EMBEDDING_DIMENSIONS: "768"
@@ -33,23 +34,21 @@ jobs:
           python -m pip install --upgrade pip
           python -m pip install -e ".[neon,pymupdf]"
 
-      - name: Run House ingest
+      - name: Ingest Senate trades
+        if: env.QUIVER_API_TOKEN != ''
         run: |
-          HOUSE_YEAR="$(date -u +%Y)"
-          python -u -m capitol_pipeline house-ingest \
-            --year "$HOUSE_YEAR" \
-            --batch-size 25 \
-            --max-batches 6 \
+          python -u -m capitol_pipeline senate-ingest \
+            --provider quiver-live \
             --with-search-index \
             --no-embeddings
 
-      - name: Embed freshest House chunks
+      - name: Embed freshest Senate chunks
         if: env.OPENAI_API_KEY != ''
         env:
           CAPITOL_EMBEDDING_PROVIDER: openai
         run: |
           python -u -m capitol_pipeline embed-search-corpus \
-            --source house-clerk \
+            --source senate-quiver \
             --batch-size 50 \
             --max-batches 1
 

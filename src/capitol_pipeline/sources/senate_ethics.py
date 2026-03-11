@@ -16,6 +16,8 @@ from capitol_pipeline.normalizers.crypto_assets import classify_crypto_asset
 from capitol_pipeline.registries.members import MemberRegistry
 
 QUIVER_BULK_PAGE_SIZE = 1000
+QUIVER_MAX_ATTEMPTS = 6
+QUIVER_BASE_DELAY_SECONDS = 3.0
 
 
 class SenateWatcherTrade(BaseModel):
@@ -55,6 +57,18 @@ class QuiverCongressTrade(BaseModel):
     state: str | None = Field(default=None, alias="State")
     quiver_upload_time: str | None = Field(default=None, alias="Quiver_Upload_Time")
     last_modified: str | None = Field(default=None, alias="last_modified")
+
+
+class QuiverLiveSenateTrade(BaseModel):
+    senator: str | None = Field(default=None, alias="Senator")
+    bioguide_id: str | None = Field(default=None, alias="BioGuideID")
+    transaction_date: str | None = Field(default=None, alias="Date")
+    ticker: str | None = Field(default=None, alias="Ticker")
+    transaction: str | None = Field(default=None, alias="Transaction")
+    trade_size_usd: str | None = Field(default=None, alias="Range")
+    amount: str | None = Field(default=None, alias="Amount")
+    disclosure_date: str | None = Field(default=None, alias="last_modified")
+    ticker_type: str | None = Field(default=None, alias="TickerType")
 
 
 def normalize_senate_date(raw: str | None) -> str | None:
@@ -178,6 +192,53 @@ def _build_quiver_comment(trade: QuiverCongressTrade) -> str | None:
     return " | ".join(values) if values else None
 
 
+def _build_quiver_client(
+    settings: Settings,
+    *,
+    timeout_seconds: float,
+) -> httpx.Client:
+    token = settings.resolved_quiver_api_token
+    if not token:
+        raise RuntimeError("QUIVER_API_TOKEN is required for Quiver Senate ingestion.")
+    return httpx.Client(
+        headers={
+            "User-Agent": settings.user_agent,
+            "Authorization": f"Bearer {token}",
+            "Accept": "application/json",
+        },
+        follow_redirects=True,
+        timeout=timeout_seconds,
+    )
+
+
+def _request_quiver_payload(
+    client: httpx.Client,
+    url: str,
+    *,
+    params: dict[str, str],
+) -> list[dict[str, object]]:
+    for attempt in range(QUIVER_MAX_ATTEMPTS):
+        response = client.get(url, params=params)
+        if response.status_code != 429 and response.status_code < 500:
+            response.raise_for_status()
+            payload = response.json()
+            if not isinstance(payload, list):
+                raise RuntimeError(f"Unexpected Quiver response type: {type(payload).__name__}")
+            return payload
+
+        retry_after = response.headers.get("retry-after")
+        delay_seconds = (
+            float(retry_after)
+            if retry_after and retry_after.isdigit()
+            else QUIVER_BASE_DELAY_SECONDS * (attempt + 1)
+        )
+        if attempt >= QUIVER_MAX_ATTEMPTS - 1:
+            response.raise_for_status()
+        time.sleep(delay_seconds)
+
+    return []
+
+
 def normalize_senate_watcher_trade(
     trade: SenateWatcherTrade,
     registry: MemberRegistry,
@@ -282,6 +343,29 @@ def normalize_quiver_senate_trade(
     return row
 
 
+def normalize_quiver_live_senate_trade(
+    trade: QuiverLiveSenateTrade,
+    registry: MemberRegistry,
+) -> NormalizedTradeRow | None:
+    """Normalize Quiver's live Senate feed into the shared trade row shape."""
+
+    return normalize_quiver_senate_trade(
+        QuiverCongressTrade(
+            Name=trade.senator,
+            BioGuideID=trade.bioguide_id,
+            Filed=trade.disclosure_date,
+            Traded=trade.transaction_date,
+            Ticker=trade.ticker,
+            Transaction=trade.transaction,
+            Trade_Size_USD=trade.trade_size_usd,
+            Amount=trade.amount,
+            House="Senate",
+            TickerType=trade.ticker_type or "Stock",
+        ),
+        registry,
+    )
+
+
 def fetch_senate_watcher_feed(
     settings: Settings | None = None,
     timeout_seconds: float = 20.0,
@@ -311,10 +395,6 @@ def fetch_quiver_bulk_congress_feed(
     """Fetch one page from Quiver's bulk Congress trading feed."""
 
     settings = settings or Settings()
-    token = settings.resolved_quiver_api_token
-    if not token:
-        raise RuntimeError("QUIVER_API_TOKEN is required for Quiver Senate ingestion.")
-
     params = {
         "normalized": "true",
         "version": "V2",
@@ -324,29 +404,32 @@ def fetch_quiver_bulk_congress_feed(
     if date:
         params["date"] = normalize_senate_date(date).replace("-", "") if normalize_senate_date(date) else date
 
-    with httpx.Client(
-        headers={
-            "User-Agent": settings.user_agent,
-            "Authorization": f"Bearer {token}",
-            "Accept": "application/json",
-        },
-        follow_redirects=True,
-        timeout=timeout_seconds,
-    ) as client:
-        for attempt in range(4):
-            response = client.get(
-                "https://api.quiverquant.com/beta/bulk/congresstrading",
-                params=params,
-            )
-            if response.status_code != 429 and response.status_code < 500:
-                response.raise_for_status()
-                payload = response.json()
-                return [QuiverCongressTrade.model_validate(row) for row in payload]
+    with _build_quiver_client(settings, timeout_seconds=timeout_seconds) as client:
+        payload = _request_quiver_payload(
+            client,
+            "https://api.quiverquant.com/beta/bulk/congresstrading",
+            params=params,
+        )
+        return [QuiverCongressTrade.model_validate(row) for row in payload]
 
-            retry_after = response.headers.get("retry-after")
-            delay_seconds = float(retry_after) if retry_after and retry_after.isdigit() else 2.0 + attempt
-            if attempt >= 3:
-                response.raise_for_status()
-            time.sleep(delay_seconds)
+    return []
+
+
+def fetch_quiver_live_senate_feed(
+    settings: Settings | None = None,
+    *,
+    timeout_seconds: float = 60.0,
+) -> list[QuiverLiveSenateTrade]:
+    """Fetch Quiver's live Senate trading feed for scheduled refreshes."""
+
+    settings = settings or Settings()
+    params = {"options": "false"}
+    with _build_quiver_client(settings, timeout_seconds=timeout_seconds) as client:
+        payload = _request_quiver_payload(
+            client,
+            "https://api.quiverquant.com/beta/live/senatetrading",
+            params=params,
+        )
+        return [QuiverLiveSenateTrade.model_validate(row) for row in payload]
 
     return []

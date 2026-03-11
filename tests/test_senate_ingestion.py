@@ -3,6 +3,8 @@ from capitol_pipeline.bridges.search_documents import build_senate_trade_search_
 from capitol_pipeline.registries.members import MemberRegistry
 from capitol_pipeline.sources.senate_ethics import (
     QuiverCongressTrade,
+    QuiverLiveSenateTrade,
+    normalize_quiver_live_senate_trade,
     normalize_quiver_senate_trade,
     SenateWatcherTrade,
     normalize_senate_watcher_trade,
@@ -125,3 +127,41 @@ def test_normalize_quiver_senate_trade_prefers_bioguide_resolution() -> None:
     assert normalized.transaction_type == "sale"
     payload = build_trade_payload(normalized)
     assert payload["source"] == "senate_quiver"
+
+
+def test_normalize_quiver_live_senate_trade_maps_live_payload_fields() -> None:
+    registry = MemberRegistry.from_rows(
+        [
+            {
+                "id": "m-M001190",
+                "bioguide_id": "M001190",
+                "name": "Markwayne Mullin",
+                "slug": "markwayne-mullin",
+                "party": "R",
+                "state": "OK",
+            }
+        ]
+    )
+
+    normalized = normalize_quiver_live_senate_trade(
+        QuiverLiveSenateTrade(
+            Senator="Markwayne Mullin",
+            BioGuideID="M001190",
+            Date="2026-02-25",
+            Ticker="UNH",
+            Transaction="Purchase",
+            Range="$50,001 - $100,000",
+            Amount="50001.0",
+            last_modified="2026-03-10",
+            TickerType="Stock",
+        ),
+        registry,
+    )
+
+    assert normalized is not None
+    assert normalized.member.id == "m-M001190"
+    assert normalized.transaction_date == "2026-02-25"
+    assert normalized.disclosure_date == "2026-03-10"
+    assert normalized.amount_min == 50001
+    assert normalized.amount_max == 100000
+    assert normalized.source == "senate-quiver"
