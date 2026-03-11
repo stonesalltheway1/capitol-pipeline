@@ -2,6 +2,8 @@ from capitol_pipeline.bridges.capitol_exposed import build_trade_id, build_trade
 from capitol_pipeline.bridges.search_documents import build_senate_trade_search_document
 from capitol_pipeline.registries.members import MemberRegistry
 from capitol_pipeline.sources.senate_ethics import (
+    QuiverCongressTrade,
+    normalize_quiver_senate_trade,
     SenateWatcherTrade,
     normalize_senate_watcher_trade,
     parse_senate_amount_range,
@@ -82,7 +84,44 @@ def test_build_senate_trade_search_document_captures_trade_metadata() -> None:
     assert normalized is not None
     document = build_senate_trade_search_document(normalized)
     assert document.source_document_id == f"senate-trade-{normalized.source_id}"
-    assert document.source == "senate-watcher"
+    assert document.source == normalized.source
     assert document.asset_tickers == ["IBIT"]
     assert document.metadata["cryptoKind"] == "crypto_etf"
     assert "Amount range: $1,001 to $15,000" in document.content
+
+
+def test_normalize_quiver_senate_trade_prefers_bioguide_resolution() -> None:
+    registry = MemberRegistry.from_rows(
+        [
+            {
+                "id": "m-B001236",
+                "bioguide_id": "B001236",
+                "name": "John Boozman",
+                "slug": "john-boozman",
+                "party": "R",
+                "state": "AR",
+            }
+        ]
+    )
+    normalized = normalize_quiver_senate_trade(
+        QuiverCongressTrade(
+            Name="John Boozman",
+            BioGuideID="B001236",
+            Filed="2026-03-06",
+            Traded="2026-02-27",
+            Ticker="AMAT",
+            Transaction="Sale (Partial)",
+            Trade_Size_USD="$1,001 - $15,000",
+            Chamber="Senate",
+            Company="Applied Materials, Inc. - Common Stock",
+        ),
+        registry,
+    )
+
+    assert normalized is not None
+    assert normalized.member.id == "m-B001236"
+    assert normalized.source == "senate-quiver"
+    assert normalized.disclosure_date == "2026-03-06"
+    assert normalized.transaction_type == "sale"
+    payload = build_trade_payload(normalized)
+    assert payload["source"] == "senate_quiver"

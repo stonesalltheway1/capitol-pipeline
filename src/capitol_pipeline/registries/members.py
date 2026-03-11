@@ -133,6 +133,7 @@ class MemberRegistry:
 
     records: list[MemberMatch]
     key_index: dict[str, list[MemberMatch]] = field(default_factory=dict)
+    bioguide_index: dict[str, MemberMatch] = field(default_factory=dict)
 
     @classmethod
     def from_records(cls, records: Iterable[MemberMatch]) -> "MemberRegistry":
@@ -147,6 +148,7 @@ class MemberRegistry:
             records.append(
                 MemberMatch(
                     id=str(row.get("id") or "") or None,
+                    bioguide_id=str(row.get("bioguide_id") or "").strip().upper() or None,
                     name=str(row.get("name") or "").strip(),
                     slug=str(row.get("slug") or "") or None,
                     party=str(row.get("party") or "") or None,
@@ -158,7 +160,10 @@ class MemberRegistry:
 
     def rebuild_index(self) -> None:
         index: dict[str, list[MemberMatch]] = {}
+        bioguide_index: dict[str, MemberMatch] = {}
         for record in self.records:
+            if record.bioguide_id:
+                bioguide_index[record.bioguide_id.strip().upper()] = record
             keys = build_member_lookup_keys(
                 name=record.name,
                 state=record.state,
@@ -166,6 +171,7 @@ class MemberRegistry:
             for key in keys:
                 index.setdefault(key, []).append(record)
         self.key_index = index
+        self.bioguide_index = bioguide_index
 
     def save_json(self, path: Path) -> Path:
         path.parent.mkdir(parents=True, exist_ok=True)
@@ -176,11 +182,16 @@ class MemberRegistry:
     def resolve(
         self,
         *,
+        bioguide_id: str | None = None,
         name: str | None = None,
         first_name: str | None = None,
         last_name: str | None = None,
         state: str | None = None,
     ) -> MemberMatch | None:
+        normalized_bioguide = (bioguide_id or "").strip().upper()
+        if normalized_bioguide:
+            return self.bioguide_index.get(normalized_bioguide)
+
         state_code = (state or "").strip().upper()
         keys = build_member_lookup_keys(
             name=name,

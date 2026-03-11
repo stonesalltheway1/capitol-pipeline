@@ -107,6 +107,7 @@ class Settings(BaseSettings):
         "https://raw.githubusercontent.com/timothycarambat/"
         "senate-stock-watcher-data/master/aggregate/all_transactions.json"
     )
+    quiver_api_token: str | None = None
     offshore_leaks_zip_url: str = (
         "https://offshoreleaks-data.icij.org/offshoreleaks/csv/full-oldb.LATEST.zip"
     )
@@ -144,6 +145,13 @@ class Settings(BaseSettings):
         """Return the configured OpenAI key, falling back to OPENAI_API_KEY for local reuse."""
 
         value = self.openai_api_key or os.getenv("OPENAI_API_KEY")
+        return value.strip() if value else None
+
+    @property
+    def resolved_quiver_api_token(self) -> str | None:
+        """Return the configured Quiver API token, falling back to QUIVER_API_TOKEN for local reuse."""
+
+        value = self.quiver_api_token or os.getenv("QUIVER_API_TOKEN")
         return value.strip() if value else None
 
     @property

@@ -147,7 +147,7 @@ def build_senate_trade_search_document(
         id=f"senate-trade-{trade.source_id}",
         title=f"{trade.member.name} Senate trade disclosure",
         date=trade.transaction_date,
-        source="senate-watcher",
+        source=trade.source,
         category="stock-act",
         summary=summary,
         memberIds=[trade.member.id] if trade.member.id else [],

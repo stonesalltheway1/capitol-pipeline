@@ -53,6 +53,7 @@ from capitol_pipeline.exporters.neon import (
     fetch_house_stub_search_backfill,
     fetch_house_stub_queue,
     fetch_pipeline_corpus_status,
+    fetch_senate_trade_search_backfill,
     hybrid_search,
     load_member_registry_from_neon,
     mark_house_stub_processed,
@@ -125,7 +126,9 @@ from capitol_pipeline.sources.fara import (
 )
 from capitol_pipeline.sources.icij_offshore_leaks import iter_offshore_nodes, iter_offshore_relationships
 from capitol_pipeline.sources.senate_ethics import (
+    fetch_quiver_bulk_congress_feed,
     fetch_senate_watcher_feed,
+    normalize_quiver_senate_trade,
     normalize_senate_date,
     normalize_senate_watcher_trade,
 )
@@ -347,14 +350,20 @@ def index_search_document(
 
     if ensure_schema:
         ensure_search_schema(settings)
-    chunks = build_search_chunks(document, settings)
+    document_summary = upsert_search_document(settings, document, ensure_schema=False)
+    resolved_document_id = str(document_summary.get("document_id") or document.id)
+    resolved_document = (
+        document.model_copy(update={"id": resolved_document_id})
+        if resolved_document_id != document.id
+        else document
+    )
+    chunks = build_search_chunks(resolved_document, settings)
     if with_embeddings and chunks:
         embedder = get_embedder(settings)
         embeddings = embedder.embed_texts([chunk.content for chunk in chunks])
         for chunk, embedding in zip(chunks, embeddings, strict=False):
             chunk.embedding = embedding or None
 
-    document_summary = upsert_search_document(settings, document, ensure_schema=False)
     chunk_summary = upsert_search_chunks(settings, chunks, ensure_schema=False)
     return {
         "document": document_summary,
@@ -553,6 +562,41 @@ def process_house_queue_rows(
     return summary
 
 
+def build_senate_trade_from_db_row(row: dict[str, object]) -> NormalizedTradeRow:
+    """Hydrate a NormalizedTradeRow from an existing trades row."""
+
+    normalized_asset = classify_crypto_asset(
+        str(row.get("ticker") or "").strip() or None,
+        str(row.get("asset_description") or "").strip() or None,
+    )
+    return NormalizedTradeRow(
+        member=MemberMatch(
+            id=str(row.get("member_id") or "").strip() or None,
+            bioguide_id=str(row.get("member_bioguide_id") or "").strip().upper() or None,
+            name=str(row.get("member_name") or "").strip() or "Unknown member",
+            slug=str(row.get("member_slug") or "").strip() or None,
+            party=str(row.get("member_party") or "").strip() or None,
+            state=str(row.get("member_state") or "").strip() or None,
+            district=str(row.get("member_district") or "").strip() or None,
+        ),
+        source=str(row.get("source") or "senate-watcher").replace("_", "-"),
+        disclosure_kind="senate-trade",
+        source_id=str(row.get("id") or ""),
+        source_url=str(row.get("source_url") or "").strip() or None,
+        ticker=str(row.get("ticker") or "").strip().upper() or None,
+        asset_description=str(row.get("asset_description") or "").strip() or "Unknown asset",
+        asset_type=str(row.get("asset_type") or "").strip() or "Stock",
+        transaction_type=str(row.get("transaction_type") or "").strip() or "purchase",
+        transaction_date=str(row.get("transaction_date") or "").strip() or None,
+        disclosure_date=str(row.get("disclosure_date") or "").strip() or None,
+        amount_min=int(row.get("amount_min") or 0),
+        amount_max=int(row.get("amount_max") or 0),
+        owner=str(row.get("owner") or "").strip().lower() or "self",
+        comment=str(row.get("comment") or "").strip() or None,
+        normalized_asset=None if normalized_asset.kind == "unrelated" else normalized_asset,
+    )
+
+
 def build_offshore_member_match(
     node: OffshoreNodeRecord,
     member: MemberMatch,
@@ -670,10 +714,37 @@ def sync_house_feed_command(
 
 @cli.command("senate-feed")
 @click.option("--limit", type=int, default=10, show_default=True)
-def senate_feed(limit: int) -> None:
-    """Fetch and print the current Senate watcher rows."""
+@click.option(
+    "--provider",
+    type=click.Choice(["auto", "quiver", "watcher"]),
+    default="auto",
+    show_default=True,
+)
+def senate_feed(limit: int, provider: str) -> None:
+    """Fetch and print the current Senate feed rows."""
 
-    rows = fetch_senate_watcher_feed()
+    settings = Settings()
+    feed_provider = (
+        "quiver" if provider == "auto" and settings.resolved_quiver_api_token else provider
+    )
+    if feed_provider == "auto":
+        feed_provider = "watcher"
+
+    if feed_provider == "quiver":
+        rows = fetch_quiver_bulk_congress_feed(
+            settings,
+            page=1,
+            page_size=max(limit, 10),
+        )
+        senate_rows = [
+            row.model_dump(by_alias=True)
+            for row in rows
+            if str(row.chamber or row.house or "").strip().lower() == "senate"
+        ]
+        click.echo(json.dumps(senate_rows[:limit], indent=2))
+        return
+
+    rows = fetch_senate_watcher_feed(settings)
     click.echo(json.dumps([row.model_dump() for row in rows[:limit]], indent=2))
 
 
@@ -682,36 +753,58 @@ def senate_feed(limit: int) -> None:
 @click.option("--export-registry/--no-export-registry", default=True, show_default=True)
 @click.option("--with-search-index/--no-search-index", default=True, show_default=True)
 @click.option("--with-embeddings/--no-embeddings", default=False, show_default=True)
+@click.option(
+    "--provider",
+    type=click.Choice(["auto", "quiver", "watcher"]),
+    default="auto",
+    show_default=True,
+)
+@click.option(
+    "--start-date",
+    type=str,
+    default="2021-01-01",
+    show_default=True,
+    help="Ignore Quiver rows filed before this date.",
+)
+@click.option("--page-size", type=int, default=250, show_default=True)
 def senate_ingest_command(
     limit: int,
     export_registry: bool,
     with_search_index: bool,
     with_embeddings: bool,
+    provider: str,
+    start_date: str,
+    page_size: int,
 ) -> None:
-    """Normalize new Senate watcher rows and upsert them into CapitolExposed."""
+    """Normalize new Senate trade rows and upsert them into CapitolExposed."""
 
     settings = Settings()
     registry = load_registry_if_available(settings, export_cache=export_registry)
     if not registry:
         raise click.ClickException("Member registry is required for Senate ingest.")
 
-    feed_rows = sorted(
-        fetch_senate_watcher_feed(settings),
-        key=lambda row: normalize_senate_date(row.transaction_date) or "",
-        reverse=True,
-    )
+    feed_provider = "quiver" if provider == "auto" and settings.resolved_quiver_api_token else provider
+    if feed_provider == "auto":
+        feed_provider = "watcher"
+
     existing_trade_ids = fetch_existing_trade_ids(
         settings,
-        sources=["senate_watcher", "senate-watcher"],
+        sources=(
+            ["senate_quiver", "senate-quiver"]
+            if feed_provider == "quiver"
+            else ["senate_watcher", "senate-watcher"]
+        ),
     )
     if with_search_index:
         ensure_search_schema(settings)
 
     summary: dict[str, object] = {
-        "fetched": len(feed_rows),
+        "provider": feed_provider,
+        "fetched": 0,
         "normalized": 0,
         "skippedExisting": 0,
         "skippedUnresolved": 0,
+        "skippedBeforeStartDate": 0,
         "tradesUpserted": 0,
         "searchDocumentsUpserted": 0,
         "searchChunksUpserted": 0,
@@ -722,21 +815,59 @@ def senate_ingest_command(
     normalized_rows: list[NormalizedTradeRow] = []
     search_documents = []
 
-    for feed_row in feed_rows:
-        normalized = normalize_senate_watcher_trade(feed_row, registry)
+    def handle_normalized_row(normalized: NormalizedTradeRow | None) -> bool:
         if normalized is None:
             summary["skippedUnresolved"] = int(summary["skippedUnresolved"]) + 1
-            continue
+            return False
+        if normalized.disclosure_date and normalized.disclosure_date < start_date:
+            summary["skippedBeforeStartDate"] = int(summary["skippedBeforeStartDate"]) + 1
+            return False
         trade_id = build_trade_payload(normalized)["id"]
         if trade_id in existing_trade_ids:
             summary["skippedExisting"] = int(summary["skippedExisting"]) + 1
-            continue
+            return False
         normalized_rows.append(normalized)
+        existing_trade_ids.add(trade_id)
         summary["normalized"] = int(summary["normalized"]) + 1
         if with_search_index:
             search_documents.append(build_senate_trade_search_document(normalized))
-        if limit > 0 and len(normalized_rows) >= limit:
-            break
+        return limit > 0 and len(normalized_rows) >= limit
+
+    if feed_provider == "quiver":
+        page = 1
+        while True:
+            page_rows = fetch_quiver_bulk_congress_feed(
+                settings,
+                page=page,
+                page_size=page_size,
+            )
+            if not page_rows:
+                break
+            summary["fetched"] = int(summary["fetched"]) + len(page_rows)
+            stop = False
+            for feed_row in page_rows:
+                stop = handle_normalized_row(
+                    normalize_quiver_senate_trade(feed_row, registry),
+                )
+                if stop:
+                    break
+            if stop or len(page_rows) < page_size:
+                break
+            page += 1
+            time.sleep(0.35)
+    else:
+        feed_rows = sorted(
+            fetch_senate_watcher_feed(settings),
+            key=lambda row: normalize_senate_date(row.transaction_date) or "",
+            reverse=True,
+        )
+        summary["fetched"] = len(feed_rows)
+        for feed_row in feed_rows:
+            stop = handle_normalized_row(
+                normalize_senate_watcher_trade(feed_row, registry),
+            )
+            if stop:
+                break
 
     if normalized_rows:
         trade_summary = upsert_trade_rows_to_neon(settings, normalized_rows)
@@ -769,6 +900,68 @@ def senate_ingest_command(
                 "transactionType": row.transaction_type,
             }
         )
+
+    click.echo(json.dumps(summary, indent=2))
+
+
+@cli.command("backfill-senate-search")
+@click.option("--limit", type=int, default=0, show_default=True, help="0 means scan every eligible Senate trade row.")
+@click.option("--source", type=str, default=None, help="Optional trades.source filter.")
+@click.option("--only-missing/--include-existing", default=True, show_default=True)
+@click.option("--with-embeddings/--no-embeddings", default=False, show_default=True)
+def backfill_senate_search_command(
+    limit: int,
+    source: str | None,
+    only_missing: bool,
+    with_embeddings: bool,
+) -> None:
+    """Backfill pipeline search documents for existing Senate trade rows."""
+
+    settings = Settings()
+    source_filters = None
+    if source:
+        normalized = source.strip()
+        source_filters = sorted({normalized, normalized.replace("_", "-"), normalized.replace("-", "_")})
+
+    rows = fetch_senate_trade_search_backfill(
+        settings,
+        limit=limit,
+        only_missing=only_missing,
+        sources=source_filters,
+    )
+    summary = {
+        "queued": len(rows),
+        "documentsUpserted": 0,
+        "chunksUpserted": 0,
+        "embedded": 0,
+        "source": source,
+        "processedSample": [],
+    }
+
+    for row in rows:
+        trade = build_senate_trade_from_db_row(row)
+        index_summary = index_search_document_with_retry(
+            settings,
+            build_senate_trade_search_document(trade),
+            with_embeddings=with_embeddings,
+            ensure_schema=False,
+        )
+        summary["documentsUpserted"] += int(
+            (index_summary.get("document") or {}).get("upserted", 0)  # type: ignore[union-attr]
+        )
+        summary["chunksUpserted"] += int(
+            (index_summary.get("chunks") or {}).get("upserted", 0)  # type: ignore[union-attr]
+        )
+        summary["embedded"] += 1 if index_summary.get("embedded") else 0
+        if len(summary["processedSample"]) < 25:
+            summary["processedSample"].append(  # type: ignore[union-attr]
+                {
+                    "tradeId": trade.source_id,
+                    "member": trade.member.name,
+                    "ticker": trade.ticker,
+                    "source": trade.source,
+                }
+            )
 
     click.echo(json.dumps(summary, indent=2))
 

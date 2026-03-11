@@ -8,6 +8,7 @@ from pydantic import BaseModel, Field
 
 DisclosureSource = Literal[
     "house-clerk",
+    "senate-quiver",
     "senate-watcher",
     "senate-ethics",
     "fec",
@@ -40,6 +41,7 @@ class MemberMatch(BaseModel):
     """Resolved member metadata used during filing normalization."""
 
     id: str | None = None
+    bioguide_id: str | None = None
     name: str
     slug: str | None = None
     party: str | None = None

@@ -9,6 +9,7 @@ from capitol_pipeline.models.congress import FilingStub, NormalizedTradeRow
 
 SOURCE_EXPORT_MAP = {
     "house-clerk": "house_clerk",
+    "senate-quiver": "senate_quiver",
     "senate-watcher": "senate_watcher",
     "senate-ethics": "senate_efd",
     "congress-gov": "congress_gov",

@@ -163,7 +163,7 @@ def load_member_registry_from_neon(
         with connection.cursor() as cursor:
             cursor.execute(
                 """
-                SELECT id, name, slug, party, state, district, first_name, last_name
+                SELECT id, bioguide_id, name, slug, party, state, district, first_name, last_name
                 FROM members
                 ORDER BY in_office DESC NULLS LAST, name ASC
                 """
@@ -939,8 +939,7 @@ def upsert_search_document(
                     %s, %s, %s, %s, %s, %s, %s, %s, %s, %s,
                     %s, %s, %s, %s, %s, %s, NOW()
                 )
-                ON CONFLICT (id) DO UPDATE SET
-                    source_document_id = EXCLUDED.source_document_id,
+                ON CONFLICT (source_document_id) DO UPDATE SET
                     title = EXCLUDED.title,
                     content = EXCLUDED.content,
                     source = EXCLUDED.source,
@@ -956,6 +955,7 @@ def upsert_search_document(
                     tags = EXCLUDED.tags,
                     metadata = EXCLUDED.metadata,
                     updated_at = NOW()
+                RETURNING id
                 """,
                 (
                     document.id,
@@ -976,8 +976,10 @@ def upsert_search_document(
                     Jsonb(document.metadata),  # type: ignore[arg-type]
                 ),
             )
+            row = cursor.fetchone()
         connection.commit()
-    return {"upserted": 1, "document_id": document.id}
+    document_id = row.get("id") if isinstance(row, dict) else row[0] if row else document.id
+    return {"upserted": 1, "document_id": document_id or document.id}
 
 
 def upsert_search_chunks(
@@ -2572,6 +2574,80 @@ def fetch_house_stub_search_backfill(
                 {"" if limit <= 0 else "LIMIT %s"}
             """
             params: list[object] = [statuses]
+            if limit > 0:
+                params.append(limit)
+            cursor.execute(query, tuple(params))
+            return list(cursor.fetchall())
+
+
+def fetch_senate_trade_search_backfill(
+    settings: Settings,
+    *,
+    limit: int = 0,
+    only_missing: bool = True,
+    sources: list[str] | None = None,
+) -> list[dict[str, object]]:
+    """Load Senate trade rows that should be indexed into pipeline search."""
+
+    normalized_sources = sorted(
+        {
+            source.strip()
+            for source in (
+                sources
+                or [
+                    "senate_quiver",
+                    "senate-quiver",
+                    "senate_watcher",
+                    "senate-watcher",
+                    "senate_efd",
+                    "senate-ethics",
+                ]
+            )
+            if source and source.strip()
+        }
+    )
+    if not normalized_sources:
+        return []
+
+    ensure_search_schema(settings)
+    with neon_connection(settings) as connection:
+        with connection.cursor() as cursor:
+            query = f"""
+                SELECT DISTINCT ON (t.id)
+                    t.id,
+                    t.member_id,
+                    t.ticker,
+                    t.asset_description,
+                    t.asset_type,
+                    t.transaction_type,
+                    t.transaction_date,
+                    t.disclosure_date,
+                    t.amount_min,
+                    t.amount_max,
+                    t.owner,
+                    t.comment,
+                    t.source,
+                    t.source_url,
+                    m.bioguide_id AS member_bioguide_id,
+                    m.name AS member_name,
+                    m.slug AS member_slug,
+                    m.party AS member_party,
+                    m.state AS member_state,
+                    m.district AS member_district
+                FROM trades t
+                LEFT JOIN members m ON m.id = t.member_id
+                WHERE t.source = ANY(%s)
+                  AND COALESCE(t.member_id, '') <> ''
+                  AND COALESCE(t.transaction_date, t.disclosure_date) IS NOT NULL
+                  {"AND NOT EXISTS (SELECT 1 FROM pipeline_search_documents d WHERE d.source_document_id = CONCAT('senate-trade-', t.id))" if only_missing else ""}
+                ORDER BY
+                    t.id,
+                    COALESCE(t.disclosure_date, t.transaction_date) DESC,
+                    t.created_at DESC NULLS LAST,
+                    t.id DESC
+                {"" if limit <= 0 else "LIMIT %s"}
+            """
+            params: list[object] = [normalized_sources]
             if limit > 0:
                 params.append(limit)
             cursor.execute(query, tuple(params))

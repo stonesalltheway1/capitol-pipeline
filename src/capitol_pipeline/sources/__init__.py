@@ -13,7 +13,7 @@ from .icij_offshore_leaks import (
     iter_offshore_nodes,
     iter_offshore_relationships,
 )
-from .senate_ethics import fetch_senate_watcher_feed
+from .senate_ethics import fetch_quiver_bulk_congress_feed, fetch_senate_watcher_feed
 
 __all__ = [
     "build_house_feed_url",
@@ -24,6 +24,7 @@ __all__ = [
     "fetch_foreign_principals",
     "fetch_house_feed",
     "fetch_reg_documents",
+    "fetch_quiver_bulk_congress_feed",
     "fetch_senate_watcher_feed",
     "fetch_short_forms",
     "iter_offshore_nodes",

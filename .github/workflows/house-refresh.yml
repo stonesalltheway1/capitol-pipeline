@@ -15,6 +15,7 @@ jobs:
     timeout-minutes: 25
     env:
       DATABASE_URL: ${{ secrets.DATABASE_URL }}
+      QUIVER_API_TOKEN: ${{ secrets.QUIVER_API_TOKEN }}
       OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
       CAPITOL_EMBEDDING_PROVIDER: none
       CAPITOL_OPENAI_EMBEDDING_DIMENSIONS: "768"
@@ -34,8 +35,10 @@ jobs:
           python -m pip install -e ".[neon,pymupdf]"
 
       - name: Ingest Senate trades
+        if: env.QUIVER_API_TOKEN != ''
         run: |
           python -u -m capitol_pipeline senate-ingest \
+            --provider quiver \
             --with-search-index \
             --no-embeddings
 
