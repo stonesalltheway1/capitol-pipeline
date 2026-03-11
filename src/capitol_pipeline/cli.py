@@ -40,6 +40,7 @@ from capitol_pipeline.exporters.neon import (
     ensure_search_schema,
     ensure_usaspending_schema,
     fetch_existing_trade_ids,
+    fetch_latest_trade_disclosure_date,
     fetch_existing_fara_registration_numbers,
     fetch_alerts_for_search,
     fetch_bills_for_congress_sync,
@@ -801,6 +802,14 @@ def senate_ingest_command(
             else ["senate_watcher", "senate-watcher"]
         ),
     )
+    latest_known_disclosure_date = fetch_latest_trade_disclosure_date(
+        settings,
+        sources=(
+            ["senate_quiver", "senate-quiver"]
+            if feed_provider in {"quiver-live", "quiver-bulk"}
+            else ["senate_watcher", "senate-watcher"]
+        ),
+    )
     if with_search_index:
         ensure_search_schema(settings)
 
@@ -815,6 +824,7 @@ def senate_ingest_command(
         "searchDocumentsUpserted": 0,
         "searchChunksUpserted": 0,
         "embedded": 0,
+        "latestKnownDisclosureDate": latest_known_disclosure_date,
         "processedSample": [],
     }
 
@@ -869,9 +879,15 @@ def senate_ingest_command(
         )
         summary["fetched"] = len(feed_rows)
         for feed_row in feed_rows:
-            stop = handle_normalized_row(
-                normalize_quiver_live_senate_trade(feed_row, registry),
-            )
+            normalized = normalize_quiver_live_senate_trade(feed_row, registry)
+            if (
+                normalized
+                and latest_known_disclosure_date
+                and normalized.disclosure_date
+                and normalized.disclosure_date < latest_known_disclosure_date
+            ):
+                break
+            stop = handle_normalized_row(normalized)
             if stop:
                 break
     else:

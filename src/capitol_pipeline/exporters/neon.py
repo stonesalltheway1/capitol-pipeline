@@ -2814,6 +2814,31 @@ def fetch_existing_trade_ids(
             }
 
 
+def fetch_latest_trade_disclosure_date(
+    settings: Settings,
+    *,
+    sources: list[str] | tuple[str, ...],
+) -> str | None:
+    """Return the newest disclosure_date for a family of trade sources."""
+
+    normalized_sources = [source.strip() for source in sources if source.strip()]
+    if not normalized_sources:
+        return None
+    with neon_connection(settings) as connection:
+        with connection.cursor() as cursor:
+            cursor.execute(
+                """
+                SELECT MAX(disclosure_date)::text AS latest_disclosure_date
+                FROM trades
+                WHERE source = ANY(%s)
+                """,
+                (normalized_sources,),
+            )
+            row = cursor.fetchone() or {}
+            value = row.get("latest_disclosure_date")
+            return str(value) if value else None
+
+
 def fetch_members_for_search(
     settings: Settings,
     *,
