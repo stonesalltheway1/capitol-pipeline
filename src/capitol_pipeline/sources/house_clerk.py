@@ -61,6 +61,9 @@ def parse_house_feed(
         doc_id = (member_node.findtext("DocID") or "").strip()
         if not doc_id:
             continue
+        filing_type = (member_node.findtext("FilingType") or "PTR").strip().upper()
+        if filing_type not in {"P", "PTR"}:
+            continue
         first_name = (member_node.findtext("First") or "").strip() or None
         last_name = (member_node.findtext("Last") or "").strip() or None
         state_district = (member_node.findtext("StateDst") or "").strip() or None
@@ -77,7 +80,7 @@ def parse_house_feed(
             FilingStub(
                 doc_id=doc_id,
                 filing_year=year,
-                filing_type=(member_node.findtext("FilingType") or "PTR").strip() or "PTR",
+                filing_type=filing_type or "PTR",
                 filing_date=normalize_date(member_node.findtext("FilingDate")),
                 first_name=first_name,
                 last_name=last_name,
