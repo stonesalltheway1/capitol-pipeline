@@ -1,7 +1,10 @@
+from datetime import date
+
 from capitol_pipeline.bridges.capitol_exposed import build_trade_id, build_trade_payload
 from capitol_pipeline.bridges.search_documents import build_senate_trade_search_document
 from capitol_pipeline.registries.members import MemberRegistry
 from capitol_pipeline.sources.senate_ethics import (
+    build_quiver_bulk_reconcile_dates,
     QuiverCongressTrade,
     QuiverLiveSenateTrade,
     normalize_quiver_live_senate_trade,
@@ -165,3 +168,33 @@ def test_normalize_quiver_live_senate_trade_maps_live_payload_fields() -> None:
     assert normalized.amount_min == 50001
     assert normalized.amount_max == 100000
     assert normalized.source == "senate-quiver"
+
+
+def test_build_quiver_bulk_reconcile_dates_bounds_to_latest_known_window() -> None:
+    reconcile_dates = build_quiver_bulk_reconcile_dates(
+        start_date="2021-01-01",
+        latest_known_disclosure_date="2026-03-10",
+        lookback_days=14,
+        today=date(2026, 3, 12),
+    )
+
+    assert reconcile_dates[0] == "2026-02-24"
+    assert reconcile_dates[-1] == "2026-03-12"
+    assert len(reconcile_dates) == 17
+
+
+def test_build_quiver_bulk_reconcile_dates_respects_start_date_floor() -> None:
+    reconcile_dates = build_quiver_bulk_reconcile_dates(
+        start_date="2026-03-08",
+        latest_known_disclosure_date="2026-03-10",
+        lookback_days=14,
+        today=date(2026, 3, 12),
+    )
+
+    assert reconcile_dates == [
+        "2026-03-08",
+        "2026-03-09",
+        "2026-03-10",
+        "2026-03-11",
+        "2026-03-12",
+    ]

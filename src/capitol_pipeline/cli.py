@@ -127,6 +127,7 @@ from capitol_pipeline.sources.fara import (
 )
 from capitol_pipeline.sources.icij_offshore_leaks import iter_offshore_nodes, iter_offshore_relationships
 from capitol_pipeline.sources.senate_ethics import (
+    build_quiver_bulk_reconcile_dates,
     fetch_quiver_bulk_congress_feed,
     fetch_quiver_live_senate_feed,
     fetch_senate_watcher_feed,
@@ -770,6 +771,13 @@ def senate_feed(limit: int, provider: str) -> None:
     help="Ignore Quiver rows filed before this date.",
 )
 @click.option("--page-size", type=int, default=250, show_default=True)
+@click.option(
+    "--reconcile-lookback-days",
+    type=int,
+    default=14,
+    show_default=True,
+    help="For quiver-bulk, replay only the most recent disclosure window to catch late amendments.",
+)
 def senate_ingest_command(
     limit: int,
     export_registry: bool,
@@ -778,6 +786,7 @@ def senate_ingest_command(
     provider: str,
     start_date: str,
     page_size: int,
+    reconcile_lookback_days: int,
 ) -> None:
     """Normalize new Senate trade rows and upsert them into CapitolExposed."""
 
@@ -825,6 +834,9 @@ def senate_ingest_command(
         "searchChunksUpserted": 0,
         "embedded": 0,
         "latestKnownDisclosureDate": latest_known_disclosure_date,
+        "reconcileLookbackDays": reconcile_lookback_days,
+        "windowStartDate": None,
+        "windowEndDate": None,
         "processedSample": [],
     }
 
@@ -850,27 +862,40 @@ def senate_ingest_command(
         return limit > 0 and len(normalized_rows) >= limit
 
     if feed_provider == "quiver-bulk":
-        page = 1
-        while True:
-            page_rows = fetch_quiver_bulk_congress_feed(
-                settings,
-                page=page,
-                page_size=page_size,
-            )
-            if not page_rows:
-                break
-            summary["fetched"] = int(summary["fetched"]) + len(page_rows)
-            stop = False
-            for feed_row in page_rows:
-                stop = handle_normalized_row(
-                    normalize_quiver_senate_trade(feed_row, registry),
+        reconcile_dates = build_quiver_bulk_reconcile_dates(
+            start_date=start_date,
+            latest_known_disclosure_date=latest_known_disclosure_date,
+            lookback_days=reconcile_lookback_days,
+        )
+        if reconcile_dates:
+            summary["windowStartDate"] = reconcile_dates[0]
+            summary["windowEndDate"] = reconcile_dates[-1]
+
+        stop = False
+        for disclosure_date in reversed(reconcile_dates):
+            page = 1
+            while True:
+                page_rows = fetch_quiver_bulk_congress_feed(
+                    settings,
+                    page=page,
+                    page_size=page_size,
+                    date=disclosure_date,
                 )
-                if stop:
+                if not page_rows:
                     break
-            if stop or len(page_rows) < page_size:
+                summary["fetched"] = int(summary["fetched"]) + len(page_rows)
+                for feed_row in page_rows:
+                    stop = handle_normalized_row(
+                        normalize_quiver_senate_trade(feed_row, registry),
+                    )
+                    if stop:
+                        break
+                if stop or len(page_rows) < page_size:
+                    break
+                page += 1
+                time.sleep(0.35)
+            if stop:
                 break
-            page += 1
-            time.sleep(0.35)
     elif feed_provider == "quiver-live":
         feed_rows = sorted(
             fetch_quiver_live_senate_feed(settings),
@@ -2636,7 +2661,11 @@ def house_ingest_command(
     )
     if sync_limit > 0:
         feed = feed[:sync_limit]
-    sync_summary = sync_house_stubs_to_neon(settings, feed)
+    sync_summary = sync_house_stubs_to_neon(
+        settings,
+        feed,
+        prune_missing=sync_limit <= 0,
+    )
 
     if with_search_index:
         ensure_search_schema(settings)

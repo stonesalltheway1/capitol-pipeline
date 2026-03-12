@@ -1,35 +1,25 @@
-name: USAspending Refresh
+name: Senate Reconcile
 
 on:
   workflow_dispatch:
-    inputs:
-      limit_companies:
-        description: Max tracked companies to refresh in this run
-        required: false
-        default: "40"
-      stale_after_days:
-        description: Only revisit companies older than this many days
-        required: false
-        default: "14"
   schedule:
-    - cron: "17 5 * * *"
+    - cron: "45 4 * * *"
 
 concurrency:
-  group: usaspending-refresh
+  group: senate-reconcile
   cancel-in-progress: false
 
 jobs:
-  refresh:
+  reconcile:
     runs-on: ubuntu-latest
     timeout-minutes: 45
     env:
       DATABASE_URL: ${{ secrets.DATABASE_URL }}
+      QUIVER_API_TOKEN: ${{ secrets.QUIVER_API_TOKEN }}
       OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
       CAPITOL_EMBEDDING_PROVIDER: none
       CAPITOL_OPENAI_EMBEDDING_DIMENSIONS: "768"
       PYTHONUNBUFFERED: "1"
-      LIMIT_COMPANIES: ${{ github.event.inputs.limit_companies || '40' }}
-      STALE_AFTER_DAYS: ${{ github.event.inputs.stale_after_days || '14' }}
     steps:
       - name: Checkout
         uses: actions/checkout@v6
@@ -44,24 +34,25 @@ jobs:
           python -m pip install --upgrade pip
           python -m pip install -e ".[neon]"
 
-      - name: Refresh USAspending contract corpus
+      - name: Reconcile Senate trades
+        if: env.QUIVER_API_TOKEN != ''
         run: |
-          python -u -m capitol_pipeline ingest-usaspending \
-            --limit-companies "${LIMIT_COMPANIES}" \
-            --stale-after-days "${STALE_AFTER_DAYS}" \
-            --only-stale \
+          python -u -m capitol_pipeline senate-ingest \
+            --provider quiver-bulk \
+            --reconcile-lookback-days 14 \
+            --page-size 250 \
             --with-search-index \
             --no-embeddings
 
-      - name: Embed queued USAspending chunks
+      - name: Embed freshest Senate chunks
         if: env.OPENAI_API_KEY != ''
         env:
           CAPITOL_EMBEDDING_PROVIDER: openai
         run: |
           python -u -m capitol_pipeline embed-search-corpus \
-            --source usaspending \
+            --source senate-quiver \
             --batch-size 50 \
-            --max-batches 4
+            --max-batches 1
 
       - name: Print corpus status
         run: python -u -m capitol_pipeline corpus-status

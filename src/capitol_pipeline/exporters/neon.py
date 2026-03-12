@@ -850,13 +850,19 @@ def ensure_congress_schema(settings: Settings) -> dict[str, object]:
 def sync_house_stubs_to_neon(
     settings: Settings,
     stubs: list[FilingStub],
+    *,
+    prune_missing: bool = False,
 ) -> dict[str, int]:
     """Upsert House filing stubs into CapitolExposed's house_filing_stubs table."""
 
     stubs = [s for s in stubs if s.doc_id not in HOUSE_STUB_BLOCKLIST]
     payloads = [build_house_stub_payload(stub) for stub in stubs]
     if not payloads:
-        return {"upserted": 0}
+        return {"upserted": 0, "pruned": 0}
+
+    live_doc_ids = sorted({stub.doc_id for stub in stubs if stub.doc_id})
+    filing_years = sorted({stub.filing_year for stub in stubs if stub.filing_year})
+    pruned = 0
 
     with neon_connection(settings) as connection:
         with connection.cursor() as cursor:
@@ -897,9 +903,28 @@ def sync_house_stubs_to_neon(
                     for payload in payloads
                 ],
             )
+            if prune_missing and live_doc_ids and filing_years:
+                cursor.execute(
+                    """
+                    WITH deleted AS (
+                        DELETE FROM house_filing_stubs
+                        WHERE filing_year = ANY(%s)
+                          AND source IN ('house_clerk', 'house-clerk')
+                          AND status = 'pending_extraction'
+                          AND COALESCE(metadata->>'lastError', '') ILIKE 'PTR PDF fetch failed with 404%%'
+                          AND NOT (doc_id = ANY(%s))
+                        RETURNING doc_id
+                    )
+                    SELECT COUNT(*)::int AS pruned
+                    FROM deleted
+                    """,
+                    (filing_years, live_doc_ids),
+                )
+                row = cursor.fetchone() or {}
+                pruned = int(row.get("pruned") or 0)
         connection.commit()
 
-    return {"upserted": len(payloads)}
+    return {"upserted": len(payloads), "pruned": pruned}
 
 
 def upsert_search_document(

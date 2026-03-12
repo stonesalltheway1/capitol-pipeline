@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from datetime import date, datetime, timedelta, timezone
 import hashlib
 import time
 import warnings
@@ -88,6 +89,39 @@ def normalize_senate_date(raw: str | None) -> str | None:
     if not (month.isdigit() and day.isdigit() and year.isdigit()):
         return None
     return f"{year.zfill(4)}-{month.zfill(2)}-{day.zfill(2)}"
+
+
+def build_quiver_bulk_reconcile_dates(
+    *,
+    start_date: str,
+    latest_known_disclosure_date: str | None,
+    lookback_days: int,
+    today: date | None = None,
+) -> list[str]:
+    """Return the bounded disclosure-date window to reconcile from Quiver bulk."""
+
+    normalized_start = normalize_senate_date(start_date)
+    if not normalized_start:
+        raise ValueError(f"Invalid Senate start date: {start_date}")
+
+    window_start = date.fromisoformat(normalized_start)
+    normalized_latest = normalize_senate_date(latest_known_disclosure_date)
+    if normalized_latest:
+        latest_date = date.fromisoformat(normalized_latest)
+        bounded_start = latest_date - timedelta(days=max(0, lookback_days))
+        if bounded_start > window_start:
+            window_start = bounded_start
+
+    current_day = today or datetime.now(timezone.utc).date()
+    if current_day < window_start:
+        return []
+
+    reconcile_dates: list[str] = []
+    cursor = window_start
+    while cursor <= current_day:
+        reconcile_dates.append(cursor.isoformat())
+        cursor += timedelta(days=1)
+    return reconcile_dates
 
 
 def parse_senate_amount_range(raw: str | None) -> tuple[int, int]:
