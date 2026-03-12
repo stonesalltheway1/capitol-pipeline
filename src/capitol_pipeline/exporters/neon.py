@@ -1255,10 +1255,17 @@ def fetch_house_stub_queue(
                 )
             )
         """
+        retry_clause = "TRUE"
     elif include_needs_review:
         status_clause = "status IN ('pending_extraction', 'extracting', 'needs_review')"
+        retry_clause = (
+            "COALESCE(NULLIF(metadata->>'retryAfter', '')::timestamptz, NOW() - INTERVAL '1 second') <= NOW()"
+        )
     else:
         status_clause = "status IN ('pending_extraction', 'extracting')"
+        retry_clause = (
+            "COALESCE(NULLIF(metadata->>'retryAfter', '')::timestamptz, NOW() - INTERVAL '1 second') <= NOW()"
+        )
 
     with neon_connection(settings) as connection:
         with connection.cursor() as cursor:
@@ -1268,7 +1275,7 @@ def fetch_house_stub_queue(
                        detected_at, last_seen_at
                 FROM house_filing_stubs
                 WHERE {status_clause}
-                  AND COALESCE(NULLIF(metadata->>'retryAfter', '')::timestamptz, NOW() - INTERVAL '1 second') <= NOW()
+                  AND {retry_clause}
                   AND (
                         status <> 'pending_extraction'
                         OR COALESCE(metadata->>'lastError', '') NOT ILIKE 'PTR PDF fetch failed with 404%%'
