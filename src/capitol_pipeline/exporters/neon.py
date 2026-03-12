@@ -1245,7 +1245,16 @@ def fetch_house_stub_queue(
     """Load queued House filing stubs that are ready for extraction or retry."""
 
     if only_needs_review:
-        status_clause = "status = 'needs_review'"
+        status_clause = """
+            (
+                status = 'needs_review'
+                OR (
+                    status = 'pending_extraction'
+                    AND COALESCE(metadata->>'lastError', '') ILIKE
+                        'PTR text extracted but transactions need manual review%%'
+                )
+            )
+        """
     elif include_needs_review:
         status_clause = "status IN ('pending_extraction', 'extracting', 'needs_review')"
     else:
