@@ -5,7 +5,7 @@ from __future__ import annotations
 from contextlib import contextmanager
 from datetime import datetime, timezone
 import hashlib
-from typing import Iterator
+from typing import Callable, Iterator
 
 from capitol_pipeline.bridges.capitol_exposed import (
     build_house_stub_payload,
@@ -120,6 +120,41 @@ def neon_connection(settings: Settings) -> Iterator["psycopg.Connection"]:  # ty
         yield connection
     finally:
         connection.close()
+
+
+_BULK_UPSERT_CHUNK_SIZE = 500
+"""Max rows per executemany() call for large corpus ingests.
+
+Neon's connection pooler terminates idle-in-transaction connections after ~30 s.
+Sending tens of thousands of rows in a single executemany() can exceed that window.
+By chunking into smaller batches with an explicit commit between each, we keep each
+transaction short and avoid mid-batch disconnections."""
+
+
+def _chunked_executemany(
+    settings: Settings,
+    sql: str,
+    params_list: list[tuple],
+    *,
+    chunk_size: int = _BULK_UPSERT_CHUNK_SIZE,
+    ensure_schema_fn: "Callable[[Settings], None] | None" = None,
+) -> int:
+    """Execute a bulk upsert in small committed chunks to survive Neon timeouts."""
+
+    if not params_list:
+        return 0
+    if ensure_schema_fn is not None:
+        ensure_schema_fn(settings)
+
+    total = 0
+    for i in range(0, len(params_list), chunk_size):
+        chunk = params_list[i : i + chunk_size]
+        with neon_connection(settings) as connection:
+            with connection.cursor() as cursor:
+                cursor.executemany(sql, chunk)
+            connection.commit()
+        total += len(chunk)
+    return total
 
 
 def vector_literal(values: list[float] | None) -> str | None:
@@ -1306,84 +1341,45 @@ def upsert_offshore_nodes(
 
     if not rows:
         return {"upserted": 0}
-    if ensure_schema:
-        ensure_offshore_schema(settings)
-    with neon_connection(settings) as connection:
-        with connection.cursor() as cursor:
-            cursor.executemany(
-                f"""
-                INSERT INTO {PIPELINE_OFFSHORE_NODES_TABLE} (
-                    node_key,
-                    node_id,
-                    node_type,
-                    name,
-                    normalized_name,
-                    source_dataset,
-                    summary,
-                    content,
-                    countries,
-                    country_codes,
-                    jurisdiction,
-                    jurisdiction_description,
-                    company_type,
-                    address,
-                    status,
-                    service_provider,
-                    note,
-                    valid_until,
-                    metadata,
-                    updated_at
-                )
-                VALUES (
-                    %s, %s, %s, %s, %s, %s, %s, %s, %s, %s,
-                    %s, %s, %s, %s, %s, %s, %s, %s, %s, NOW()
-                )
-                ON CONFLICT (node_key) DO UPDATE SET
-                    name = EXCLUDED.name,
-                    normalized_name = EXCLUDED.normalized_name,
-                    source_dataset = EXCLUDED.source_dataset,
-                    summary = EXCLUDED.summary,
-                    content = EXCLUDED.content,
-                    countries = EXCLUDED.countries,
-                    country_codes = EXCLUDED.country_codes,
-                    jurisdiction = EXCLUDED.jurisdiction,
-                    jurisdiction_description = EXCLUDED.jurisdiction_description,
-                    company_type = EXCLUDED.company_type,
-                    address = EXCLUDED.address,
-                    status = EXCLUDED.status,
-                    service_provider = EXCLUDED.service_provider,
-                    note = EXCLUDED.note,
-                    valid_until = EXCLUDED.valid_until,
-                    metadata = EXCLUDED.metadata,
-                    updated_at = NOW()
-                """,
-                [
-                    (
-                        row.node_key,
-                        row.node_id,
-                        row.node_type,
-                        row.name,
-                        row.normalized_name,
-                        row.source_dataset,
-                        row.summary,
-                        row.content,
-                        row.countries,
-                        row.country_codes,
-                        row.jurisdiction,
-                        row.jurisdiction_description,
-                        row.company_type,
-                        row.address,
-                        row.status,
-                        row.service_provider,
-                        row.note,
-                        row.valid_until,
-                        Jsonb(row.metadata),  # type: ignore[arg-type]
-                    )
-                    for row in rows
-                ],
-            )
-        connection.commit()
-    return {"upserted": len(rows)}
+
+    sql = f"""
+        INSERT INTO {PIPELINE_OFFSHORE_NODES_TABLE} (
+            node_key, node_id, node_type, name, normalized_name,
+            source_dataset, summary, content, countries, country_codes,
+            jurisdiction, jurisdiction_description, company_type, address,
+            status, service_provider, note, valid_until, metadata, updated_at
+        )
+        VALUES (
+            %s, %s, %s, %s, %s, %s, %s, %s, %s, %s,
+            %s, %s, %s, %s, %s, %s, %s, %s, %s, NOW()
+        )
+        ON CONFLICT (node_key) DO UPDATE SET
+            name = EXCLUDED.name, normalized_name = EXCLUDED.normalized_name,
+            source_dataset = EXCLUDED.source_dataset, summary = EXCLUDED.summary,
+            content = EXCLUDED.content, countries = EXCLUDED.countries,
+            country_codes = EXCLUDED.country_codes, jurisdiction = EXCLUDED.jurisdiction,
+            jurisdiction_description = EXCLUDED.jurisdiction_description,
+            company_type = EXCLUDED.company_type, address = EXCLUDED.address,
+            status = EXCLUDED.status, service_provider = EXCLUDED.service_provider,
+            note = EXCLUDED.note, valid_until = EXCLUDED.valid_until,
+            metadata = EXCLUDED.metadata, updated_at = NOW()
+        """
+    params = [
+        (
+            row.node_key, row.node_id, row.node_type, row.name,
+            row.normalized_name, row.source_dataset, row.summary, row.content,
+            row.countries, row.country_codes, row.jurisdiction,
+            row.jurisdiction_description, row.company_type, row.address,
+            row.status, row.service_provider, row.note, row.valid_until,
+            Jsonb(row.metadata),  # type: ignore[arg-type]
+        )
+        for row in rows
+    ]
+    upserted = _chunked_executemany(
+        settings, sql, params,
+        ensure_schema_fn=ensure_offshore_schema if ensure_schema else None,
+    )
+    return {"upserted": upserted}
 
 
 def upsert_offshore_relationships(
@@ -1396,55 +1392,33 @@ def upsert_offshore_relationships(
 
     if not rows:
         return {"upserted": 0}
-    if ensure_schema:
-        ensure_offshore_schema(settings)
-    with neon_connection(settings) as connection:
-        with connection.cursor() as cursor:
-            cursor.executemany(
-                f"""
-                INSERT INTO {PIPELINE_OFFSHORE_RELATIONSHIPS_TABLE} (
-                    relationship_key,
-                    start_node_id,
-                    end_node_id,
-                    rel_type,
-                    link,
-                    status,
-                    start_date,
-                    end_date,
-                    source_dataset,
-                    metadata,
-                    updated_at
-                )
-                VALUES (
-                    %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, NOW()
-                )
-                ON CONFLICT (relationship_key) DO UPDATE SET
-                    link = EXCLUDED.link,
-                    status = EXCLUDED.status,
-                    start_date = EXCLUDED.start_date,
-                    end_date = EXCLUDED.end_date,
-                    source_dataset = EXCLUDED.source_dataset,
-                    metadata = EXCLUDED.metadata,
-                    updated_at = NOW()
-                """,
-                [
-                    (
-                        row.relationship_key,
-                        row.start_node_id,
-                        row.end_node_id,
-                        row.rel_type,
-                        row.link,
-                        row.status,
-                        row.start_date,
-                        row.end_date,
-                        row.source_dataset,
-                        Jsonb(row.metadata),  # type: ignore[arg-type]
-                    )
-                    for row in rows
-                ],
-            )
-        connection.commit()
-    return {"upserted": len(rows)}
+
+    sql = f"""
+        INSERT INTO {PIPELINE_OFFSHORE_RELATIONSHIPS_TABLE} (
+            relationship_key, start_node_id, end_node_id, rel_type, link,
+            status, start_date, end_date, source_dataset, metadata, updated_at
+        )
+        VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, NOW())
+        ON CONFLICT (relationship_key) DO UPDATE SET
+            link = EXCLUDED.link, status = EXCLUDED.status,
+            start_date = EXCLUDED.start_date, end_date = EXCLUDED.end_date,
+            source_dataset = EXCLUDED.source_dataset,
+            metadata = EXCLUDED.metadata, updated_at = NOW()
+        """
+    params = [
+        (
+            row.relationship_key, row.start_node_id, row.end_node_id,
+            row.rel_type, row.link, row.status, row.start_date,
+            row.end_date, row.source_dataset,
+            Jsonb(row.metadata),  # type: ignore[arg-type]
+        )
+        for row in rows
+    ]
+    upserted = _chunked_executemany(
+        settings, sql, params,
+        ensure_schema_fn=ensure_offshore_schema if ensure_schema else None,
+    )
+    return {"upserted": upserted}
 
 
 def upsert_offshore_member_matches(
@@ -1738,56 +1712,38 @@ def upsert_fara_documents(
 
     if not rows:
         return {"upserted": 0}
-    if ensure_schema:
-        ensure_fara_schema(settings)
-    with neon_connection(settings) as connection:
-        with connection.cursor() as cursor:
-            cursor.executemany(
-                f"""
-                INSERT INTO {PIPELINE_FARA_DOCUMENTS_TABLE} (
-                    document_key,
-                    registration_number,
-                    registrant_name,
-                    document_type,
-                    date_stamped,
-                    url,
-                    short_form_name,
-                    foreign_principal_name,
-                    foreign_principal_country,
-                    metadata,
-                    updated_at
-                )
-                VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, NOW())
-                ON CONFLICT (document_key) DO UPDATE SET
-                    registration_number = EXCLUDED.registration_number,
-                    registrant_name = EXCLUDED.registrant_name,
-                    document_type = EXCLUDED.document_type,
-                    date_stamped = EXCLUDED.date_stamped,
-                    url = EXCLUDED.url,
-                    short_form_name = EXCLUDED.short_form_name,
-                    foreign_principal_name = EXCLUDED.foreign_principal_name,
-                    foreign_principal_country = EXCLUDED.foreign_principal_country,
-                    metadata = EXCLUDED.metadata,
-                    updated_at = NOW()
-                """,
-                [
-                    (
-                        row.document_key,
-                        row.registration_number,
-                        row.registrant_name,
-                        row.document_type,
-                        row.date_stamped,
-                        row.url,
-                        row.short_form_name,
-                        row.foreign_principal_name,
-                        row.foreign_principal_country,
-                        Jsonb(row.metadata),  # type: ignore[arg-type]
-                    )
-                    for row in rows
-                ],
-            )
-        connection.commit()
-    return {"upserted": len(rows)}
+
+    sql = f"""
+        INSERT INTO {PIPELINE_FARA_DOCUMENTS_TABLE} (
+            document_key, registration_number, registrant_name, document_type,
+            date_stamped, url, short_form_name, foreign_principal_name,
+            foreign_principal_country, metadata, updated_at
+        )
+        VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, NOW())
+        ON CONFLICT (document_key) DO UPDATE SET
+            registration_number = EXCLUDED.registration_number,
+            registrant_name = EXCLUDED.registrant_name,
+            document_type = EXCLUDED.document_type,
+            date_stamped = EXCLUDED.date_stamped, url = EXCLUDED.url,
+            short_form_name = EXCLUDED.short_form_name,
+            foreign_principal_name = EXCLUDED.foreign_principal_name,
+            foreign_principal_country = EXCLUDED.foreign_principal_country,
+            metadata = EXCLUDED.metadata, updated_at = NOW()
+        """
+    params = [
+        (
+            row.document_key, row.registration_number, row.registrant_name,
+            row.document_type, row.date_stamped, row.url, row.short_form_name,
+            row.foreign_principal_name, row.foreign_principal_country,
+            Jsonb(row.metadata),  # type: ignore[arg-type]
+        )
+        for row in rows
+    ]
+    upserted = _chunked_executemany(
+        settings, sql, params,
+        ensure_schema_fn=ensure_fara_schema if ensure_schema else None,
+    )
+    return {"upserted": upserted}
 
 
 def upsert_fara_member_matches(
