@@ -112,6 +112,7 @@ class Settings(BaseSettings):
         "https://offshoreleaks-data.icij.org/offshoreleaks/csv/full-oldb.LATEST.zip"
     )
     fara_base_url: str = "https://efile.fara.gov/api/v1"
+    lda_api_token: str | None = None  # LDA.gov lobbying disclosure API token
     fara_bulk_registrants_zip_url: str = "https://efile.fara.gov/bulk/zip/FARA_All_Registrants.csv.zip"
     fara_bulk_foreign_principals_zip_url: str = "https://efile.fara.gov/bulk/zip/FARA_All_ForeignPrincipals.csv.zip"
     fara_bulk_short_forms_zip_url: str = "https://efile.fara.gov/bulk/zip/FARA_All_ShortForms.csv.zip"
