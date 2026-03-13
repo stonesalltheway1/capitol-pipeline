@@ -55,3 +55,38 @@ jobs:
 
       - name: Print corpus status
         run: python -u -m capitol_pipeline corpus-status
+
+      - name: Notify app of new trades
+        if: success() && env.PIPELINE_WEBHOOK_SECRET != ''
+        env:
+          PIPELINE_WEBHOOK_SECRET: ${{ secrets.PIPELINE_WEBHOOK_SECRET }}
+          SITE_BASE_URL: ${{ secrets.SITE_BASE_URL }}
+        run: |
+          # Query trades inserted in the last 20 minutes and notify the app
+          python -u -c "
+          import os, json, urllib.request, psycopg
+          db = os.environ.get('NEON_DATABASE_URL') or os.environ.get('DATABASE_URL', '')
+          if not db:
+              print('No DATABASE_URL, skipping notify'); exit(0)
+          conn = psycopg.connect(db)
+          cur = conn.cursor()
+          cur.execute(\"SELECT id FROM trades WHERE created_at >= NOW() - INTERVAL '20 minutes'\")
+          ids = [r[0] for r in cur.fetchall()]
+          cur.close(); conn.close()
+          if not ids:
+              print('No recent trades to notify about'); exit(0)
+          print(f'Notifying app about {len(ids)} recent trades')
+          base = os.environ.get('SITE_BASE_URL', 'https://www.capitolexposed.com')
+          secret = os.environ['PIPELINE_WEBHOOK_SECRET']
+          data = json.dumps({'trade_ids': ids, 'source': 'house-clerk'}).encode()
+          req = urllib.request.Request(
+              f'{base}/api/webhooks/new-trades',
+              data=data,
+              headers={'Authorization': f'Bearer {secret}', 'Content-Type': 'application/json'},
+              method='POST')
+          try:
+              resp = urllib.request.urlopen(req, timeout=30)
+              print(f'App notified: {resp.read().decode()[:200]}')
+          except Exception as e:
+              print(f'Notify failed (non-fatal): {e}')
+          "
