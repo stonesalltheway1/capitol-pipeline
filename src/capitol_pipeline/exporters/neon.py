@@ -5,7 +5,10 @@ from __future__ import annotations
 from contextlib import contextmanager
 from datetime import datetime, timezone
 import hashlib
+import random
+import time
 from typing import Callable, Iterator
+from urllib.parse import parse_qs, urlencode, urlparse, urlunparse
 
 from capitol_pipeline.bridges.capitol_exposed import (
     build_house_stub_payload,
@@ -98,18 +101,40 @@ def ensure_neon_available() -> None:
         )
 
 
+def _optimize_neon_url(url: str) -> str:
+    """Add sslnegotiation=direct and connect_timeout to Neon URLs.
+
+    PG17 sslnegotiation=direct saves ~13% on TLS handshake latency.
+    """
+    parsed = urlparse(url)
+    params = parse_qs(parsed.query)
+    if "sslnegotiation" not in params:
+        params["sslnegotiation"] = ["direct"]
+    if "connect_timeout" not in params:
+        params["connect_timeout"] = ["15"]
+    new_query = urlencode(params, doseq=True)
+    return urlunparse(parsed._replace(query=new_query))
+
+
+_RETRIABLE_ERRORS = (
+    "connection", "timed out", "timeout", "too many clients",
+    "server closed the connection", "broken pipe", "connection reset",
+    "08006", "08003", "57P01", "53200", "53300", "40001",
+)
+
+
 def _require_database_url(settings: Settings) -> str:
     database_url = settings.resolved_neon_database_url
     if not database_url:
         raise RuntimeError(
             "No database URL configured. Set CAPITOL_NEON_DATABASE_URL or DATABASE_URL."
         )
-    return database_url
+    return _optimize_neon_url(database_url)
 
 
 @contextmanager
 def neon_connection(settings: Settings) -> Iterator["psycopg.Connection"]:  # type: ignore[name-defined]
-    """Open a short-lived psycopg connection to Neon."""
+    """Open a short-lived psycopg connection to Neon with optimized URL."""
 
     ensure_neon_available()
     database_url = _require_database_url(settings)
@@ -138,8 +163,12 @@ def _chunked_executemany(
     *,
     chunk_size: int = _BULK_UPSERT_CHUNK_SIZE,
     ensure_schema_fn: "Callable[[Settings], None] | None" = None,
+    max_retries: int = 5,
 ) -> int:
-    """Execute a bulk upsert in small committed chunks to survive Neon timeouts."""
+    """Execute a bulk upsert in small committed chunks to survive Neon timeouts.
+
+    Each chunk is retried with exponential backoff + jitter on transient errors.
+    """
 
     if not params_list:
         return 0
@@ -149,10 +178,21 @@ def _chunked_executemany(
     total = 0
     for i in range(0, len(params_list), chunk_size):
         chunk = params_list[i : i + chunk_size]
-        with neon_connection(settings) as connection:
-            with connection.cursor() as cursor:
-                cursor.executemany(sql, chunk)
-            connection.commit()
+        for attempt in range(max_retries):
+            try:
+                with neon_connection(settings) as connection:
+                    with connection.cursor() as cursor:
+                        cursor.executemany(sql, chunk)
+                    connection.commit()
+                break
+            except Exception as e:
+                msg = str(e).lower()
+                retriable = any(err in msg for err in _RETRIABLE_ERRORS)
+                if retriable and attempt < max_retries - 1:
+                    delay = (2 ** attempt) + random.uniform(0, 1)
+                    time.sleep(delay)
+                    continue
+                raise
         total += len(chunk)
     return total
 
@@ -324,8 +364,8 @@ def ensure_search_schema(settings: Settings) -> dict[str, object]:
                     """
                     CREATE INDEX IF NOT EXISTS idx_pipeline_search_chunks_embedding
                     ON pipeline_search_chunks
-                    USING ivfflat (embedding vector_cosine_ops)
-                    WITH (lists = 100)
+                    USING hnsw (embedding vector_cosine_ops)
+                    WITH (m = 24, ef_construction = 100)
                     """
                 )
             connection.commit()
