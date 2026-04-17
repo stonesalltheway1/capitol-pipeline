@@ -102,14 +102,15 @@ def ensure_neon_available() -> None:
 
 
 def _optimize_neon_url(url: str) -> str:
-    """Add sslnegotiation=direct and connect_timeout to Neon URLs.
+    """Normalize Neon URL for psycopg3: add connect_timeout, strip sslnegotiation.
 
-    PG17 sslnegotiation=direct saves ~13% on TLS handshake latency.
+    Node's @neondatabase/serverless accepts ``sslnegotiation=direct`` (libpq 17
+    feature for faster TLS handshake), but psycopg3's conninfo parser rejects it
+    as an unknown parameter. Strip it before handing off to psycopg.
     """
     parsed = urlparse(url)
     params = parse_qs(parsed.query)
-    if "sslnegotiation" not in params:
-        params["sslnegotiation"] = ["direct"]
+    params.pop("sslnegotiation", None)
     if "connect_timeout" not in params:
         params["connect_timeout"] = ["15"]
     new_query = urlencode(params, doseq=True)
@@ -3524,7 +3525,9 @@ def upsert_trade_rows_to_neon(
                     source,
                     source_url,
                     conflict_score,
-                    conflict_flags
+                    conflict_flags,
+                    parser_version,
+                    parser_confidence
                 )
                 VALUES (
                     %(id)s,
@@ -3542,7 +3545,9 @@ def upsert_trade_rows_to_neon(
                     %(source)s,
                     %(source_url)s,
                     %(conflict_score)s,
-                    %(conflict_flags)s
+                    %(conflict_flags)s,
+                    %(parser_version)s,
+                    %(parser_confidence)s
                 )
                 ON CONFLICT (id) DO UPDATE SET
                     member_id = EXCLUDED.member_id,
@@ -3559,7 +3564,9 @@ def upsert_trade_rows_to_neon(
                     source = EXCLUDED.source,
                     source_url = EXCLUDED.source_url,
                     conflict_score = EXCLUDED.conflict_score,
-                    conflict_flags = EXCLUDED.conflict_flags
+                    conflict_flags = EXCLUDED.conflict_flags,
+                    parser_version = EXCLUDED.parser_version,
+                    parser_confidence = EXCLUDED.parser_confidence
                 """,
                 [
                     {

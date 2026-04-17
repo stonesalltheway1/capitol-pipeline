@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from datetime import date
+import logging
 import re
 from pathlib import Path
 
@@ -15,27 +16,50 @@ from capitol_pipeline.models.congress import (
     NormalizedTradeRow,
 )
 from capitol_pipeline.normalizers.crypto_assets import classify_crypto_asset
+from capitol_pipeline.parsers.ptr_llm_fallback import extract_via_haiku
 from capitol_pipeline.processors.ocr import OcrProcessor
 
+logger = logging.getLogger(__name__)
+
+REGEX_PARSER_VERSION = "regex-v1"
+LLM_PARSER_VERSION = "haiku-4.5-fallback-v1"
+
+_LLM_OWNER_MAP: dict[str, str] = {
+    "self": "self",
+    "spouse": "spouse",
+    "joint": "joint",
+    "dependent": "child",
+    "trust": "self",
+    "unknown": "self",
+}
+
+def _range_pattern(low: str, high: str) -> re.Pattern[str]:
+    return re.compile(
+        rf"\$\s*{re.escape(low).replace(',', ',?')}\s*[-–—]\s*\$\s*{re.escape(high).replace(',', ',?')}",
+        re.I,
+    )
+
+
 AMOUNT_RANGES: list[tuple[re.Pattern[str], int, int]] = [
-    (re.compile(r"\$1,001\s*-\s*\$15,000", re.I), 1001, 15000),
-    (re.compile(r"\$15,001\s*-\s*\$50,000", re.I), 15001, 50000),
-    (re.compile(r"\$50,001\s*-\s*\$100,000", re.I), 50001, 100000),
-    (re.compile(r"\$100,001\s*-\s*\$250,000", re.I), 100001, 250000),
-    (re.compile(r"\$250,001\s*-\s*\$500,000", re.I), 250001, 500000),
-    (re.compile(r"\$500,001\s*-\s*\$1,000,000", re.I), 500001, 1000000),
-    (re.compile(r"\$1,000,001\s*-\s*\$5,000,000", re.I), 1000001, 5000000),
-    (re.compile(r"\$5,000,001\s*-\s*\$25,000,000", re.I), 5000001, 25000000),
-    (re.compile(r"\$25,000,001\s*-\s*\$50,000,000", re.I), 25000001, 50000000),
-    (re.compile(r"Over\s*\$50,000,000", re.I), 50000001, 100000000),
+    (_range_pattern("1,001", "15,000"), 1001, 15000),
+    (_range_pattern("1,000", "15,000"), 1000, 15000),
+    (_range_pattern("15,001", "50,000"), 15001, 50000),
+    (_range_pattern("50,001", "100,000"), 50001, 100000),
+    (_range_pattern("100,001", "250,000"), 100001, 250000),
+    (_range_pattern("250,001", "500,000"), 250001, 500000),
+    (_range_pattern("500,001", "1,000,000"), 500001, 1000000),
+    (_range_pattern("1,000,001", "5,000,000"), 1000001, 5000000),
+    (_range_pattern("5,000,001", "25,000,000"), 5000001, 25000000),
+    (_range_pattern("25,000,001", "50,000,000"), 25000001, 50000000),
+    (re.compile(r"(?:over|>)\s*\$\s*50,?000,?000", re.I), 50000001, 100000000),
 ]
 
 TRANSACTION_PATTERN = re.compile(
     r"((?:[A-Z]{1,3}\s+)?[^[]{6,240}?)(?:\s*\(([A-Z.]{1,6})\))?"
-    r"\s*\[([A-Z]{2,4})\]\s*(P|S(?:\s*\(partial\))?|E)\s*"
-    r"(\d{1,2}/\d{1,2}/\d{4})\s*(\d{1,2}/\d{1,2}/\d{4})\s*"
+    r"\s*(?:\[([A-Z]{2,4})\]\s*)?(P|S(?:\s*\(partial\))?|E)\s+"
+    r"(\d{1,2}/\d{1,2}/\d{4})\s+(\d{1,2}/\d{1,2}/\d{4})\s+"
     r"(?:(Spouse/DC|JT|DC|SP|TR|XX)\s+)?"
-    r"(\$[\d,]+\s*-\s*\$[\d,]+|Over\s*\$[\d,]+)(?:\s+[A-Z])?",
+    r"(\$[\d,]+\s*[-–—]\s*\$[\d,]+|(?:Over|>)\s*\$[\d,]+)(?:\s+[A-Z])?",
     re.I,
 )
 
@@ -85,7 +109,9 @@ def parse_transaction_type(raw: str) -> str:
     return "purchase"
 
 
-def infer_asset_type(raw: str) -> str:
+def infer_asset_type(raw: str | None) -> str:
+    if not raw:
+        return "Asset"
     normalized = raw.strip().upper()
     if normalized == "ST":
         return "Stock"
@@ -320,9 +346,11 @@ def build_trade_rows_from_house_ptr(
                 owner=transaction.owner,
                 comment=(
                     f"Parsed from House PTR {stub.doc_id} at "
-                    f"{round(parsed.parser_confidence * 100)}% confidence"
+                    f"{round(parsed.parser_confidence * 100)}% confidence "
+                    f"[{parsed.parser_version}]"
                 ),
                 parser_confidence=parsed.parser_confidence,
+                parser_version=parsed.parser_version,
                 normalized_asset=normalized_asset,
             )
         )
@@ -347,7 +375,129 @@ def parse_house_ptr_text(
         member_name=member_name,
         state=state,
         parser_confidence=score_confidence(valid_transactions, stub.member),
+        parser_version=REGEX_PARSER_VERSION,
         raw_text_preview=normalized[:1200],
+        transactions=valid_transactions,
+    )
+    return parsed, build_trade_rows_from_house_ptr(parsed, stub)
+
+
+def _llm_amount_bounds(raw_min: object, raw_max: object) -> tuple[int, int]:
+    try:
+        amount_min = int(raw_min or 0)
+    except (TypeError, ValueError):
+        amount_min = 0
+    try:
+        amount_max = int(raw_max or 0)
+    except (TypeError, ValueError):
+        amount_max = 0
+    if amount_min < 0:
+        amount_min = 0
+    if amount_max < 0:
+        amount_max = 0
+    if amount_min > amount_max and amount_max > 0:
+        amount_min, amount_max = amount_max, amount_min
+    return amount_min, amount_max
+
+
+def _llm_transaction_type(raw: object) -> str:
+    value = str(raw or "").strip().lower()
+    if value in {"sale", "s"}:
+        return "sale"
+    if value in {"exchange", "e"}:
+        return "exchange"
+    return "purchase"
+
+
+def _llm_owner(raw: object) -> str:
+    value = str(raw or "").strip().lower()
+    return _LLM_OWNER_MAP.get(value, "self")
+
+
+def _llm_to_transactions(payload: list[dict]) -> list[HousePtrTransaction]:
+    out: list[HousePtrTransaction] = []
+    for index, raw_row in enumerate(payload, start=1):
+        if not isinstance(raw_row, dict):
+            continue
+        description = (raw_row.get("asset_description") or "").strip()
+        if not description:
+            continue
+        amount_min, amount_max = _llm_amount_bounds(raw_row.get("amount_min"), raw_row.get("amount_max"))
+        ticker = raw_row.get("ticker")
+        ticker = ticker.strip().upper() if isinstance(ticker, str) and ticker.strip() else None
+        out.append(
+            HousePtrTransaction(
+                line_number=index,
+                asset_description=description,
+                ticker=ticker,
+                asset_type=(raw_row.get("asset_type") or "Asset").strip() or "Asset",
+                transaction_type=_llm_transaction_type(raw_row.get("transaction_type")),  # type: ignore[arg-type]
+                transaction_date=normalize_date(raw_row.get("transaction_date")),
+                notification_date=normalize_date(raw_row.get("notification_date")),
+                amount_min=amount_min,
+                amount_max=amount_max,
+                owner=_llm_owner(raw_row.get("owner")),  # type: ignore[arg-type]
+            )
+        )
+    return out
+
+
+def _run_llm_fallback(
+    pdf_path: Path,
+    stub: FilingStub,
+    text_preview: str,
+) -> tuple[HousePtrParseResult, list[NormalizedTradeRow]] | None:
+    """Invoke Haiku 4.5 fallback; return (parsed, rows) or None if nothing extracted."""
+
+    try:
+        llm_result = extract_via_haiku(pdf_path)
+    except Exception as exc:
+        logger.exception("house_ptr fallback: extract_via_haiku raised: %s", exc)
+        return None
+
+    raw_transactions = llm_result.get("transactions") or []
+    if not raw_transactions:
+        logger.info(
+            "house_ptr fallback: no rows recovered for %s (notes=%r usage=%s)",
+            pdf_path.name,
+            (llm_result.get("parser_notes") or "")[:120],
+            llm_result.get("usage"),
+        )
+        return None
+
+    transactions = _llm_to_transactions(raw_transactions)
+    transactions = dedupe_transactions(stub, transactions)
+    valid_transactions = [
+        transaction
+        for transaction in transactions
+        if get_transaction_date_issue(transaction.transaction_date, stub.filing_date) is None
+    ]
+    if not valid_transactions:
+        logger.info("house_ptr fallback: all LLM rows filtered as invalid for %s", pdf_path.name)
+        return None
+
+    confidence = float(llm_result.get("confidence") or 0.0)
+    usage = llm_result.get("usage") or {}
+    logger.info(
+        "house_ptr fallback: Haiku recovered %d rows for %s "
+        "(parser_version=%s parser_confidence=%.2f usage=input=%s cached=%s output=%s notes=%r)",
+        len(valid_transactions),
+        pdf_path.name,
+        LLM_PARSER_VERSION,
+        confidence,
+        usage.get("input"),
+        usage.get("cached_input"),
+        usage.get("output"),
+        (llm_result.get("parser_notes") or "")[:120],
+    )
+
+    parsed = HousePtrParseResult(
+        doc_id=stub.doc_id,
+        member_name=parse_header_name(text_preview) or stub.member.name,
+        state=parse_header_state(text_preview) or stub.member.state,
+        parser_confidence=confidence,
+        parser_version=LLM_PARSER_VERSION,
+        raw_text_preview=text_preview[:1200],
         transactions=valid_transactions,
     )
     return parsed, build_trade_rows_from_house_ptr(parsed, stub)
@@ -363,4 +513,25 @@ def parse_house_ptr_pdf(
     processor = OcrProcessor(settings, backend=backend)
     result = processor.process_file(pdf_path)
     text = result.document.ocrText if result.document and result.document.ocrText else ""
-    return parse_house_ptr_text(text, stub)
+    parsed, rows = parse_house_ptr_text(text, stub)
+
+    if parsed.transactions:
+        return parsed, rows
+
+    text_has_content = bool((text or "").strip())
+    if not text_has_content:
+        logger.debug(
+            "house_ptr: no OCR text for %s; invoking LLM fallback unconditionally",
+            pdf_path.name,
+        )
+    else:
+        logger.debug(
+            "house_ptr: regex found 0 rows despite %d chars of text for %s; invoking LLM fallback",
+            len(text),
+            pdf_path.name,
+        )
+
+    fallback = _run_llm_fallback(pdf_path, stub, normalize_text(text))
+    if fallback is None:
+        return parsed, rows
+    return fallback

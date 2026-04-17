@@ -110,4 +110,6 @@ def build_trade_payload(row: NormalizedTradeRow) -> dict[str, object]:
         "crypto_kind": normalized_asset.kind if normalized_asset else None,
         "crypto_symbol": normalized_asset.canonical_symbol if normalized_asset else None,
         "crypto_match_confidence": normalized_asset.confidence if normalized_asset else None,
+        "parser_version": row.parser_version,
+        "parser_confidence": row.parser_confidence,
     }

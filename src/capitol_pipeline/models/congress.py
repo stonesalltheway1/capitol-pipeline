@@ -86,6 +86,7 @@ class HousePtrParseResult(BaseModel):
     member_name: str | None = None
     state: str | None = None
     parser_confidence: float = 0.0
+    parser_version: str = "regex-v1"
     raw_text_preview: str | None = None
     transactions: list[HousePtrTransaction] = Field(default_factory=list)
 
@@ -122,4 +123,5 @@ class NormalizedTradeRow(BaseModel):
     owner: str = "self"
     comment: str | None = None
     parser_confidence: float | None = None
+    parser_version: str | None = None
     normalized_asset: NormalizedAsset | None = None
