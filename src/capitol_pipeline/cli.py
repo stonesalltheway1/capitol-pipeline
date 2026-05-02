@@ -32,6 +32,7 @@ from capitol_pipeline.bridges import (
     build_trade_payload,
 )
 from capitol_pipeline.config import OcrBackend, Settings
+from capitol_pipeline.exporters.members_bio_schema import ensure_members_bio_schema
 from capitol_pipeline.exporters.neon import (
     backfill_crypto_trade_classification,
     ensure_congress_schema,
@@ -105,6 +106,11 @@ from capitol_pipeline.normalizers.crypto_assets import classify_crypto_asset
 from capitol_pipeline.parsers.house_ptr import parse_house_ptr_pdf
 from capitol_pipeline.processors.chunking import build_search_chunks
 from capitol_pipeline.processors.embeddings import get_embedder
+from capitol_pipeline.processors.headshots import (
+    fetch_headshot_targets,
+    run_headshot_verification,
+    upsert_headshot_verifications,
+)
 from capitol_pipeline.processors.ocr import OcrProcessor
 from capitol_pipeline.registries.members import MemberRegistry, load_member_registry_from_json
 from capitol_pipeline.sources.congress_gov import (
@@ -113,7 +119,26 @@ from capitol_pipeline.sources.congress_gov import (
     build_congress_bill_record,
     build_congress_bill_summary_records,
 )
+from capitol_pipeline.sources.bioguide import (
+    fetch_bioguide_records,
+    fetch_member_bioguides,
+    upsert_bioguide_records,
+)
+from capitol_pipeline.sources.congress_legislators import (
+    fetch_legislator_crosswalk,
+    upsert_member_crosswalk,
+)
 from capitol_pipeline.sources.house_clerk import fetch_house_feed
+from capitol_pipeline.sources.wikidata import (
+    fetch_member_qids,
+    fetch_wikidata_infoboxes,
+    upsert_wikidata_infoboxes,
+)
+from capitol_pipeline.sources.wikipedia import (
+    fetch_member_wiki_pairs,
+    fetch_wikipedia_summaries,
+    upsert_wikipedia_summaries,
+)
 from capitol_pipeline.sources.fara import (
     FaraApiClient,
     fetch_bulk_foreign_principals,
@@ -2767,6 +2792,172 @@ def hybrid_search_command(
         ticker=ticker,
     )
     click.echo(json.dumps([hit.model_dump() for hit in hits], indent=2))
+
+
+@cli.command("ensure-members-bio-schema")
+def ensure_members_bio_schema_command() -> None:
+    """Add Wikipedia-style infobox + verified-headshot columns to the members table."""
+
+    settings = Settings()
+    summary = ensure_members_bio_schema(settings)
+    click.echo(json.dumps(summary, indent=2))
+
+
+@cli.command("sync-member-crosswalk")
+def sync_member_crosswalk_command() -> None:
+    """Pull Wikidata/Wikipedia/Ballotpedia/GovTrack/VoteSmart IDs from
+    unitedstates/congress-legislators into the members table."""
+
+    settings = Settings()
+    ensure_members_bio_schema(settings)
+    records = list(fetch_legislator_crosswalk(settings))
+    summary = upsert_member_crosswalk(settings, records)
+    click.echo(json.dumps({"fetched": len(records), **summary}, indent=2))
+
+
+@cli.command("enrich-members-wikidata")
+@click.option(
+    "--limit",
+    type=int,
+    default=None,
+    help="Limit the number of QIDs enriched (smoke testing).",
+)
+def enrich_members_wikidata_command(limit: int | None) -> None:
+    """Pull infobox facts (birthplace, education, religion, family, predecessor) from Wikidata."""
+
+    settings = Settings()
+    ensure_members_bio_schema(settings)
+    pairs = fetch_member_qids(settings)
+    if limit:
+        pairs = pairs[: int(limit)]
+    qids = [qid for _, qid in pairs]
+    infoboxes = fetch_wikidata_infoboxes(settings, qids)
+    applied = upsert_wikidata_infoboxes(settings, infoboxes)
+    click.echo(
+        json.dumps(
+            {
+                "members_with_qid": len(pairs),
+                "infoboxes_returned": len(infoboxes),
+                "rows_updated": applied,
+            },
+            indent=2,
+        )
+    )
+
+
+@cli.command("import-bioguide-bios")
+@click.option(
+    "--only-missing/--all",
+    default=True,
+    show_default=True,
+    help="Only fetch members without an existing bio_text.",
+)
+@click.option(
+    "--limit",
+    type=int,
+    default=None,
+    help="Optional cap on the number of bioguide IDs processed.",
+)
+@click.option(
+    "--no-cache",
+    is_flag=True,
+    default=False,
+    help="Bypass the on-disk Bioguide JSON cache.",
+)
+def import_bioguide_bios_command(
+    only_missing: bool, limit: int | None, no_cache: bool
+) -> None:
+    """Pull profileText prose biographies from the Bioguide JSON feed."""
+
+    settings = Settings()
+    ensure_members_bio_schema(settings)
+    bioguide_ids = fetch_member_bioguides(settings, only_missing=only_missing, limit=limit)
+    records = list(
+        fetch_bioguide_records(settings, bioguide_ids, use_cache=not no_cache)
+    )
+    applied = upsert_bioguide_records(settings, records)
+    click.echo(
+        json.dumps(
+            {
+                "candidates": len(bioguide_ids),
+                "records_with_bio": len(records),
+                "rows_updated": applied,
+            },
+            indent=2,
+        )
+    )
+
+
+@cli.command("import-wikipedia-bios")
+@click.option(
+    "--only-missing/--all",
+    default=True,
+    show_default=True,
+    help="Only fetch members without an existing bio_text.",
+)
+def import_wikipedia_bios_command(only_missing: bool) -> None:
+    """Pull Wikipedia REST summaries (CC BY-SA) for the bio_text column.
+
+    Used in place of the Bioguide profileText feed, which is gated by Akamai
+    and returns 403 to every non-browser request.
+    """
+
+    settings = Settings()
+    ensure_members_bio_schema(settings)
+    pairs = fetch_member_wiki_pairs(settings, only_missing=only_missing)
+    summaries = list(fetch_wikipedia_summaries(settings, pairs))
+    applied = upsert_wikipedia_summaries(settings, summaries)
+    click.echo(
+        json.dumps(
+            {
+                "candidates": len(pairs),
+                "summaries_returned": len(summaries),
+                "rows_updated": applied,
+            },
+            indent=2,
+        )
+    )
+
+
+@cli.command("sync-member-headshots")
+@click.option(
+    "--only-unverified/--all",
+    default=False,
+    show_default=True,
+    help="Only re-run on members without a verified headshot or in needs_review.",
+)
+@click.option(
+    "--limit",
+    type=int,
+    default=None,
+    help="Optional cap on the number of members processed (smoke testing).",
+)
+@click.option(
+    "--no-vlm",
+    is_flag=True,
+    default=False,
+    help="Skip the Claude Haiku VLM fallback even if ANTHROPIC_API_KEY is set.",
+)
+def sync_member_headshots_command(
+    only_unverified: bool, limit: int | None, no_vlm: bool
+) -> None:
+    """Fetch + verify member headshots from unitedstates/images, congress.gov, and Wikidata."""
+
+    settings = Settings()
+    ensure_members_bio_schema(settings)
+    targets = fetch_headshot_targets(
+        settings, only_unverified=only_unverified, limit=limit
+    )
+    verifications, summary = run_headshot_verification(
+        settings, targets, enable_vlm_fallback=not no_vlm
+    )
+    applied = upsert_headshot_verifications(settings, verifications)
+    click.echo(
+        json.dumps(
+            {**summary, "rows_updated": applied},
+            indent=2,
+        )
+    )
 
 
 if __name__ == "__main__":

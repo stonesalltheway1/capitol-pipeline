@@ -1,0 +1,80 @@
+name: Member Bio + Headshot Refresh
+
+on:
+  workflow_dispatch:
+    inputs:
+      headshot_limit:
+        description: Cap on headshots verified per run, blank for all
+        required: false
+        default: ""
+      only_unverified_headshots:
+        description: Only re-run on headshots without a verified status
+        required: false
+        default: "true"
+      bioguide_limit:
+        description: Cap on Bioguide profileText fetches per run, blank for all
+        required: false
+        default: "150"
+  schedule:
+    # Sundays at 04:17 UTC — off-peak for the public infra we hit (Wikidata,
+    # Bioguide, congress.gov, unitedstates/images CDN). Single weekly cadence is
+    # plenty: roster changes are rare outside swearing-in days, and Wikidata
+    # infobox edits propagate within a week of any real-world event.
+    - cron: "17 4 * * 0"
+
+concurrency:
+  group: member-bio-refresh
+  cancel-in-progress: false
+
+jobs:
+  refresh:
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    env:
+      DATABASE_URL: ${{ secrets.DATABASE_URL }}
+      ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+      PYTHONUNBUFFERED: "1"
+      HEADSHOT_LIMIT: ${{ github.event.inputs.headshot_limit || '' }}
+      ONLY_UNVERIFIED_HEADSHOTS: ${{ github.event.inputs.only_unverified_headshots || 'true' }}
+      BIOGUIDE_LIMIT: ${{ github.event.inputs.bioguide_limit || '150' }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+
+      - name: Set up Python
+        uses: actions/setup-python@v6
+        with:
+          python-version: "3.11"
+
+      - name: Install pipeline (with neon + headshots extras)
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install -e ".[neon,headshots]"
+
+      - name: Ensure members bio + headshot schema
+        run: python -u -m capitol_pipeline ensure-members-bio-schema
+
+      - name: Sync cross-walk IDs from congress-legislators
+        run: python -u -m capitol_pipeline sync-member-crosswalk
+
+      - name: Enrich members with Wikidata infobox facts
+        run: python -u -m capitol_pipeline enrich-members-wikidata
+
+      - name: Import Wikipedia summaries (CC BY-SA, only members missing bio)
+        run: python -u -m capitol_pipeline import-wikipedia-bios --only-missing
+
+      - name: Verify and store member headshots
+        run: |
+          ARGS=""
+          if [ "${ONLY_UNVERIFIED_HEADSHOTS}" = "true" ]; then
+            ARGS="${ARGS} --only-unverified"
+          else
+            ARGS="${ARGS} --all"
+          fi
+          if [ -n "${HEADSHOT_LIMIT}" ]; then
+            ARGS="${ARGS} --limit ${HEADSHOT_LIMIT}"
+          fi
+          if [ -z "${ANTHROPIC_API_KEY}" ]; then
+            ARGS="${ARGS} --no-vlm"
+          fi
+          python -u -m capitol_pipeline sync-member-headshots ${ARGS}
