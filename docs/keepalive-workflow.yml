@@ -1,0 +1,80 @@
+name: Keepalive
+
+# GitHub disables scheduled workflows after 60 days with no commits on the
+# default branch. This repository is almost entirely scheduled jobs, so it goes
+# quiet for months at a time by design and then GitHub switches the pipelines
+# off. On 2026-08-23 the last commit was 113 days old and GitHub had already
+# sent the warning for House Refresh.
+#
+# Losing these is not cosmetic. house-refresh runs every 15 minutes and
+# senate-refresh every 30, and CapitolExposed reads what they produce, so a
+# silent disable means the site quietly serves stale data.
+#
+# This job pushes an empty commit when the repository gets close to the cutoff,
+# which resets the timer. It runs twice a month so a single failed or skipped
+# run cannot lose the window.
+#
+# Deliberately self-contained rather than a third-party keepalive action: this
+# repository holds pipeline credentials, and a job with `contents: write` is not
+# somewhere to add an outside dependency for the sake of ten lines of shell.
+
+on:
+  schedule:
+    # 1st and 15th at 05:11 UTC. Off the hour on purpose; GitHub delays
+    # scheduled runs that land on a busy minute, and :00 is the worst of them.
+    - cron: "11 5 1,15 * *"
+  workflow_dispatch:
+    inputs:
+      force:
+        description: "Commit even if the repo is under the 45 day threshold (use to verify the push works)"
+        type: boolean
+        default: false
+
+# Only the default branch matters for the inactivity timer.
+concurrency:
+  group: keepalive
+  cancel-in-progress: false
+
+permissions:
+  contents: write
+
+jobs:
+  keepalive:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          # Need real history to read the last commit date.
+          fetch-depth: 0
+
+      - name: Reset the inactivity timer if we are close to it
+        env:
+          FORCE: ${{ inputs.force }}
+        run: |
+          set -euo pipefail
+
+          LAST_COMMIT_TS=$(git log -1 --format=%ct)
+          NOW_TS=$(date +%s)
+          AGE_DAYS=$(( (NOW_TS - LAST_COMMIT_TS) / 86400 ))
+
+          echo "Last commit was ${AGE_DAYS} days ago (GitHub disables at 60)."
+
+          # 45 leaves at least two scheduled runs of headroom before the cutoff
+          # while keeping the history quiet during normal development.
+          if [ "${AGE_DAYS}" -lt 45 ] && [ "${FORCE}" != "true" ]; then
+            echo "Under the 45 day threshold, nothing to do."
+            exit 0
+          fi
+
+          git config user.name  "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
+          # [skip ci] is belt and braces. A push authenticated with the default
+          # GITHUB_TOKEN cannot trigger workflow runs anyway, so validate.yml
+          # will not fire, but the marker makes the intent obvious to a reader.
+          git commit --allow-empty -m "Keepalive: reset the GitHub Actions 60 day inactivity timer [skip ci]"
+          git push
+
+          echo "Pushed an empty commit. Scheduled workflows stay enabled."
