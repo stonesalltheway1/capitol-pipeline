@@ -11,6 +11,7 @@ SOURCE_EXPORT_MAP = {
     "house-clerk": "house_clerk",
     "senate-quiver": "senate_quiver",
     "senate-watcher": "senate_watcher",
+    "senate-efd": "senate_efd",
     "senate-ethics": "senate_efd",
     "congress-gov": "congress_gov",
 }
@@ -22,18 +23,49 @@ def normalize_trade_source_for_site(source: str) -> str:
     return SOURCE_EXPORT_MAP.get(source, source.replace("-", "_"))
 
 
+def build_canonical_senate_trade_asset_key(row: NormalizedTradeRow) -> str:
+    """Return the asset half of the canonical Senate trade id.
+
+    The ticker identifies the asset whenever the filing carries one. Only when
+    it does not (unlisted assets, municipal bonds, most paper filings) does the
+    normalized asset description stand in, because providers word the same
+    holding differently and would otherwise hash apart.
+    """
+
+    ticker = (row.ticker or "").strip().upper()
+    if ticker and ticker not in {"--", "N/A"}:
+        return ticker
+    return " ".join((row.asset_description or "").split()).lower()
+
+
 def build_canonical_senate_trade_id(row: NormalizedTradeRow) -> str:
+    """Build the provider-independent canonical id for one Senate trade.
+
+    The id deliberately hashes only the facts every provider reports the same
+    way: member, asset, action, transaction date, amount bounds, and owner. It
+    used to also hash ``asset_description`` and ``source_url``, which made the
+    same trade hash differently depending on whether it arrived via the Quiver
+    live feed or the Quiver bulk feed and produced ~2,686 duplicate rows. Run
+    ``capitol-pipeline dedupe-senate-trades --apply`` (or
+    ``scripts/dedupe_senate_trades.sql``) once after deploying this change.
+
+    KEEP IN SYNC: the TypeScript mirror of this function lives in the site repo
+    at ``E:\\CapitolGraph\\lib\\trade-integrity.ts``. It must be updated
+    identically -- same field list, same order, same ``|`` join, same SHA-256
+    truncated to 16 hex characters, same ``tr-senate-`` prefix -- or the site
+    and the pipeline will compute different ids for the same trade. Do not edit
+    that repo from here; change it in its own repo alongside this one.
+    """
+
     payload = "|".join(
         [
-            row.member.id,
-            (row.ticker or "").strip().upper(),
-            " ".join(row.asset_description.split()).lower(),
+            row.member.id or "",
+            build_canonical_senate_trade_asset_key(row),
             (row.transaction_type or "").strip().lower(),
             row.transaction_date or "",
             str(row.amount_min or 0),
             str(row.amount_max or 0),
             (row.owner or "self").strip().lower(),
-            (row.source_url or "").strip().lower().rstrip("/"),
         ]
     )
     digest = hashlib.sha256(payload.encode("utf-8")).hexdigest()[:16]

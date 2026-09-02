@@ -1,0 +1,50 @@
+{
+  "draw": 1,
+  "recordsTotal": 6,
+  "recordsFiltered": 6,
+  "data": [
+    [
+      "Sheldon",
+      "Whitehouse",
+      "Whitehouse, Sheldon (Senator)",
+      "<a href=\"/search/view/ptr/f8d003c0-ca1e-4c39-9d66-632d220180e1/\" target=\"_blank\">Periodic Transaction Report for 09/02/2026</a>",
+      "09/02/2026"
+    ],
+    [
+      "RICHARD ",
+      "BLUMENTHAL",
+      "Senator",
+      "<a href=\"/search/view/paper/929216d5-5dbd-429c-858c-1e9332924627/\" target=\"_blank\">Periodic Transaction Report for 08/31/2026</a>",
+      "08/31/2026"
+    ],
+    [
+      "Christopher A",
+      "Coons",
+      "Coons, Chris (Senator)",
+      "<a href=\"/search/view/ptr/5a76ceb6-2d1d-4430-8a17-6512bcb402be/\" target=\"_blank\">Periodic Transaction Report for 08/28/2026</a>",
+      "08/28/2026"
+    ],
+    [
+      "David H",
+      "McCormick",
+      "McCormick, David H. (Senator)",
+      "<a href=\"/search/view/ptr/257795ae-e1b2-411d-b562-8fe4c2a4f2a1/\" target=\"_blank\">Periodic Transaction Report for 08/27/2026</a>",
+      "08/27/2026"
+    ],
+    [
+      "John",
+      "Boozman",
+      "Boozman, John (Senator)",
+      "<a href=\"/search/view/ptr/51455bcd-4966-4e77-b481-09897ada81ae/\" target=\"_blank\">Periodic Transaction Report for 12/08/2025 (Amendment 1)</a>",
+      "08/24/2026"
+    ],
+    [
+      "Ron",
+      "Wyden",
+      "Wyden, Ron (Senator)",
+      "<a href=\"/search/view/ptr/5ecc9b5c-07c1-4ec1-bd4a-2db759eff299/\" target=\"_blank\">Periodic Transaction Report for 08/08/2026</a>",
+      "08/08/2026"
+    ]
+  ],
+  "result": "ok"
+}

@@ -2638,6 +2638,7 @@ def fetch_senate_trade_search_backfill(
                     "senate_watcher",
                     "senate-watcher",
                     "senate_efd",
+                    "senate-efd",
                     "senate-ethics",
                 ]
             )
@@ -2823,6 +2824,158 @@ def fetch_published_dossiers(
                 params.append(limit)
             cursor.execute(query, tuple(params))
             return list(cursor.fetchall())
+
+
+DEFAULT_SENATE_DEDUPE_SOURCES: tuple[str, ...] = ("senate_quiver", "senate-quiver")
+"""Trade sources the Senate duplicate sweep targets by default.
+
+The Quiver live and bulk providers wrote the same trade twice because the old
+canonical id hashed ``asset_description`` and ``source_url``, which the two feeds
+word differently. See ``build_canonical_senate_trade_id``.
+"""
+
+_SENATE_DUPLICATE_RANKED_SQL = """
+    SELECT
+        t.id,
+        t.member_id,
+        COALESCE(
+            NULLIF(NULLIF(UPPER(TRIM(COALESCE(t.ticker, ''))), ''), '--'),
+            LOWER(REGEXP_REPLACE(TRIM(COALESCE(t.asset_description, '')), '\\s+', ' ', 'g'))
+        ) AS asset_key,
+        t.transaction_type,
+        t.transaction_date,
+        t.amount_min,
+        t.amount_max,
+        t.disclosure_date,
+        t.asset_description,
+        t.source,
+        ROW_NUMBER() OVER (
+            PARTITION BY
+                t.member_id,
+                COALESCE(
+                    NULLIF(NULLIF(UPPER(TRIM(COALESCE(t.ticker, ''))), ''), '--'),
+                    LOWER(REGEXP_REPLACE(TRIM(COALESCE(t.asset_description, '')), '\\s+', ' ', 'g'))
+                ),
+                t.transaction_type,
+                t.transaction_date,
+                t.amount_min,
+                t.amount_max
+            ORDER BY
+                (t.disclosure_date IS NULL),
+                LENGTH(COALESCE(t.asset_description, '')) DESC,
+                t.created_at ASC NULLS LAST,
+                t.id ASC
+        ) AS keep_rank
+    FROM trades t
+    WHERE t.source = ANY(%s)
+"""
+
+
+def fetch_duplicate_senate_trade_groups(
+    settings: Settings,
+    *,
+    sources: list[str] | tuple[str, ...] = DEFAULT_SENATE_DEDUPE_SOURCES,
+    limit: int = 0,
+) -> list[dict[str, object]]:
+    """Report duplicate Senate trade groups without changing anything.
+
+    A group is one (member_id, ticker-or-asset, transaction_type,
+    transaction_date, amount_min, amount_max) tuple holding more than one row.
+    The keeper is the row with a non-null ``disclosure_date`` first, then the
+    longest ``asset_description``, then the oldest ``created_at``.
+    """
+
+    normalized_sources = [source.strip() for source in sources if source.strip()]
+    if not normalized_sources:
+        return []
+
+    query = f"""
+        WITH ranked AS ({_SENATE_DUPLICATE_RANKED_SQL})
+        SELECT
+            member_id,
+            asset_key,
+            transaction_type,
+            transaction_date::text AS transaction_date,
+            amount_min,
+            amount_max,
+            COUNT(*) AS row_count,
+            MIN(id) FILTER (WHERE keep_rank = 1) AS keep_id,
+            ARRAY_AGG(id ORDER BY keep_rank) FILTER (WHERE keep_rank > 1) AS delete_ids
+        FROM ranked
+        GROUP BY member_id, asset_key, transaction_type, transaction_date, amount_min, amount_max
+        HAVING COUNT(*) > 1
+        ORDER BY COUNT(*) DESC, member_id, asset_key
+    """
+    params: list[object] = [normalized_sources]
+    if limit > 0:
+        query += " LIMIT %s"
+        params.append(limit)
+
+    with neon_connection(settings) as connection:
+        with connection.cursor() as cursor:
+            cursor.execute(query, tuple(params))
+            return list(cursor.fetchall())
+
+
+def delete_duplicate_senate_trades(
+    settings: Settings,
+    *,
+    sources: list[str] | tuple[str, ...] = DEFAULT_SENATE_DEDUPE_SOURCES,
+) -> dict[str, object]:
+    """Delete every non-keeper row of each duplicate Senate trade group.
+
+    Runs inside a single transaction: either the whole sweep lands or none of it.
+    """
+
+    normalized_sources = [source.strip() for source in sources if source.strip()]
+    if not normalized_sources:
+        return {"scanned": 0, "duplicateGroups": 0, "deleted": 0, "sources": []}
+
+    with neon_connection(settings) as connection:
+        try:
+            with connection.cursor() as cursor:
+                cursor.execute(
+                    "SELECT COUNT(*) AS total FROM trades WHERE source = ANY(%s)",
+                    (normalized_sources,),
+                )
+                scanned = int((cursor.fetchone() or {}).get("total") or 0)
+
+                cursor.execute(
+                    f"""
+                    WITH ranked AS ({_SENATE_DUPLICATE_RANKED_SQL})
+                    SELECT COUNT(*) AS groups
+                    FROM (
+                        SELECT 1
+                        FROM ranked
+                        GROUP BY member_id, asset_key, transaction_type,
+                                 transaction_date, amount_min, amount_max
+                        HAVING COUNT(*) > 1
+                    ) AS duplicate_groups
+                    """,
+                    (normalized_sources,),
+                )
+                duplicate_groups = int((cursor.fetchone() or {}).get("groups") or 0)
+
+                cursor.execute(
+                    f"""
+                    WITH ranked AS ({_SENATE_DUPLICATE_RANKED_SQL})
+                    DELETE FROM trades
+                    WHERE id IN (SELECT id FROM ranked WHERE keep_rank > 1)
+                    """,
+                    (normalized_sources,),
+                )
+                deleted = cursor.rowcount or 0
+            connection.commit()
+        except Exception:
+            connection.rollback()
+            raise
+
+    return {
+        "scanned": scanned,
+        "duplicateGroups": duplicate_groups,
+        "deleted": deleted,
+        "sources": normalized_sources,
+    }
 
 
 def fetch_existing_trade_ids(

@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from datetime import datetime, timedelta, timezone
+from datetime import date, datetime, timedelta, timezone
 import hashlib
 import json
 from pathlib import Path
@@ -34,7 +34,9 @@ from capitol_pipeline.bridges import (
 from capitol_pipeline.config import OcrBackend, Settings
 from capitol_pipeline.exporters.members_bio_schema import ensure_members_bio_schema
 from capitol_pipeline.exporters.neon import (
+    DEFAULT_SENATE_DEDUPE_SOURCES,
     backfill_crypto_trade_classification,
+    delete_duplicate_senate_trades,
     ensure_congress_schema,
     ensure_fara_schema,
     ensure_offshore_schema,
@@ -48,6 +50,7 @@ from capitol_pipeline.exporters.neon import (
     fetch_bills_for_search,
     fetch_company_candidates_for_usaspending,
     fetch_committees_for_search,
+    fetch_duplicate_senate_trade_groups,
     fetch_published_dossiers,
     fetch_published_news_posts,
     fetch_members_for_search,
@@ -151,6 +154,15 @@ from capitol_pipeline.sources.fara import (
     fetch_short_forms,
 )
 from capitol_pipeline.sources.icij_offshore_leaks import iter_offshore_nodes, iter_offshore_relationships
+from capitol_pipeline.sources.senate_efd import (
+    SenateEfdClient,
+    build_efd_submitted_since,
+    build_paper_report_stub,
+    fetch_electronic_ptr,
+    fetch_paper_ptr_pages,
+    list_ptr_reports,
+    normalize_efd_transaction,
+)
 from capitol_pipeline.sources.senate_ethics import (
     build_quiver_bulk_reconcile_dates,
     fetch_quiver_bulk_congress_feed,
@@ -741,23 +753,107 @@ def sync_house_feed_command(
     )
 
 
+SENATE_TRADE_SOURCE_FAMILIES: dict[str, list[str]] = {
+    "quiver": ["senate_quiver", "senate-quiver"],
+    "watcher": ["senate_watcher", "senate-watcher"],
+    # eFD ids are provider independent now, so an eFD run must also see the
+    # Quiver rows or it will re-insert trades Quiver already wrote.
+    "efd": [
+        "senate_efd",
+        "senate-efd",
+        "senate-ethics",
+        "senate_quiver",
+        "senate-quiver",
+    ],
+}
+
+
+def resolve_senate_provider(provider: str, settings: Settings) -> str:
+    """Resolve the ``auto`` Senate provider.
+
+    ``auto`` prefers Quiver while a token is configured and otherwise falls back
+    to the official eFD scraper. It never falls back to the senate-stock-watcher
+    feed, which has been frozen since 2020.
+    """
+
+    if provider != "auto":
+        return provider
+    return "quiver" if settings.resolved_quiver_api_token else "efd"
+
+
+def senate_source_family(feed_provider: str) -> list[str]:
+    """Return the trades.source values one Senate provider should reconcile."""
+
+    if feed_provider.startswith("quiver"):
+        return SENATE_TRADE_SOURCE_FAMILIES["quiver"]
+    if feed_provider == "efd":
+        return SENATE_TRADE_SOURCE_FAMILIES["efd"]
+    return SENATE_TRADE_SOURCE_FAMILIES["watcher"]
+
+
 @cli.command("senate-feed")
 @click.option("--limit", type=int, default=10, show_default=True)
 @click.option(
     "--provider",
-    type=click.Choice(["auto", "quiver", "watcher"]),
+    type=click.Choice(["auto", "quiver", "watcher", "efd"]),
     default="auto",
     show_default=True,
 )
-def senate_feed(limit: int, provider: str) -> None:
+@click.option(
+    "--since",
+    type=str,
+    default=None,
+    help="For --provider efd: only list reports submitted on or after YYYY-MM-DD.",
+)
+@click.option(
+    "--with-transactions/--no-transactions",
+    default=False,
+    show_default=True,
+    help="For --provider efd: also fetch and print each report's parsed rows.",
+)
+def senate_feed(limit: int, provider: str, since: str | None, with_transactions: bool) -> None:
     """Fetch and print the current Senate feed rows."""
 
     settings = Settings()
-    feed_provider = (
-        "quiver" if provider == "auto" and settings.resolved_quiver_api_token else provider
-    )
-    if feed_provider == "auto":
-        feed_provider = "watcher"
+    feed_provider = resolve_senate_provider(provider, settings)
+
+    if feed_provider == "efd":
+        submitted_since = (
+            date.fromisoformat(since)
+            if since
+            else build_efd_submitted_since(None, floor_days=settings.senate_efd_floor_days)
+        )
+        payload: list[dict[str, object]] = []
+        with SenateEfdClient(settings) as client:
+            reports = list_ptr_reports(
+                settings,
+                submitted_since,
+                None,
+                max(1, limit),
+                client=client,
+            )
+            for report in reports:
+                entry = report.model_dump()
+                if with_transactions:
+                    if report.kind == "electronic":
+                        entry["transactions"] = [
+                            transaction.model_dump()
+                            for transaction in fetch_electronic_ptr(client, report)
+                        ]
+                    else:
+                        entry["pageImages"] = fetch_paper_ptr_pages(client, report)
+                payload.append(entry)
+        click.echo(
+            json.dumps(
+                {
+                    "provider": "efd",
+                    "submittedSince": submitted_since.isoformat(),
+                    "reports": payload,
+                },
+                indent=2,
+            )
+        )
+        return
 
     if feed_provider == "quiver":
         rows = fetch_quiver_bulk_congress_feed(
@@ -784,7 +880,7 @@ def senate_feed(limit: int, provider: str) -> None:
 @click.option("--with-embeddings/--no-embeddings", default=False, show_default=True)
 @click.option(
     "--provider",
-    type=click.Choice(["auto", "quiver", "quiver-live", "quiver-bulk", "watcher"]),
+    type=click.Choice(["auto", "quiver", "quiver-live", "quiver-bulk", "watcher", "efd"]),
     default="auto",
     show_default=True,
 )
@@ -793,7 +889,7 @@ def senate_feed(limit: int, provider: str) -> None:
     type=str,
     default="2021-01-01",
     show_default=True,
-    help="Ignore Quiver rows filed before this date.",
+    help="Ignore rows filed before this date.",
 )
 @click.option("--page-size", type=int, default=250, show_default=True)
 @click.option(
@@ -802,6 +898,23 @@ def senate_feed(limit: int, provider: str) -> None:
     default=14,
     show_default=True,
     help="For quiver-bulk, replay only the most recent disclosure window to catch late amendments.",
+)
+@click.option(
+    "--since",
+    type=str,
+    default=None,
+    help=(
+        "For --provider efd: override the submitted-date window start (YYYY-MM-DD). "
+        "Defaults to the newest known Senate disclosure date minus the eFD lookback, "
+        "floored so a scheduled run never scans more than the last 60 days."
+    ),
+)
+@click.option(
+    "--max-reports",
+    type=int,
+    default=0,
+    show_default=True,
+    help="For --provider efd: hard cap on reports opened per run. 0 uses the configured cap.",
 )
 def senate_ingest_command(
     limit: int,
@@ -812,6 +925,8 @@ def senate_ingest_command(
     start_date: str,
     page_size: int,
     reconcile_lookback_days: int,
+    since: str | None,
+    max_reports: int,
 ) -> None:
     """Normalize new Senate trade rows and upsert them into CapitolExposed."""
 
@@ -820,29 +935,15 @@ def senate_ingest_command(
     if not registry:
         raise click.ClickException("Member registry is required for Senate ingest.")
 
-    feed_provider = (
-        "quiver-live" if provider == "auto" and settings.resolved_quiver_api_token else provider
-    )
-    if feed_provider == "auto":
-        feed_provider = "watcher"
+    feed_provider = resolve_senate_provider(provider, settings)
     if feed_provider == "quiver":
         feed_provider = "quiver-live"
 
-    existing_trade_ids = fetch_existing_trade_ids(
-        settings,
-        sources=(
-            ["senate_quiver", "senate-quiver"]
-            if feed_provider in {"quiver-live", "quiver-bulk"}
-            else ["senate_watcher", "senate-watcher"]
-        ),
-    )
+    source_family = senate_source_family(feed_provider)
+    existing_trade_ids = fetch_existing_trade_ids(settings, sources=source_family)
     latest_known_disclosure_date = fetch_latest_trade_disclosure_date(
         settings,
-        sources=(
-            ["senate_quiver", "senate-quiver"]
-            if feed_provider in {"quiver-live", "quiver-bulk"}
-            else ["senate_watcher", "senate-watcher"]
-        ),
+        sources=source_family,
     )
     if with_search_index:
         ensure_search_schema(settings)
@@ -862,6 +963,11 @@ def senate_ingest_command(
         "reconcileLookbackDays": reconcile_lookback_days,
         "windowStartDate": None,
         "windowEndDate": None,
+        "reportsListed": 0,
+        "electronicParsed": 0,
+        "paperDeferred": 0,
+        "paperDeferredReports": [],
+        "errors": [],
         "processedSample": [],
     }
 
@@ -886,7 +992,66 @@ def senate_ingest_command(
             search_documents.append(build_senate_trade_search_document(normalized))
         return limit > 0 and len(normalized_rows) >= limit
 
-    if feed_provider == "quiver-bulk":
+    if feed_provider == "efd":
+        submitted_since = (
+            date.fromisoformat(since)
+            if since
+            else build_efd_submitted_since(
+                latest_known_disclosure_date,
+                lookback_days=settings.senate_efd_lookback_days,
+                floor_days=settings.senate_efd_floor_days,
+            )
+        )
+        summary["windowStartDate"] = submitted_since.isoformat()
+        summary["windowEndDate"] = datetime.now(timezone.utc).date().isoformat()
+        report_cap = max_reports if max_reports > 0 else settings.senate_efd_max_reports_per_run
+
+        stop = False
+        with SenateEfdClient(settings) as efd_client:
+            reports = list_ptr_reports(
+                settings,
+                submitted_since,
+                None,
+                report_cap,
+                client=efd_client,
+            )
+            summary["reportsListed"] = len(reports)
+
+            for report in reports:
+                if report.kind != "electronic":
+                    page_images: list[str] = []
+                    try:
+                        page_images = fetch_paper_ptr_pages(efd_client, report)
+                    except Exception as error:  # noqa: BLE001 - one bad scan cannot stop the run
+                        summary["errors"].append(  # type: ignore[union-attr]
+                            {"reportId": report.report_id, "error": str(error)[:200]}
+                        )
+                    summary["paperDeferred"] = int(summary["paperDeferred"]) + 1
+                    if len(summary["paperDeferredReports"]) < 25:  # type: ignore[arg-type]
+                        summary["paperDeferredReports"].append(  # type: ignore[union-attr]
+                            build_paper_report_stub(report, page_images)
+                        )
+                    continue
+
+                try:
+                    transactions = fetch_electronic_ptr(efd_client, report)
+                except Exception as error:  # noqa: BLE001 - skip the report and keep going
+                    summary["errors"].append(  # type: ignore[union-attr]
+                        {"reportId": report.report_id, "error": str(error)[:200]}
+                    )
+                    continue
+
+                summary["electronicParsed"] = int(summary["electronicParsed"]) + 1
+                summary["fetched"] = int(summary["fetched"]) + len(transactions)
+                for transaction in transactions:
+                    stop = handle_normalized_row(
+                        normalize_efd_transaction(report, transaction, registry),
+                    )
+                    if stop:
+                        break
+                if stop:
+                    break
+    elif feed_provider == "quiver-bulk":
         reconcile_dates = build_quiver_bulk_reconcile_dates(
             start_date=start_date,
             latest_known_disclosure_date=latest_known_disclosure_date,
@@ -986,7 +1151,76 @@ def senate_ingest_command(
             }
         )
 
+    summary["tradesInserted"] = summary["tradesUpserted"]
+    summary["skipped"] = (
+        int(summary["skippedExisting"])
+        + int(summary["skippedUnresolved"])
+        + int(summary["skippedBeforeStartDate"])
+    )
+
     click.echo(json.dumps(summary, indent=2))
+
+
+@cli.command("dedupe-senate-trades")
+@click.option(
+    "--source",
+    "sources",
+    multiple=True,
+    default=DEFAULT_SENATE_DEDUPE_SOURCES,
+    show_default=True,
+    help="trades.source values to sweep. Repeat the flag for more than one.",
+)
+@click.option(
+    "--dry-run/--apply",
+    default=True,
+    show_default=True,
+    help="Dry run only reports. --apply deletes the duplicates inside one transaction.",
+)
+@click.option("--limit", type=int, default=25, show_default=True, help="Sample groups to print.")
+def dedupe_senate_trades_command(sources: tuple[str, ...], dry_run: bool, limit: int) -> None:
+    """Collapse Senate trade rows the old canonical id scheme duplicated.
+
+    Groups on (member_id, ticker, transaction_type, transaction_date,
+    amount_min, amount_max), falling back to the normalized asset description
+    when a row has no ticker, and keeps the most complete row: a non-null
+    disclosure_date first, then the longest asset_description, then the oldest
+    created_at.
+    """
+
+    settings = Settings()
+    source_list = [source.strip() for source in sources if source.strip()]
+
+    groups = fetch_duplicate_senate_trade_groups(settings, sources=source_list, limit=0)
+    duplicate_rows = sum(max(0, int(group.get("row_count") or 0) - 1) for group in groups)
+
+    summary: dict[str, object] = {
+        "mode": "dry-run" if dry_run else "apply",
+        "sources": source_list,
+        "duplicateGroups": len(groups),
+        "rowsToDelete": duplicate_rows,
+        "deleted": 0,
+        "sampleGroups": [
+            {
+                "memberId": group.get("member_id"),
+                "assetKey": group.get("asset_key"),
+                "transactionType": group.get("transaction_type"),
+                "transactionDate": group.get("transaction_date"),
+                "amountMin": group.get("amount_min"),
+                "amountMax": group.get("amount_max"),
+                "rowCount": group.get("row_count"),
+                "keepId": group.get("keep_id"),
+                "deleteIds": list(group.get("delete_ids") or []),
+            }
+            for group in groups[: max(0, limit)]
+        ],
+    }
+
+    if not dry_run and duplicate_rows:
+        result = delete_duplicate_senate_trades(settings, sources=source_list)
+        summary["deleted"] = result.get("deleted", 0)
+        summary["scanned"] = result.get("scanned", 0)
+
+    click.echo(json.dumps(summary, indent=2, default=str))
 
 
 @cli.command("backfill-senate-search")

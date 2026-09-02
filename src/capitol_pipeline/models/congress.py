@@ -10,6 +10,7 @@ DisclosureSource = Literal[
     "house-clerk",
     "senate-quiver",
     "senate-watcher",
+    "senate-efd",
     "senate-ethics",
     "fec",
     "lda",

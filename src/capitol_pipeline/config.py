@@ -108,6 +108,17 @@ class Settings(BaseSettings):
         "senate-stock-watcher-data/master/aggregate/all_transactions.json"
     )
     quiver_api_token: str | None = None
+    # Official Senate eFD scraper (free replacement for Quiver / senate-stock-watcher).
+    senate_efd_base_url: str = "https://efdsearch.senate.gov"
+    senate_efd_user_agent: str = (
+        "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) "
+        "Chrome/128.0.0.0 Safari/537.36 CapitolExposedPipeline/1.0 "
+        "(+https://www.capitolexposed.com)"
+    )
+    senate_efd_request_interval_seconds: float = 1.05
+    senate_efd_max_reports_per_run: int = 200
+    senate_efd_lookback_days: int = 14
+    senate_efd_floor_days: int = 60
     offshore_leaks_zip_url: str = (
         "https://offshoreleaks-data.icij.org/offshoreleaks/csv/full-oldb.LATEST.zip"
     )

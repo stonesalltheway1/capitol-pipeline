@@ -12,7 +12,8 @@ PTR filings and asset normalization.
 - Transplanted multi-backend OCR core from Epstein-Pipeline
 - Capitol-specific package and settings
 - House Clerk XML source adapter
-- Senate watcher source adapter
+- Official Senate eFD (efdsearch.senate.gov) scraper for Periodic Transaction Reports
+- Senate watcher and Quiver source adapters (both now legacy)
 - House PTR parser for text and PDF-backed filings
 - CapitolExposed-compatible member registry resolution
 - Crypto asset classifier for direct coins, ETFs and trusts, and adjacent equities
@@ -46,11 +47,21 @@ capitol-pipeline house-feed --year 2026
 # Sync House filing stubs into CapitolExposed and resolve members first
 capitol-pipeline sync-house-feed --year 2026
 
-# Inspect the current Senate watcher aggregate feed
-capitol-pipeline senate-feed
+# Inspect the official Senate eFD Periodic Transaction Report feed
+capitol-pipeline senate-feed --provider efd --limit 10
 
-# Normalize new Senate watcher rows and write them into CapitolExposed
-capitol-pipeline senate-ingest --with-search-index
+# ...including each report's parsed rows
+capitol-pipeline senate-feed --provider efd --limit 3 --with-transactions
+
+# Scrape efdsearch.senate.gov and write new Senate trades into CapitolExposed
+capitol-pipeline senate-ingest --provider efd --with-search-index --no-embeddings
+
+# Backfill a wider eFD window (submitted-date based, capped per run)
+capitol-pipeline senate-ingest --provider efd --since 2026-01-01 --max-reports 400
+
+# Collapse Senate trades the old canonical id scheme duplicated
+capitol-pipeline dedupe-senate-trades --dry-run
+capitol-pipeline dedupe-senate-trades --apply
 
 # Classify a raw asset
 capitol-pipeline classify-crypto --ticker IBIT --description "iShares Bitcoin Trust ETF"
@@ -150,6 +161,38 @@ Set these repository secrets before enabling the schedules:
 
 Operational details and recovery commands live in
 [docs/OPERATIONS.md](docs/OPERATIONS.md).
+
+## Senate Trade Sources
+
+Senate PTRs now come from the official disclosure site rather than a paid API:
+
+| Provider | Status |
+|---|---|
+| `efd` | **Current.** Scrapes `https://efdsearch.senate.gov` directly. Free, no key. |
+| `quiver-live` / `quiver-bulk` | Legacy. Needs `QUIVER_API_TOKEN`; the subscription lapsed and returns 403. |
+| `watcher` | Dead. The senate-stock-watcher aggregate feed has been frozen since 2020. |
+
+`--provider auto` picks `quiver-live` while a Quiver token is configured and
+otherwise falls back to `efd`. It never falls back to the watcher feed.
+
+The eFD scraper accepts the site's prohibition agreement once per session, holds
+the resulting cookies, waits at least a second between requests, retries 5xx and
+429, and stops after `CAPITOL_SENATE_EFD_MAX_REPORTS_PER_RUN` reports (200 by
+default) so a 30-minute timer stays cheap. Electronic filings
+(`/search/view/ptr/...`) are parsed from their HTML transaction table with the
+standard library HTML parser. Scanned paper filings (`/search/view/paper/...`)
+are page-image GIFs that the PDF-only OCR chain cannot read, so they are
+recorded in the run summary as `needs_review` with their page-image URLs and
+skipped.
+
+Relevant settings (all `CAPITOL_`-prefixed environment variables):
+
+- `CAPITOL_SENATE_EFD_BASE_URL`
+- `CAPITOL_SENATE_EFD_USER_AGENT`
+- `CAPITOL_SENATE_EFD_REQUEST_INTERVAL_SECONDS`
+- `CAPITOL_SENATE_EFD_MAX_REPORTS_PER_RUN`
+- `CAPITOL_SENATE_EFD_LOOKBACK_DAYS`
+- `CAPITOL_SENATE_EFD_FLOOR_DAYS`
 
 ## Search Layer
 
