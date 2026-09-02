@@ -11,8 +11,6 @@ on:
         description: Only revisit companies older than this many days
         required: false
         default: "14"
-  schedule:
-    - cron: "17 5 * * *"
 
 concurrency:
   group: usaspending-refresh

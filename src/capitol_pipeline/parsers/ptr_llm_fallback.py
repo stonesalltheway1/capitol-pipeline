@@ -18,7 +18,7 @@ from typing import Any
 
 logger = logging.getLogger(__name__)
 
-MODEL_ID = "claude-haiku-4-5-20251001"
+MODEL_ID = "claude-haiku-4-5"
 MAX_PDF_BYTES = 25 * 1024 * 1024
 MAX_OUTPUT_TOKENS = 8192
 

@@ -11,9 +11,6 @@ on:
         description: Max embedding batches to run, 0 drains the queue
         required: false
         default: "30"
-  schedule:
-    - cron: "23 6 * * *"
-    - cron: "23 18 * * *"
 
 concurrency:
   group: corpus-refresh

@@ -19,10 +19,6 @@ name: Keepalive
 # somewhere to add an outside dependency for the sake of ten lines of shell.
 
 on:
-  schedule:
-    # 1st and 15th at 05:11 UTC. Off the hour on purpose; GitHub delays
-    # scheduled runs that land on a busy minute, and :00 is the worst of them.
-    - cron: "11 5 1,15 * *"
   workflow_dispatch:
     inputs:
       force:

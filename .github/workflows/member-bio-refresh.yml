@@ -15,12 +15,6 @@ on:
         description: Cap on Bioguide profileText fetches per run, blank for all
         required: false
         default: "150"
-  schedule:
-    # Sundays at 04:17 UTC — off-peak for the public infra we hit (Wikidata,
-    # Bioguide, congress.gov, unitedstates/images CDN). Single weekly cadence is
-    # plenty: roster changes are rare outside swearing-in days, and Wikidata
-    # infobox edits propagate within a week of any real-world event.
-    - cron: "17 4 * * 0"
 
 concurrency:
   group: member-bio-refresh

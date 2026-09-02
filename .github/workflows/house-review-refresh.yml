@@ -2,8 +2,6 @@ name: House Review Refresh
 
 on:
   workflow_dispatch:
-  schedule:
-    - cron: "17 */6 * * *"
 
 concurrency:
   group: house-review-refresh

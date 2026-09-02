@@ -2,8 +2,6 @@ name: Senate Reconcile
 
 on:
   workflow_dispatch:
-  schedule:
-    - cron: "45 4 * * *"
 
 concurrency:
   group: senate-reconcile
