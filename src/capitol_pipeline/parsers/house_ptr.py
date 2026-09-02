@@ -165,6 +165,13 @@ def clean_asset_description(raw: str, ticker: str | None) -> str:
     full_word = re.match(r"^.*?(?:Description:)\s*(.+)$", cleaned, flags=re.I)
     if full_word and re.search(r"(?:Filing Status|Subholding Of|Location:)", cleaned, flags=re.I):
         cleaned = full_word.group(1).strip()
+    else:
+        subholding = re.search(r"Subholding Of:\s*(.+)$", cleaned, flags=re.I)
+        if subholding:
+            rest = subholding.group(1).strip()
+            after_account = re.search(r"\(\d+\)\s*(\S.*)$", rest)
+            cleaned = (after_account.group(1) if after_account else rest).strip()
+    cleaned = re.sub(r"^\s*F?iling Status:\s*New\s*", "", cleaned, flags=re.I)
     cleaned = re.sub(r"^(?:F\s+)?S:\s+New\s+", "", cleaned, flags=re.I)
     cleaned = re.sub(r"^S\s+O:\s+", "", cleaned, flags=re.I)
     cleaned = re.sub(r"^Trust\s+", "", cleaned, flags=re.I)
