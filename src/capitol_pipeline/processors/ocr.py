@@ -61,6 +61,23 @@ class OcrResult:
 # ---------------------------------------------------------------------------
 
 
+
+# Some House PTR PDFs embed a subset font whose lowercase glyphs extract as IPA
+# characters (U+0283..U+029C, i.e. ord(letter) + 0x222). Map them back so the
+# text layer reads as English before any parsing happens.
+_FONT_MOJIBAKE = str.maketrans(
+    "ʃʄʅʆʇʈʉʊʋʌʍʎʏʐʑʒʓʔʕʖʗʘʙʚʛʜ",
+    "abcdefghijklmnopqrstuvwxyz",
+)
+
+
+def fix_font_mojibake(text: str) -> str:
+    """Reverse the +0x222 lowercase shift some subset fonts produce."""
+    if not text:
+        return text
+    return text.translate(_FONT_MOJIBAKE)
+
+
 class OcrBackendBase(ABC):
     """Abstract base class for OCR backends."""
 
@@ -146,7 +163,7 @@ class PyMuPDFBackend(OcrBackendBase):
         pages_text: list[str] = []
         try:
             for page in doc:
-                pages_text.append(page.get_text())
+                pages_text.append(fix_font_mojibake(page.get_text()))
         finally:
             doc.close()
 

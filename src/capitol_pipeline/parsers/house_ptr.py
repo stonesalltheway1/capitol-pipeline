@@ -17,7 +17,7 @@ from capitol_pipeline.models.congress import (
 )
 from capitol_pipeline.normalizers.crypto_assets import classify_crypto_asset
 from capitol_pipeline.parsers.ptr_llm_fallback import extract_via_haiku
-from capitol_pipeline.processors.ocr import OcrProcessor
+from capitol_pipeline.processors.ocr import fix_font_mojibake, OcrProcessor
 
 logger = logging.getLogger(__name__)
 
@@ -129,6 +129,7 @@ def infer_asset_type(raw: str | None) -> str:
 
 
 def clean_asset_description(raw: str, ticker: str | None) -> str:
+    raw = fix_font_mojibake(raw)
     cleaned = squeeze_spaces(
         re.sub(
             r"\* For the complete list of asset type abbreviations.*$",
@@ -161,6 +162,9 @@ def clean_asset_description(raw: str, ticker: str | None) -> str:
         if descriptor_after_d and re.search(r"(?:Trust|S O:|Investment Fund|Capital call)", cleaned, flags=re.I):
             cleaned = descriptor_after_d.group(1).strip()
 
+    full_word = re.match(r"^.*?(?:Description:)\s*(.+)$", cleaned, flags=re.I)
+    if full_word and re.search(r"(?:Filing Status|Subholding Of|Location:)", cleaned, flags=re.I):
+        cleaned = full_word.group(1).strip()
     cleaned = re.sub(r"^(?:F\s+)?S:\s+New\s+", "", cleaned, flags=re.I)
     cleaned = re.sub(r"^S\s+O:\s+", "", cleaned, flags=re.I)
     cleaned = re.sub(r"^Trust\s+", "", cleaned, flags=re.I)
