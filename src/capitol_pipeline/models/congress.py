@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from typing import Literal
+from typing import Any, Literal
 
 from pydantic import BaseModel, Field
 
@@ -63,6 +63,10 @@ class FilingStub(BaseModel):
     source: DisclosureSource = "house-clerk"
     source_url: str
     raw_state_district: str | None = None
+    # The stub's previous ``metadata.visionParse`` and ``parsedTransactions``,
+    # hydrated from the review queue so an unchanged PDF is not read again.
+    # Never serialized: the exporter writes stubs field by field.
+    prior_vision: dict[str, Any] | None = Field(default=None, exclude=True)
 
 
 class HousePtrTransaction(BaseModel):
@@ -98,6 +102,14 @@ class HousePtrParseResult(BaseModel):
     # estimated cost, legibility counts, skip reason). Written to the stub's
     # ``metadata.visionParse``; None whenever the vision path never ran.
     vision_report: dict[str, object] | None = None
+    # What pymupdf found before any OCR ran (page counts, text-layer chars,
+    # whether OCR was skipped, capped or completed). Written to the stub's
+    # ``metadata.textLayer``.
+    text_layer: dict[str, object] | None = None
+    # Why a filing produced no rows, for the stub's ``lastError``: a typed
+    # text layer the segmenter could not split, an image-only scan whose OCR
+    # timed out, and so on. None whenever at least one row was parsed.
+    review_reason: str | None = None
 
 
 class NormalizedAsset(BaseModel):

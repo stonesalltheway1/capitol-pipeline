@@ -61,6 +61,10 @@ class Settings(BaseSettings):
     ocr_fallback_chain: list[str] = ["pymupdf", "surya", "olmocr", "docling"]
     ocr_default_source: str = "manual"
     ocr_default_category: str = "other"
+    # Wall-clock budget for the OCR chain on one image-only House PTR. The
+    # chain runs in a child process that is killed at the cap; 0 disables the
+    # cap and runs OCR inline. Typed PDFs never enter the chain.
+    ptr_ocr_time_cap_seconds: int = 240
 
     # ── NER settings ─────────────────────────────────────────────────────
     spacy_model: str = "en_core_web_trf"  # upgraded from en_core_web_sm

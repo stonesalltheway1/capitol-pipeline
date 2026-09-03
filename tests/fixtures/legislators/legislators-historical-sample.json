@@ -1,0 +1,661 @@
+[
+ {
+  "id": {
+   "bioguide": "L000564",
+   "thomas": "01834",
+   "govtrack": 412191,
+   "opensecrets": "N00028133",
+   "votesmart": 2698,
+   "fec": [
+    "H6CO05159"
+   ],
+   "cspan": 1022846,
+   "wikipedia": "Doug Lamborn",
+   "house_history": 17305,
+   "ballotpedia": "Doug Lamborn",
+   "maplight": 678,
+   "icpsr": 20704,
+   "wikidata": "Q371106",
+   "google_entity_id": "kg:/m/0fsgdd",
+   "pictorial": 12971
+  },
+  "name": {
+   "first": "Doug",
+   "last": "Lamborn",
+   "official_full": "Doug Lamborn"
+  },
+  "bio": {
+   "birthday": "1954-05-24",
+   "gender": "M"
+  },
+  "terms": [
+   {
+    "type": "rep",
+    "start": "2021-01-03",
+    "end": "2023-01-03",
+    "state": "CO",
+    "district": 5,
+    "party": "Republican",
+    "url": "https://lamborn.house.gov",
+    "rss_url": "http://lamborn.house.gov/news-rss-graphic/news-rss-graphic/",
+    "address": "2371 Rayburn House Office Building Washington DC 20515-0605",
+    "office": "2371 Rayburn House Office Building",
+    "phone": "202-225-4422"
+   },
+   {
+    "type": "rep",
+    "start": "2023-01-03",
+    "end": "2025-01-03",
+    "state": "CO",
+    "district": 5,
+    "party": "Republican",
+    "url": "https://lamborn.house.gov",
+    "rss_url": "http://lamborn.house.gov/news-rss-graphic/news-rss-graphic/",
+    "address": "2371 Rayburn House Office Building Washington DC 20515-0605",
+    "office": "2371 Rayburn House Office Building",
+    "phone": "202-225-4422"
+   }
+  ]
+ },
+ {
+  "id": {
+   "bioguide": "B000574",
+   "thomas": "00099",
+   "govtrack": 400033,
+   "opensecrets": "N00007727",
+   "votesmart": 367,
+   "fec": [
+    "H6OR03064"
+   ],
+   "cspan": 43809,
+   "wikipedia": "Earl Blumenauer",
+   "house_history": 9518,
+   "ballotpedia": "Earl Blumenauer",
+   "maplight": 152,
+   "icpsr": 29588,
+   "wikidata": "Q748066",
+   "google_entity_id": "kg:/m/033tw8",
+   "pictorial": 13217
+  },
+  "name": {
+   "first": "Earl",
+   "last": "Blumenauer",
+   "official_full": "Earl Blumenauer"
+  },
+  "bio": {
+   "birthday": "1948-08-16",
+   "gender": "M"
+  },
+  "terms": [
+   {
+    "type": "rep",
+    "start": "2021-01-03",
+    "end": "2023-01-03",
+    "state": "OR",
+    "district": 3,
+    "party": "Democrat",
+    "url": "https://blumenauer.house.gov",
+    "rss_url": "http://blumenauer.house.gov/index.php?format=feed&amp;type=rss",
+    "address": "1111 Longworth House Office Building Washington DC 20515-3703",
+    "office": "1111 Longworth House Office Building",
+    "phone": "202-225-4811"
+   },
+   {
+    "type": "rep",
+    "start": "2023-01-03",
+    "end": "2025-01-03",
+    "state": "OR",
+    "district": 3,
+    "party": "Democrat",
+    "url": "https://blumenauer.house.gov",
+    "rss_url": "http://blumenauer.house.gov/index.php?format=feed&amp;type=rss",
+    "address": "1111 Longworth House Office Building Washington DC 20515-3703",
+    "office": "1111 Longworth House Office Building",
+    "phone": "202-225-4811"
+   }
+  ]
+ },
+ {
+  "id": {
+   "bioguide": "G000596",
+   "fec": [
+    "H0GA06192"
+   ],
+   "opensecrets": "N00044701",
+   "govtrack": 456814,
+   "wikidata": "Q98380406",
+   "wikipedia": "Marjorie Taylor Greene",
+   "google_entity_id": "kg:/g/11fscs046n",
+   "ballotpedia": "Marjorie Taylor Greene",
+   "votesmart": 189785,
+   "pictorial": 13023
+  },
+  "name": {
+   "first": "Marjorie",
+   "middle": "Taylor",
+   "last": "Greene",
+   "official_full": "Marjorie Taylor Greene"
+  },
+  "bio": {
+   "gender": "F",
+   "birthday": "1974-05-27"
+  },
+  "terms": [
+   {
+    "type": "rep",
+    "start": "2023-01-03",
+    "end": "2025-01-03",
+    "state": "GA",
+    "district": 14,
+    "party": "Republican",
+    "url": "https://greene.house.gov",
+    "address": "403 Cannon House Office Building Washington DC 20515-1014",
+    "office": "403 Cannon House Office Building",
+    "phone": "202-225-5211"
+   },
+   {
+    "type": "rep",
+    "start": "2025-01-03",
+    "end": "2026-01-05",
+    "state": "GA",
+    "district": 14,
+    "party": "Republican",
+    "url": "https://greene.house.gov",
+    "address": "2201 Rayburn House Office Building Washington DC 20515-1014",
+    "office": "2201 Rayburn House Office Building",
+    "phone": "202-225-5211"
+   }
+  ]
+ },
+ {
+  "id": {
+   "bioguide": "C001078",
+   "thomas": "01959",
+   "govtrack": 412272,
+   "opensecrets": "N00029891",
+   "votesmart": 95078,
+   "fec": [
+    "H8VA11062"
+   ],
+   "cspan": 64005,
+   "wikipedia": "Gerry Connolly",
+   "house_history": 11817,
+   "maplight": 754,
+   "icpsr": 20952,
+   "wikidata": "Q1514859",
+   "google_entity_id": "kg:/m/04f40kn",
+   "ballotpedia": "Gerald Connolly",
+   "pictorial": 13309
+  },
+  "name": {
+   "first": "Gerald",
+   "middle": "E.",
+   "last": "Connolly",
+   "official_full": "Gerald E. Connolly"
+  },
+  "bio": {
+   "birthday": "1950-03-30",
+   "gender": "M"
+  },
+  "terms": [
+   {
+    "type": "rep",
+    "start": "2023-01-03",
+    "end": "2025-01-03",
+    "state": "VA",
+    "district": 11,
+    "party": "Democrat",
+    "url": "https://connolly.house.gov",
+    "rss_url": "http://connolly.house.gov/common/rss//index.cfm?rss=44",
+    "address": "2265 Rayburn House Office Building Washington DC 20515-4611",
+    "office": "2265 Rayburn House Office Building",
+    "phone": "202-225-1492"
+   },
+   {
+    "type": "rep",
+    "start": "2025-01-03",
+    "end": "2025-05-21",
+    "state": "VA",
+    "district": 11,
+    "party": "Democrat",
+    "url": "https://connolly.house.gov",
+    "rss_url": "http://connolly.house.gov/common/rss//index.cfm?rss=44",
+    "address": "2265 Rayburn House Office Building Washington DC 20515-4611",
+    "office": "2265 Rayburn House Office Building",
+    "phone": "202-225-1492"
+   }
+  ]
+ },
+ {
+  "id": {
+   "bioguide": "M001135",
+   "fec": [
+    "H8NC13067"
+   ],
+   "opensecrets": "N00042159",
+   "govtrack": 456832,
+   "wikidata": "Q101136890",
+   "wikipedia": "Kathy Manning",
+   "google_entity_id": "kg:/g/11dxpjz93v",
+   "pictorial": 13135
+  },
+  "name": {
+   "first": "Kathy",
+   "middle": "Ellen",
+   "last": "Manning",
+   "official_full": "Kathy E. Manning"
+  },
+  "bio": {
+   "gender": "F",
+   "birthday": "1956-12-03"
+  },
+  "terms": [
+   {
+    "type": "rep",
+    "start": "2021-01-03",
+    "end": "2023-01-03",
+    "state": "NC",
+    "district": 6,
+    "party": "Democrat",
+    "address": "415 Cannon House Office Building Washington DC 20515-3306",
+    "office": "415 Cannon House Office Building",
+    "phone": "202-225-3065",
+    "url": "https://manning.house.gov"
+   },
+   {
+    "type": "rep",
+    "start": "2023-01-03",
+    "end": "2025-01-03",
+    "state": "NC",
+    "district": 6,
+    "party": "Democrat",
+    "url": "https://manning.house.gov",
+    "address": "307 Cannon House Office Building Washington DC 20515-3306",
+    "office": "307 Cannon House Office Building",
+    "phone": "202-225-3065"
+   }
+  ]
+ },
+ {
+  "id": {
+   "bioguide": "B001248",
+   "thomas": "01751",
+   "govtrack": 400052,
+   "opensecrets": "N00025219",
+   "votesmart": 50120,
+   "fec": [
+    "H2TX26093"
+   ],
+   "cspan": 1003620,
+   "wikipedia": "Michael C. Burgess",
+   "house_history": 10395,
+   "maplight": 171,
+   "icpsr": 20355,
+   "wikidata": "Q539521",
+   "google_entity_id": "kg:/m/03tq8_",
+   "pictorial": 13283
+  },
+  "name": {
+   "first": "Michael",
+   "middle": "C.",
+   "last": "Burgess",
+   "official_full": "Michael C. Burgess"
+  },
+  "bio": {
+   "birthday": "1950-12-23",
+   "gender": "M"
+  },
+  "terms": [
+   {
+    "type": "rep",
+    "start": "2021-01-03",
+    "end": "2023-01-03",
+    "state": "TX",
+    "district": 26,
+    "party": "Republican",
+    "url": "https://burgess.house.gov",
+    "rss_url": "http://burgess.house.gov/news/rss.aspx",
+    "address": "2161 Rayburn House Office Building Washington DC 20515-4326",
+    "office": "2161 Rayburn House Office Building",
+    "phone": "202-225-7772"
+   },
+   {
+    "type": "rep",
+    "start": "2023-01-03",
+    "end": "2025-01-03",
+    "state": "TX",
+    "district": 26,
+    "party": "Republican",
+    "url": "https://burgess.house.gov",
+    "rss_url": "http://burgess.house.gov/news/rss.aspx",
+    "address": "2161 Rayburn House Office Building Washington DC 20515-4326",
+    "office": "2161 Rayburn House Office Building",
+    "phone": "202-225-7772"
+   }
+  ]
+ },
+ {
+  "id": {
+   "bioguide": "W000828",
+   "fec": [
+    "H2NY22212"
+   ],
+   "govtrack": 456926,
+   "opensecrets": "N00050433",
+   "wikipedia": "Brandon Williams (politician)",
+   "votesmart": 206001,
+   "wikidata": "Q115805431",
+   "pictorial": 13190,
+   "ballotpedia": "Brandon Williams (New York)",
+   "google_entity_id": "kg:/g/11q3s03t3w"
+  },
+  "name": {
+   "first": "Brandon",
+   "middle": "McDonald",
+   "last": "Williams",
+   "official_full": "Brandon Williams"
+  },
+  "bio": {
+   "gender": "M",
+   "birthday": "1967-05-22"
+  },
+  "terms": [
+   {
+    "type": "rep",
+    "start": "2023-01-03",
+    "end": "2025-01-03",
+    "state": "NY",
+    "district": 22,
+    "party": "Republican",
+    "url": "https://brandonwilliams.house.gov",
+    "address": "1022 Longworth House Office Building Washington DC 20515-3222",
+    "office": "1022 Longworth House Office Building",
+    "phone": "202-225-3701"
+   }
+  ]
+ },
+ {
+  "id": {
+   "bioguide": "M000639",
+   "thomas": "00791",
+   "lis": "S306",
+   "govtrack": 400272,
+   "opensecrets": "N00000699",
+   "votesmart": 26961,
+   "fec": [
+    "H2NJ13075",
+    "S6NJ00289"
+   ],
+   "cspan": 29608,
+   "house_history": 18124,
+   "wikipedia": "Bob Menendez",
+   "ballotpedia": "Bob Menendez",
+   "maplight": 368,
+   "icpsr": 29373,
+   "wikidata": "Q888132",
+   "google_entity_id": "kg:/m/033d3p"
+  },
+  "name": {
+   "first": "Robert",
+   "last": "Menendez",
+   "nickname": "Bob",
+   "official_full": "Robert Menendez"
+  },
+  "other_names": [
+   {
+    "last": "Menendez"
+   }
+  ],
+  "bio": {
+   "birthday": "1954-01-01",
+   "gender": "M"
+  },
+  "terms": [
+   {
+    "type": "sen",
+    "start": "2013-01-03",
+    "end": "2019-01-03",
+    "state": "NJ",
+    "party": "Democrat",
+    "class": 1,
+    "url": "https://www.menendez.senate.gov",
+    "address": "528 Hart Senate Office Building Washington DC 20510",
+    "phone": "202-224-4744",
+    "fax": "202-228-2197",
+    "contact_form": "https://www.menendez.senate.gov/contact",
+    "office": "528 Hart Senate Office Building",
+    "state_rank": "senior",
+    "rss_url": "http://www.menendez.senate.gov/rss/feeds/index.cfm?type=news"
+   },
+   {
+    "type": "sen",
+    "start": "2019-01-03",
+    "end": "2024-08-20",
+    "state": "NJ",
+    "class": 1,
+    "party": "Democrat",
+    "state_rank": "senior",
+    "url": "https://www.menendez.senate.gov",
+    "rss_url": "http://www.menendez.senate.gov/rss/feeds/index.cfm?type=news",
+    "contact_form": "https://www.menendez.senate.gov/contact",
+    "address": "528 Hart Senate Office Building Washington DC 20510",
+    "office": "528 Hart Senate Office Building",
+    "phone": "202-224-4744"
+   }
+  ]
+ },
+ {
+  "id": {
+   "bioguide": "R000572",
+   "thomas": "01651",
+   "govtrack": 400342,
+   "opensecrets": "N00009668",
+   "votesmart": 8751,
+   "fec": [
+    "H0MI08042"
+   ],
+   "cspan": 86133,
+   "house_history": 20789,
+   "wikipedia": "Mike Rogers (Michigan politician)",
+   "ballotpedia": "Mike Rogers (Michigan)",
+   "maplight": 435,
+   "icpsr": 20120,
+   "wikidata": "Q970515",
+   "google_entity_id": "kg:/m/0258zm"
+  },
+  "name": {
+   "first": "Mike",
+   "last": "Rogers",
+   "official_full": "Mike Rogers"
+  },
+  "bio": {
+   "birthday": "1963-06-02",
+   "gender": "M"
+  },
+  "terms": [
+   {
+    "type": "rep",
+    "start": "2011-01-05",
+    "end": "2013-01-03",
+    "state": "MI",
+    "district": 8,
+    "party": "Republican",
+    "url": "http://www.house.gov/mikerogers",
+    "address": "133 Cannon HOB; Washington DC 20515-2208",
+    "phone": "202-225-4872",
+    "fax": "202-225-5820",
+    "contact_form": "http://www.mikerogers.house.gov/Contact.aspx",
+    "office": "133 Cannon House Office Building"
+   },
+   {
+    "type": "rep",
+    "start": "2013-01-03",
+    "end": "2015-01-03",
+    "state": "MI",
+    "party": "Republican",
+    "district": 8,
+    "url": "http://mikerogers.house.gov",
+    "address": "2112 Rayburn HOB; Washington DC 20515-2208",
+    "phone": "202-225-4872",
+    "fax": "202-225-5820",
+    "contact_form": "https://mikerogers.house.gov/contact/contactform.htm?zip5=48915",
+    "office": "2112 Rayburn House Office Building",
+    "rss_url": "http://mikerogers.house.gov/news/rss.aspx"
+   }
+  ]
+ },
+ {
+  "id": {
+   "bioguide": "F000062",
+   "thomas": "01332",
+   "lis": "S221",
+   "govtrack": 300043,
+   "opensecrets": "N00007364",
+   "votesmart": 53273,
+   "fec": [
+    "S0CA00199"
+   ],
+   "cspan": 13061,
+   "wikipedia": "Dianne Feinstein",
+   "house_history": 13044,
+   "ballotpedia": "Dianne Feinstein",
+   "maplight": 567,
+   "icpsr": 49300,
+   "wikidata": "Q230733",
+   "google_entity_id": "kg:/m/01gqws"
+  },
+  "name": {
+   "first": "Dianne",
+   "last": "Feinstein",
+   "official_full": "Dianne Feinstein"
+  },
+  "bio": {
+   "birthday": "1933-06-22",
+   "gender": "F"
+  },
+  "terms": [
+   {
+    "type": "sen",
+    "start": "2013-01-03",
+    "end": "2019-01-03",
+    "state": "CA",
+    "party": "Democrat",
+    "class": 1,
+    "url": "https://www.feinstein.senate.gov",
+    "address": "331 Hart Senate Office Building Washington DC 20510",
+    "phone": "202-224-3841",
+    "fax": "202-228-3954",
+    "contact_form": "https://www.feinstein.senate.gov/public/index.cfm/e-mail-me",
+    "office": "331 Hart Senate Office Building",
+    "state_rank": "senior",
+    "rss_url": "http://www.feinstein.senate.gov/public/?a=rss.feed"
+   },
+   {
+    "type": "sen",
+    "start": "2019-01-03",
+    "end": "2023-09-28",
+    "state": "CA",
+    "class": 1,
+    "party": "Democrat",
+    "state_rank": "senior",
+    "url": "https://www.feinstein.senate.gov",
+    "rss_url": "http://www.feinstein.senate.gov/public/?a=rss.feed",
+    "contact_form": "https://www.feinstein.senate.gov/public/index.cfm/e-mail-me",
+    "address": "331 Hart Senate Office Building Washington DC 20510",
+    "office": "331 Hart Senate Office Building",
+    "phone": "202-224-3841"
+   }
+  ]
+ },
+ {
+  "id": {
+   "bioguide": "D000549",
+   "thomas": "00324",
+   "govtrack": 400117,
+   "opensecrets": "N00007823",
+   "wikipedia": "Jennifer Dunn",
+   "house_history": 12510,
+   "icpsr": 39312,
+   "wikidata": "Q518997",
+   "google_entity_id": "kg:/m/024zp4",
+   "fec": [
+    "H2WA08075"
+   ]
+  },
+  "name": {
+   "first": "Jennifer",
+   "middle": "B.",
+   "last": "Dunn"
+  },
+  "bio": {
+   "birthday": "1941-07-29",
+   "gender": "F"
+  },
+  "terms": [
+   {
+    "type": "rep",
+    "start": "2001-01-03",
+    "end": "2003-01-03",
+    "state": "WA",
+    "district": 8,
+    "party": "Republican"
+   },
+   {
+    "type": "rep",
+    "start": "2003-01-07",
+    "end": "2005-01-03",
+    "state": "WA",
+    "district": 8,
+    "party": "Republican",
+    "url": "http://www.house.gov/dunn"
+   }
+  ]
+ },
+ {
+  "id": {
+   "bioguide": "G000554",
+   "thomas": "01831",
+   "govtrack": 412188,
+   "opensecrets": "N00027829",
+   "votesmart": 28507,
+   "fec": [
+    "H6AZ08038"
+   ],
+   "cspan": 1021830,
+   "wikipedia": "Gabby Giffords",
+   "house_history": 14267,
+   "icpsr": 20701,
+   "wikidata": "Q193703",
+   "google_entity_id": "kg:/m/0dvl98"
+  },
+  "name": {
+   "first": "Gabrielle",
+   "last": "Giffords"
+  },
+  "bio": {
+   "gender": "F",
+   "birthday": "1970-06-08"
+  },
+  "terms": [
+   {
+    "type": "rep",
+    "start": "2009-01-06",
+    "end": "2011-01-03",
+    "state": "AZ",
+    "district": 8,
+    "party": "Democrat",
+    "url": "http://giffords.house.gov"
+   },
+   {
+    "type": "rep",
+    "start": "2011-01-05",
+    "end": "2012-01-25",
+    "state": "AZ",
+    "district": 8,
+    "party": "Democrat",
+    "url": "http://giffords.house.gov",
+    "address": "1030 Longworth House Office Building;  20515-0308"
+   }
+  ]
+ }
+]

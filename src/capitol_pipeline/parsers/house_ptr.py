@@ -2,7 +2,8 @@
 
 from __future__ import annotations
 
-from datetime import date
+from datetime import date, datetime, timedelta, timezone
+import hashlib
 import logging
 import re
 from pathlib import Path
@@ -19,6 +20,7 @@ from capitol_pipeline.normalizers.crypto_assets import classify_crypto_asset
 from capitol_pipeline.parsers.ptr_llm_fallback import extract_via_haiku
 from capitol_pipeline.parsers.ptr_vision import (
     VISION_PARSER_VERSION,
+    VISION_REUSE_MAX_AGE_DAYS,
     build_vision_metadata,
     extract_via_vision,
     scrub_example_row_values,
@@ -942,6 +944,84 @@ def _run_vision_parse(
     even when no usable rows came back.
     """
 
+    pdf_sha256 = hashlib.sha256(pdf_path.read_bytes()).hexdigest()
+
+    def _reusable_vision_report(candidate: object) -> dict | None:
+        """The stub's previous visionParse, if it can stand in for a new read."""
+
+        if not isinstance(candidate, dict) or not candidate.get("ok"):
+            return None
+        if candidate.get("parserVersion") != VISION_PARSER_VERSION:
+            return None
+        if candidate.get("pdfSha256") != pdf_sha256:
+            return None
+        stamp = str(candidate.get("at") or "")
+        try:
+            when = datetime.fromisoformat(stamp.replace("Z", "+00:00"))
+        except ValueError:
+            return None
+        if when.tzinfo is None:
+            when = when.replace(tzinfo=timezone.utc)
+        if datetime.now(timezone.utc) - when > timedelta(days=VISION_REUSE_MAX_AGE_DAYS):
+            return None
+        return candidate
+
+    # Reuse the stub's previous transcription when the PDF is unchanged and the
+    # result is recent: a stub that bounced for a reason unrelated to the read
+    # (an unresolved member, say) should not pay for two more reads.
+    prior = getattr(stub, "prior_vision", None)
+    reused = _reusable_vision_report(prior.get("visionParse") if isinstance(prior, dict) else None)
+    if reused is not None:
+        prior_rows = prior.get("parsedTransactions") if isinstance(prior, dict) else None
+        try:
+            cached = [
+                HousePtrTransaction(**row)
+                for row in (prior_rows or [])
+                if isinstance(row, dict)
+            ]
+        except Exception as exc:  # noqa: BLE001 - fall through to a fresh read
+            logger.warning("house_ptr vision: cached rows for %s unusable (%s)", pdf_path.name, exc)
+            cached = []
+        valid_cached = [
+            transaction
+            for transaction in cached
+            if get_transaction_date_issue(transaction.transaction_date, stub.filing_date) is None
+        ]
+        if valid_cached or reused.get("noTransactions"):
+            metadata = {
+                **reused,
+                "reused": True,
+                "reusedFrom": reused.get("at"),
+                "originalCostUsd": reused.get("costUsd"),
+                "costUsd": 0.0,
+                "usage": {
+                    "inputTokens": 0,
+                    "cacheReadTokens": 0,
+                    "cacheWriteTokens": 0,
+                    "outputTokens": 0,
+                },
+                "calls": [],
+                "rowsTranscribed": len(cached),
+                "rowsRecovered": len(valid_cached),
+            }
+            parsed = HousePtrParseResult(
+                doc_id=stub.doc_id,
+                member_name=parse_header_name(text_preview) or stub.member.name,
+                state=parse_header_state(text_preview) or stub.member.state,
+                parser_confidence=float(reused.get("confidence") or 0.0),
+                parser_version=VISION_PARSER_VERSION,
+                raw_text_preview=text_preview[:1200],
+                transactions=valid_cached,
+                vision_report=metadata,
+            )
+            logger.info(
+                "house_ptr vision: reused the %s transcription of %s (%d rows, no new spend)",
+                reused.get("at"),
+                pdf_path.name,
+                len(valid_cached),
+            )
+            return (parsed, build_trade_rows_from_house_ptr(parsed, stub)), metadata
+
     try:
         report = extract_via_vision(
             pdf_path,
@@ -986,6 +1066,29 @@ def _run_vision_parse(
         )
 
     if not raw_transactions:
+        metadata["rowsTranscribed"] = 0
+        metadata["rowsRecovered"] = 0
+        if report.get("no_transactions"):
+            # Both reads agree the form states there is nothing to report: a
+            # terminal zero-row result, not a review item. Returning a result
+            # (rather than None) also keeps the Haiku text fallback from
+            # running on the scanner junk afterwards.
+            parsed = HousePtrParseResult(
+                doc_id=stub.doc_id,
+                member_name=parse_header_name(text_preview) or stub.member.name,
+                state=parse_header_state(text_preview) or stub.member.state,
+                parser_confidence=float(report.get("confidence") or 0.0),
+                parser_version=VISION_PARSER_VERSION,
+                raw_text_preview=text_preview[:1200],
+                transactions=[],
+                vision_report=metadata,
+            )
+            logger.info(
+                "house_ptr vision: %s states no transactions (cost=$%.4f)",
+                pdf_path.name,
+                float(report.get("cost_usd") or 0.0),
+            )
+            return (parsed, []), metadata
         logger.info(
             "house_ptr vision: no rows recovered for %s (reason=%r cost=$%.4f)",
             pdf_path.name,
@@ -1033,6 +1136,8 @@ def _run_vision_parse(
         for transaction in transactions
         if get_transaction_date_issue(transaction.transaction_date, stub.filing_date) is None
     ]
+    metadata["rowsTranscribed"] = len(raw_transactions)
+    metadata["rowsRecovered"] = len(valid_transactions)
     if not valid_transactions:
         logger.info("house_ptr vision: all rows filtered as invalid for %s", pdf_path.name)
         metadata["reason"] = "every transcribed row failed date validation"
@@ -1063,6 +1168,260 @@ def _run_vision_parse(
     return (parsed, build_trade_rows_from_house_ptr(parsed, stub)), metadata
 
 
+#: A page whose text layer holds fewer non-space characters than this is
+#: image-only. A typed PTR page carries thousands; a scan carries none.
+TEXT_LAYER_MIN_CHARS_PER_PAGE = 40
+#: Share of pages that must carry a text layer for the PDF to count as typed.
+TEXT_LAYER_MIN_PAGE_SHARE = 0.5
+
+
+class TextLayerProbe:
+    """What pymupdf finds in a PDF before any OCR runs."""
+
+    __slots__ = ("page_count", "text_pages", "image_pages", "chars", "text")
+
+    def __init__(
+        self,
+        page_count: int,
+        text_pages: int,
+        image_pages: int,
+        chars: int,
+        text: str,
+    ) -> None:
+        self.page_count = page_count
+        self.text_pages = text_pages
+        self.image_pages = image_pages
+        self.chars = chars
+        self.text = text
+
+    @property
+    def has_text_layer(self) -> bool:
+        if self.page_count <= 0:
+            return False
+        return self.text_pages / self.page_count >= TEXT_LAYER_MIN_PAGE_SHARE
+
+    def to_dict(self) -> dict[str, object]:
+        return {
+            "pageCount": self.page_count,
+            "textPages": self.text_pages,
+            "imagePages": self.image_pages,
+            "chars": self.chars,
+            "hasTextLayer": self.has_text_layer,
+        }
+
+
+def probe_text_layer(pdf_path: Path) -> TextLayerProbe | None:
+    """Read the PDF's own text layer, page by page, without OCR.
+
+    The text is assembled exactly as ``PyMuPDFBackend.extract`` does so the
+    parser sees the same string either way. Returns None when pymupdf is
+    unavailable or cannot open the file; callers then fall back to the OCR
+    processor's own handling.
+    """
+
+    try:
+        import fitz  # type: ignore[import-untyped]
+    except ImportError:
+        return None
+    try:
+        document = fitz.open(str(pdf_path))
+    except Exception:
+        return None
+    pages_text: list[str] = []
+    text_pages = 0
+    image_pages = 0
+    chars = 0
+    try:
+        for page in document:
+            page_text = fix_font_mojibake(page.get_text())
+            pages_text.append(page_text)
+            page_chars = sum(1 for char in page_text if not char.isspace())
+            chars += page_chars
+            if page_chars >= TEXT_LAYER_MIN_CHARS_PER_PAGE:
+                text_pages += 1
+            elif page.get_images():
+                image_pages += 1
+    except Exception:
+        return None
+    finally:
+        document.close()
+    return TextLayerProbe(
+        page_count=len(pages_text),
+        text_pages=text_pages,
+        image_pages=image_pages,
+        chars=chars,
+        text="\n\n".join(pages_text).strip(),
+    )
+
+
+def _capped_call(connection: object, target: object, args: tuple) -> None:
+    """Child-process body for ``run_with_time_cap``."""
+
+    try:
+        connection.send({"ok": True, "value": target(*args)})  # type: ignore[attr-defined]
+    except BaseException as exc:  # noqa: BLE001 - reported to the parent
+        connection.send({"ok": False, "error": f"{type(exc).__name__}: {exc}"})  # type: ignore[attr-defined]
+    finally:
+        connection.close()  # type: ignore[attr-defined]
+
+
+def run_with_time_cap(target: object, args: tuple, cap_seconds: float) -> tuple[str, object]:
+    """Run ``target(*args)`` in a child process, killing it at the cap.
+
+    Returns ``(status, value)`` with status ``finished`` (value is the
+    return value), ``timeout`` (value is None) or ``crashed`` (value is the
+    error text). ``target`` must be importable by name: OCR backends pull in
+    torch, so a thread cannot be interrupted and a fresh process is the only
+    thing that can actually be stopped.
+    """
+
+    import multiprocessing
+
+    context = multiprocessing.get_context("spawn")
+    parent_end, child_end = context.Pipe(duplex=False)
+    process = context.Process(target=_capped_call, args=(child_end, target, args))
+    process.start()
+    child_end.close()
+    try:
+        if not parent_end.poll(cap_seconds):
+            return "timeout", None
+        try:
+            message = parent_end.recv()
+        except EOFError:
+            return "crashed", "worker exited without a result"
+        if message.get("ok"):
+            return "finished", message.get("value")
+        return "crashed", message.get("error")
+    finally:
+        parent_end.close()
+        process.join(timeout=1)
+        if process.is_alive():
+            process.terminate()
+            process.join(timeout=5)
+        if process.is_alive():
+            process.kill()
+            process.join(timeout=5)
+
+
+def _ocr_chain_worker(args: tuple) -> dict[str, object]:
+    """Run the OCR chain (in the child) and return only what the parser needs."""
+
+    from capitol_pipeline.processors.ocr import _process_single_ocr
+
+    result = _process_single_ocr(args)  # type: ignore[arg-type]
+    text = result.document.ocrText if result.document and result.document.ocrText else ""
+    return {"text": text, "warnings": list(result.warnings), "errors": list(result.errors)}
+
+
+def _run_ocr_chain_capped(
+    pdf_path: Path,
+    settings: Settings,
+    backend: str | OcrBackend,
+    cap_seconds: float,
+) -> tuple[str, dict[str, object]]:
+    """OCR an image-only filing under a wall-clock cap.
+
+    Returns ``(text, report)``. With ``cap_seconds`` <= 0 the chain runs
+    inline exactly as before; otherwise it runs in a child process that is
+    killed at the cap, and the report says ``timeout`` so the caller can
+    route the filing to review (or vision) instead of waiting on docling.
+    """
+
+    import time
+
+    backend_value = backend if isinstance(backend, str) else backend.value
+    started = time.monotonic()
+    if cap_seconds <= 0:
+        processor = OcrProcessor(settings, backend=backend)
+        result = processor.process_file(pdf_path)
+        text = result.document.ocrText if result.document and result.document.ocrText else ""
+        return text, {
+            "status": "finished",
+            "backend": backend_value,
+            "capSeconds": 0,
+            "elapsedSeconds": round(time.monotonic() - started, 1),
+            "chars": len(text),
+        }
+
+    args = (
+        str(pdf_path),
+        backend_value,
+        settings.spacy_model,
+        settings.ocr_confidence_threshold,
+        list(settings.ocr_fallback_chain),
+        settings.ocr_default_source,
+        settings.ocr_default_category,
+    )
+    status, value = run_with_time_cap(_ocr_chain_worker, (args,), cap_seconds)
+    report: dict[str, object] = {
+        "status": status,
+        "backend": backend_value,
+        "capSeconds": cap_seconds,
+        "elapsedSeconds": round(time.monotonic() - started, 1),
+    }
+    text = ""
+    if status == "finished" and isinstance(value, dict):
+        text = str(value.get("text") or "")
+        report["chars"] = len(text)
+        if value.get("warnings"):
+            report["warnings"] = value["warnings"]
+        if value.get("errors"):
+            report["errors"] = value["errors"]
+    elif status == "crashed":
+        report["error"] = str(value)
+    if status != "finished":
+        logger.warning(
+            "house_ptr: OCR chain %s for %s after %.1fs (cap %.0fs)",
+            status,
+            pdf_path.name,
+            report["elapsedSeconds"],
+            cap_seconds,
+        )
+    return text, report
+
+
+def describe_review_reason(
+    probe: TextLayerProbe | None,
+    ocr_report: dict[str, object] | None,
+    text: str,
+) -> str:
+    """Explain, for the stub's lastError, why a filing yielded no rows."""
+
+    if probe is None:
+        return "PDF could not be opened for a text-layer probe and no transaction rows were segmented"
+    if probe.has_text_layer:
+        return (
+            f"PDF has a text layer ({probe.chars} chars on {probe.text_pages}/{probe.page_count} "
+            "pages) but no transaction rows could be segmented; OCR skipped"
+        )
+    base = (
+        f"PDF is image-only ({probe.page_count} pages, {probe.image_pages} carrying a page image, "
+        "no text layer)"
+    )
+    if not ocr_report:
+        return f"{base}; no OCR ran"
+    status = ocr_report.get("status")
+    if status == "timeout":
+        return f"{base}; OCR exceeded the {ocr_report.get('capSeconds')}s cap"
+    if status == "crashed":
+        return f"{base}; OCR failed: {ocr_report.get('error')}"
+    if not text.strip():
+        return f"{base}; OCR produced no text"
+    return f"{base}; OCR text ({len(text)} chars) yielded no transaction rows"
+
+
+def _with_text_layer(
+    result: tuple[HousePtrParseResult, list[NormalizedTradeRow]],
+    text_layer: dict[str, object] | None,
+) -> tuple[HousePtrParseResult, list[NormalizedTradeRow]]:
+    """Carry the text-layer report onto a result built by a fallback parser."""
+
+    if text_layer is None:
+        return result
+    parsed, rows = result
+    return parsed.model_copy(update={"text_layer": text_layer}), rows
+
+
 def parse_house_ptr_pdf(
     pdf_path: Path,
     stub: FilingStub,
@@ -1071,10 +1430,40 @@ def parse_house_ptr_pdf(
     vision_backend: str = "off",
 ) -> tuple[HousePtrParseResult, list[NormalizedTradeRow]]:
     settings = settings or Settings()
-    processor = OcrProcessor(settings, backend=backend)
-    result = processor.process_file(pdf_path)
-    text = result.document.ocrText if result.document and result.document.ocrText else ""
+    backend_value = backend if isinstance(backend, str) else backend.value
+
+    # Decide from the PDF itself whether OCR has anything to add. A typed
+    # PDF is parsed from its own text layer and never enters the OCR chain
+    # (surya/docling + torch), however the segmenter fares on it. Only an
+    # image-only scan is OCR'd, and only under a wall-clock cap. Explicit
+    # backends bypass the OCR gate (the caller asked for that backend) but
+    # the probe still runs so the Haiku gate below knows a scan is a scan.
+    probe = probe_text_layer(pdf_path)
+    auto_backend = backend_value == OcrBackend.AUTO.value
+    ocr_report: dict[str, object] | None = None
+    if auto_backend and probe is not None and probe.has_text_layer:
+        text = probe.text
+        ocr_report = {"status": "skipped", "reason": "text layer present"}
+    elif auto_backend and probe is not None:
+        text, ocr_report = _run_ocr_chain_capped(
+            pdf_path, settings, backend, settings.ptr_ocr_time_cap_seconds
+        )
+    else:
+        processor = OcrProcessor(settings, backend=backend)
+        result = processor.process_file(pdf_path)
+        text = result.document.ocrText if result.document and result.document.ocrText else ""
+        if probe is not None:
+            ocr_report = {"status": "explicit", "backend": backend_value, "chars": len(text)}
+    # An image-only PDF has nothing a text model could read: the Haiku
+    # whole-PDF fallback is reserved for readable text the segmenter could
+    # not split, and scans go to vision or review instead.
+    image_only = probe is not None and not probe.has_text_layer
     parsed, rows = parse_house_ptr_text(text, stub)
+    text_layer_report: dict[str, object] | None = (
+        {**probe.to_dict(), "ocr": ocr_report} if probe is not None else None
+    )
+    if text_layer_report is not None:
+        parsed = parsed.model_copy(update={"text_layer": text_layer_report})
 
     mode = str(vision_backend or "off").strip().lower()
     if mode not in VISION_BACKENDS:
@@ -1104,7 +1493,7 @@ def parse_house_ptr_pdf(
         )
         fallback = _run_llm_fallback(pdf_path, stub, normalize_text(text))
         if fallback is not None:
-            return fallback
+            return _with_text_layer(fallback, text_layer_report)
 
     if vision_enabled:
         logger.debug(
@@ -1116,19 +1505,24 @@ def parse_house_ptr_pdf(
         )
         vision_result, vision_metadata = _run_vision_parse(pdf_path, stub, normalize_text(text))
         if vision_result is not None:
-            return vision_result
+            return _with_text_layer(vision_result, text_layer_report)
         # Record the attempt even though it produced nothing usable.
         parsed = parsed.model_copy(update={"vision_report": vision_metadata})
 
     # Vision is off, unavailable, or empty-handed: fall back to Haiku on the
-    # raw text exactly as this parser did before the vision path existed.
-    if not parsed.transactions and not decent_text:
+    # raw text exactly as this parser did before the vision path existed,
+    # unless the PDF is image-only, in which case there is no text to read.
+    if not parsed.transactions and not decent_text and not image_only:
         logger.debug(
             "house_ptr: no usable OCR text for %s; invoking the Haiku text fallback",
             pdf_path.name,
         )
         fallback = _run_llm_fallback(pdf_path, stub, normalize_text(text))
         if fallback is not None:
-            return fallback
+            return _with_text_layer(fallback, text_layer_report)
 
+    if not parsed.transactions:
+        parsed = parsed.model_copy(
+            update={"review_reason": describe_review_reason(probe, ocr_report, text)}
+        )
     return parsed, rows

@@ -1,0 +1,168 @@
+[
+ {
+  "id": {
+   "bioguide": "D000628",
+   "govtrack": 412691,
+   "wikipedia": "Neal Dunn",
+   "wikidata": "Q27733851",
+   "votesmart": 166297,
+   "fec": [
+    "H6FL02208"
+   ],
+   "opensecrets": "N00037442",
+   "maplight": 2203,
+   "google_entity_id": "kg:/g/11c2ld4vv7",
+   "cspan": 104529,
+   "icpsr": 21714,
+   "ballotpedia": "Neal Dunn",
+   "pictorial": 12983
+  },
+  "name": {
+   "first": "Neal",
+   "middle": "P.",
+   "last": "Dunn",
+   "official_full": "Neal P. Dunn"
+  },
+  "bio": {
+   "gender": "M",
+   "birthday": "1953-02-16"
+  },
+  "terms": [
+   {
+    "type": "rep",
+    "start": "2023-01-03",
+    "end": "2025-01-03",
+    "state": "FL",
+    "district": 2,
+    "party": "Republican",
+    "url": "https://dunn.house.gov",
+    "address": "466 Cannon House Office Building Washington DC 20515-0902",
+    "office": "466 Cannon House Office Building",
+    "phone": "202-225-5235"
+   },
+   {
+    "type": "rep",
+    "start": "2025-01-03",
+    "end": "2027-01-03",
+    "state": "FL",
+    "district": 2,
+    "party": "Republican",
+    "url": "https://dunn.house.gov",
+    "address": "466 Cannon House Office Building Washington DC 20515-0902",
+    "office": "466 Cannon House Office Building",
+    "phone": "202-225-5235"
+   }
+  ]
+ },
+ {
+  "id": {
+   "bioguide": "M001226",
+   "fec": [
+    "H2NJ08232"
+   ],
+   "govtrack": 456918,
+   "opensecrets": "N00049686",
+   "wikidata": "Q115137457",
+   "wikipedia": "Rob Menendez",
+   "votesmart": 205678,
+   "pictorial": 13157,
+   "ballotpedia": "Rob Menendez (New Jersey)",
+   "google_entity_id": "kg:/g/11snp9md7d"
+  },
+  "name": {
+   "first": "Robert",
+   "middle": "Jacobsen",
+   "last": "Menendez",
+   "suffix": "Jr.",
+   "official_full": "Robert Menendez"
+  },
+  "bio": {
+   "gender": "M",
+   "birthday": "1985-07-12"
+  },
+  "terms": [
+   {
+    "type": "rep",
+    "start": "2023-01-03",
+    "end": "2025-01-03",
+    "state": "NJ",
+    "district": 8,
+    "party": "Democrat",
+    "url": "https://menendez.house.gov",
+    "address": "1007 Longworth House Office Building Washington DC 20515-3008",
+    "office": "1007 Longworth House Office Building",
+    "phone": "202-225-7919"
+   },
+   {
+    "type": "rep",
+    "start": "2025-01-03",
+    "end": "2027-01-03",
+    "state": "NJ",
+    "district": 8,
+    "party": "Democrat",
+    "url": "https://menendez.house.gov",
+    "address": "2453 Rayburn House Office Building Washington DC 20515-3008",
+    "office": "2453 Rayburn House Office Building",
+    "phone": "202-225-7919"
+   }
+  ]
+ },
+ {
+  "id": {
+   "bioguide": "R000575",
+   "thomas": "01704",
+   "govtrack": 400341,
+   "opensecrets": "N00024759",
+   "votesmart": 5705,
+   "fec": [
+    "H2AL03032"
+   ],
+   "cspan": 1014740,
+   "wikipedia": "Mike Rogers (Alabama politician)",
+   "house_history": 20795,
+   "ballotpedia": "Mike Rogers (Alabama)",
+   "maplight": 433,
+   "icpsr": 20301,
+   "wikidata": "Q693238",
+   "google_entity_id": "kg:/m/024n_s",
+   "pictorial": 12896
+  },
+  "name": {
+   "first": "Mike",
+   "last": "Rogers",
+   "official_full": "Mike Rogers"
+  },
+  "bio": {
+   "birthday": "1958-07-16",
+   "gender": "M"
+  },
+  "terms": [
+   {
+    "type": "rep",
+    "start": "2023-01-03",
+    "end": "2025-01-03",
+    "state": "AL",
+    "district": 3,
+    "party": "Republican",
+    "url": "https://mikerogers.house.gov",
+    "rss_url": "http://mikerogers.house.gov/rss.xml",
+    "address": "2469 Rayburn House Office Building Washington DC 20515-0103",
+    "office": "2469 Rayburn House Office Building",
+    "phone": "202-225-3261"
+   },
+   {
+    "type": "rep",
+    "start": "2025-01-03",
+    "end": "2027-01-03",
+    "state": "AL",
+    "district": 3,
+    "party": "Republican",
+    "url": "https://mikerogers.house.gov",
+    "rss_url": "http://mikerogers.house.gov/rss.xml",
+    "address": "2469 Rayburn House Office Building Washington DC 20515-0103",
+    "office": "2469 Rayburn House Office Building",
+    "phone": "202-225-3261"
+   }
+  ]
+ }
+]

@@ -91,7 +91,13 @@ GE_ROW: dict[str, Any] = {
 
 
 def _payload(*rows: dict[str, Any], **header: Any) -> dict[str, Any]:
-    base = {"filer_name": None, "filing_date": None, "page_count": 1, "notes": None}
+    base = {
+        "filer_name": None,
+        "filing_date": None,
+        "page_count": 1,
+        "notes": None,
+        "no_transactions_stated": False,
+    }
     base.update(header)
     base["transactions"] = list(rows)
     return base
@@ -309,9 +315,17 @@ def _walk_schema_keys(node: Any) -> list[str]:
 def test_schema_declares_every_required_field() -> None:
     assert PTR_VISION_SCHEMA["type"] == "object"
     assert PTR_VISION_SCHEMA["additionalProperties"] is False
-    for field in ("filer_name", "filing_date", "page_count", "notes", "transactions"):
+    for field in (
+        "filer_name",
+        "filing_date",
+        "page_count",
+        "notes",
+        "no_transactions_stated",
+        "transactions",
+    ):
         assert field in PTR_VISION_SCHEMA["properties"]
         assert field in PTR_VISION_SCHEMA["required"]
+    assert PTR_VISION_SCHEMA["properties"]["no_transactions_stated"]["type"] == "boolean"
 
     item = PTR_VISION_SCHEMA["properties"]["transactions"]["items"]
     for field in (
@@ -324,12 +338,18 @@ def test_schema_declares_every_required_field() -> None:
         "notification_date",
         "amount_min",
         "amount_max",
+        "amount_column_letter",
         "cap_gains_over_200",
         "comment",
         "legibility",
     ):
         assert field in item["properties"], f"missing schema field: {field}"
         assert field in item["required"], f"schema field not required: {field}"
+    letter = item["properties"]["amount_column_letter"]
+    assert letter["anyOf"] == [
+        {"type": "string", "enum": list("ABCDEFGHIJK")},
+        {"type": "null"},
+    ]
 
     assert item["properties"]["transaction_type"]["enum"] == [
         "purchase",
@@ -427,9 +447,9 @@ def test_good_response_parses_and_request_is_well_formed(
     # Request shape
     request = captured[0]
     assert request["model"] == MODEL_ID == "claude-opus-5"
-    assert request["max_tokens"] == 16000
     assert request["thinking"] == {"type": "adaptive"}
-    assert request["output_config"]["effort"] == ptr_vision.EFFORT
+    assert request["output_config"]["effort"] == ptr_vision.resolve_effort() == "medium"
+    assert request["max_tokens"] == ptr_vision.MAX_OUTPUT_TOKENS == 64000
     assert request["output_config"]["format"]["type"] == "json_schema"
     assert request["output_config"]["format"]["schema"] is PTR_VISION_SCHEMA
     assert "temperature" not in request
@@ -637,10 +657,28 @@ def test_image_request_shape_with_a_real_pdf(monkeypatch: pytest.MonkeyPatch, tm
     # Both reads saw byte-identical images.
     assert captured[1]["messages"] == captured[0]["messages"]
 
+    # Portrait pages are the typed form: no close-up strips.
     assert result["orientation"] == [
-        {"page": 1, "rotation": 0, "method": "model-confirmed", "width": sizes[0][0], "height": sizes[0][1]},
-        {"page": 2, "rotation": 0, "method": "model-confirmed", "width": sizes[1][0], "height": sizes[1][1]},
+        {"page": 1, "rotation": 0, "method": "model-confirmed", "width": sizes[0][0], "height": sizes[0][1], "strips": 0},
+        {"page": 2, "rotation": 0, "method": "model-confirmed", "width": sizes[1][0], "height": sizes[1][1], "strips": 0},
     ]
+    assert result["chunks"] == [
+        {
+            "chunk": 1,
+            "pages": "1-2",
+            "rowsA": 1,
+            "rowsB": 1,
+            "matched": 1,
+            "fieldDisagreements": {},
+            "halvedA": False,
+            "halvedB": False,
+            "readBFailed": None,
+            "letterConflicts": 0,
+            "usage": result["chunks"][0]["usage"],
+            "costUsd": result["chunks"][0]["costUsd"],
+        }
+    ]
+    assert "This filing has 2 page(s); all of them are shown." in content[-1]["text"]
     orientation_requests = captured.orientation_requests  # type: ignore[attr-defined]
     assert len(orientation_requests) == 4  # per page: four candidates, then a confirmation
     assert all(request["model"] == ORIENTATION_MODEL_ID for request in orientation_requests)
@@ -679,13 +717,27 @@ def test_portrait_page_is_rotated_upright_before_the_read(
 
     result = extract_via_vision(pdf)
 
-    image = captured[0]["messages"][0]["content"][1]
+    content = captured[0]["messages"][0]["content"]
+    image = content[1]
     width, height = _png_size(image["source"]["data"])
     assert width > height  # rotated 90 -> landscape
     assert result["orientation"][0]["rotation"] == 90
     assert result["orientation"][0]["method"] == "model-confirmed"
     assert result["orientation"][0]["width"] == width
     assert result["orientation"][0]["height"] == height
+    # Landscape after rotation is the paper form: two close-up strips follow
+    # the full page, each captioned, before the instruction.
+    assert [block["type"] for block in content] == [
+        "text", "image", "text", "image", "text", "image", "text",
+    ]
+    assert "close-up strip 1 of 2" in content[2]["text"] and "top part" in content[2]["text"]
+    assert "close-up strip 2 of 2" in content[4]["text"] and "bottom part" in content[4]["text"]
+    for strip in (content[3], content[5]):
+        strip_width, strip_height = _png_size(strip["source"]["data"])
+        assert max(strip_width, strip_height) <= ptr_vision.MAX_IMAGE_LONG_EDGE
+        # The strip covers 58% of the page width at a higher zoom than the page.
+        assert strip_width > 0.58 * width
+    assert result["orientation"][0]["strips"] == 2
 
 
 def test_portrait_page_uses_the_heuristic_when_haiku_is_down(
@@ -703,7 +755,7 @@ def test_portrait_page_uses_the_heuristic_when_haiku_is_down(
     width, height = _png_size(image["source"]["data"])
     assert width > height
     assert result["orientation"] == [
-        {"page": 1, "rotation": 90, "method": "heuristic", "width": width, "height": height}
+        {"page": 1, "rotation": 90, "method": "heuristic", "width": width, "height": height, "strips": 2}
     ]
     assert result["ok"] is True
 
@@ -1067,15 +1119,16 @@ def test_page_limit_skips_without_calling_the_model(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
     _enable(monkeypatch)
-    monkeypatch.setattr(ptr_vision, "count_pdf_pages", lambda _path: 41)
+    monkeypatch.setattr(ptr_vision, "count_pdf_pages", lambda _path: 61)
     _, calls = _install_fake_client(monkeypatch, _payload(CHEVRON_VISION_ROW))
 
     result = extract_via_vision(_write_pdf(tmp_path))
 
     assert calls == []
     assert result["skipped"] is True
-    assert result["page_count"] == 41
-    assert "41 pages" in str(result["reason"])
+    assert result["page_count"] == 61
+    assert "61 pages" in str(result["reason"])
+    assert ptr_vision.MAX_VISION_PDF_PAGES == 60
     assert result["needs_review"] is True
 
 

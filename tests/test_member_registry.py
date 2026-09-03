@@ -38,3 +38,30 @@ def test_member_registry_resolves_state_aware_ambiguities() -> None:
     kean_match = registry.resolve(name="Thomas H. Kean Jr.", state="NJ")
     assert kean_match is not None
     assert kean_match.id == "m-3"
+
+
+def test_normalize_member_lookup_value_drops_honorifics_and_credentials() -> None:
+    # Forms the House Clerk feed actually emits for the same two people.
+    assert normalize_member_lookup_value("Marjorie Taylor Mrs Greene") == "marjorie taylor greene"
+    assert normalize_member_lookup_value("Neal Patrick Dunn, MD, FACS") == "neal patrick dunn"
+    assert normalize_member_lookup_value("Gerald E. Connolly") == "gerald e connolly"
+    # A name made only of dropped tokens is kept rather than collapsed to "".
+    assert normalize_member_lookup_value("Mrs") == "mrs"
+
+
+def test_member_registry_resolves_feed_names_with_credentials() -> None:
+    registry = MemberRegistry.from_records(
+        [
+            MemberMatch(id="m-D000628", name="Neal P. Dunn", slug="neal-p-dunn", party="R", state="FL"),
+            MemberMatch(id="m-G000596", name="Marjorie Taylor Greene", slug="marjorie-taylor-greene", party="R", state="GA"),
+        ]
+    )
+
+    dunn = registry.resolve(first_name="Neal Patrick", last_name="Dunn, MD, FACS", state="FL")
+    assert dunn is not None and dunn.id == "m-D000628"
+
+    greene = registry.resolve(first_name="Marjorie Taylor Mrs", last_name="Greene", state="GA")
+    assert greene is not None and greene.id == "m-G000596"
+
+    by_name = registry.resolve(name="Neal Patrick Dunn, MD, FACS", state="FL")
+    assert by_name is not None and by_name.id == "m-D000628"

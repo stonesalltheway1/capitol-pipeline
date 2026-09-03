@@ -11,6 +11,37 @@ from typing import Iterable, Mapping
 from capitol_pipeline.models.congress import MemberMatch
 
 
+#: Generational suffixes that never help identify a member.
+NAME_SUFFIX_TOKENS = frozenset({"jr", "sr", "ii", "iii", "iv"})
+
+#: Courtesy titles and post-nominal credentials the House Clerk feed sometimes
+#: folds into the first or last name ("Marjorie Taylor Mrs Greene",
+#: "Neal Patrick Dunn, MD, FACS"). None of these is a real name token for any
+#: member since 2012, so dropping them is safe for every lookup key.
+HONORIFIC_TOKENS = frozenset({"mr", "mrs", "ms", "miss", "mx", "dr", "hon"})
+CREDENTIAL_TOKENS = frozenset(
+    {
+        "md",
+        "facs",
+        "facp",
+        "faap",
+        "phd",
+        "dds",
+        "dmd",
+        "dvm",
+        "jd",
+        "esq",
+        "cpa",
+        "rn",
+        "mba",
+        "mph",
+        "ret",
+    }
+)
+
+_DROPPED_NAME_TOKENS = NAME_SUFFIX_TOKENS | HONORIFIC_TOKENS | CREDENTIAL_TOKENS
+
+
 def strip_diacritics(value: str) -> str:
     """Collapse accented characters into their ASCII base form."""
 
@@ -44,13 +75,21 @@ def normalize_member_lookup_value(raw: str | None) -> str:
     )
 
     tokens: list[str] = []
+    all_tokens: list[str] = []
     for token in normalized.split():
-        lowered = token.lower()
-        if lowered in {"jr", "sr", "ii", "iii", "iv"}:
-            continue
         cleaned = "".join(char for char in token if char.isalnum() or char.isspace())
-        if cleaned:
-            tokens.append(cleaned.lower())
+        if not cleaned:
+            continue
+        lowered = cleaned.lower()
+        all_tokens.append(lowered)
+        if lowered in _DROPPED_NAME_TOKENS:
+            continue
+        tokens.append(lowered)
+
+    # Never normalize a name down to nothing: if every token was a title or
+    # credential, keep the original tokens rather than returning "".
+    if not tokens:
+        tokens = all_tokens
 
     return " ".join(tokens).strip()
 

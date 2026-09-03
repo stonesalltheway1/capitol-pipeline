@@ -175,6 +175,7 @@ from capitol_pipeline.sources.senate_ethics import (
     normalize_senate_watcher_trade,
 )
 from capitol_pipeline.sources.usaspending import (
+from capitol_pipeline.members_historical import sync_members_historical_command
     DEFAULT_USASPENDING_END_DATE,
     DEFAULT_USASPENDING_START_DATE,
     UsaspendingApiClient,
@@ -333,20 +334,62 @@ def resolve_house_stub_status(
 
     A vision transcription overrides the confidence threshold with the model's
     own legibility verdict: more than half the rows illegible keeps the stub in
-    ``needs_review``, anything better marks it ``parsed``. A stub whose member
-    never resolved, or that produced no trade rows, can never be ``parsed``.
+    ``needs_review``, anything better marks it ``parsed``. A vision result that
+    found the form states there is nothing to report is terminal: ``parsed``
+    with zero rows (there is no separate "nothing to import" status; the
+    ``visionParse.noTransactions`` flag records why). A stub whose member never
+    resolved, or that otherwise produced no trade rows, can never be ``parsed``.
     """
 
-    if not trades or not stub.member.id:
+    if not stub.member.id:
         return "needs_review"
     vision = parsed.vision_report
-    if (
+    vision_ok = (
         is_vision_parser_version(parsed.parser_version)
         and isinstance(vision, dict)
-        and vision.get("ok")
-    ):
-        return "needs_review" if vision.get("needsReview") else "parsed"
+        and bool(vision.get("ok"))
+    )
+    if vision_ok and vision.get("noTransactions") and not parsed.transactions:  # type: ignore[union-attr]
+        return "needs_review" if vision.get("needsReview") else "parsed"  # type: ignore[union-attr]
+    if not trades:
+        return "needs_review"
+    if vision_ok:
+        return "needs_review" if vision.get("needsReview") else "parsed"  # type: ignore[union-attr]
     return "parsed" if parsed.parser_confidence >= 0.6 else "needs_review"
+
+
+#: Prefix the needs-review queue query matches on; keep it stable.
+HOUSE_REVIEW_LAST_ERROR = "PTR text extracted but transactions need manual review"
+
+
+def house_stub_last_error(parsed: HousePtrParseResult) -> str | None:
+    """The ``lastError`` for a parsed stub: None once any row was parsed.
+
+    The parser's ``review_reason`` (typed text the segmenter could not split,
+    image-only scan whose OCR timed out, ...) is appended after the stable
+    prefix so the queue query still recognises the row.
+    """
+
+    if parsed.transactions:
+        return None
+    vision = parsed.vision_report
+    if isinstance(vision, dict) and vision.get("ok") and vision.get("noTransactions"):
+        # The form states there is nothing to report: a clean zero-row result.
+        return None
+    if parsed.review_reason:
+        return f"{HOUSE_REVIEW_LAST_ERROR}: {parsed.review_reason}"
+    return HOUSE_REVIEW_LAST_ERROR
+
+
+def build_house_stub_metadata_extra(parsed: HousePtrParseResult) -> dict[str, object] | None:
+    """Vision and text-layer reports to merge into the stub metadata."""
+
+    extra: dict[str, object] = {}
+    if parsed.vision_report:
+        extra["visionParse"] = parsed.vision_report
+    if parsed.text_layer:
+        extra["textLayer"] = parsed.text_layer
+    return extra or None
 
 
 def persist_parsed_house_stub(
@@ -360,9 +403,7 @@ def persist_parsed_house_stub(
     sync_house_stubs_to_neon(settings, [stub])
     trade_summary = upsert_trade_rows_to_neon(settings, trades)
     status = resolve_house_stub_status(stub, parsed, trades)
-    metadata_extra: dict[str, object] | None = (
-        {"visionParse": parsed.vision_report} if parsed.vision_report else None
-    )
+    metadata_extra = build_house_stub_metadata_extra(parsed)
     mark_house_stub_processed(
         settings,
         stub,
@@ -370,11 +411,7 @@ def persist_parsed_house_stub(
         parser_confidence=parsed.parser_confidence,
         parsed_transaction_count=len(parsed.transactions),
         extracted_trade_id=trade_summary["trade_ids"][0] if trade_summary.get("trade_ids") else None,
-        last_error=(
-            None
-            if parsed.transactions
-            else "PTR text extracted but transactions need manual review"
-        ),
+        last_error=house_stub_last_error(parsed),
         raw_text_preview=parsed.raw_text_preview,
         parsed_transactions=[transaction.model_dump() for transaction in parsed.transactions],
         metadata_extra=metadata_extra,
@@ -418,6 +455,14 @@ def build_stub_from_queue_row(row: dict[str, object]) -> FilingStub:
         source=str(row.get("source") or "house-clerk").replace("_", "-"),
         source_url=str(row.get("source_url") or ""),
         raw_state_district=str(metadata.get("rawStateDistrict") or "").strip() or None,
+        prior_vision=(
+            {
+                "visionParse": metadata.get("visionParse"),
+                "parsedTransactions": metadata.get("parsedTransactions"),
+            }
+            if isinstance(metadata.get("visionParse"), dict)
+            else None
+        ),
     )
 
 
@@ -615,7 +660,12 @@ def process_house_queue_rows(
                     "ok": vision_report.get("ok"),
                     "reason": vision_report.get("reason"),
                     "rowCount": vision_report.get("rowCount"),
+                    "rowsRecovered": vision_report.get("rowsRecovered"),
+                    "noTransactions": vision_report.get("noTransactions"),
+                    "reused": vision_report.get("reused", False),
+                    "chunks": len(vision_report.get("chunks") or []),
                     "legibility": vision_report.get("legibility"),
+                    "needsReviewReasons": vision_report.get("needsReviewReasons"),
                     "costUsd": vision_report.get("costUsd"),
                 }
             if index_summary:
@@ -3292,3 +3342,5 @@ def sync_member_headshots_command(
 
 if __name__ == "__main__":
     cli()
+
+cli.add_command(sync_members_historical_command)

@@ -16,14 +16,24 @@ How a filing is read (v2)
    upright; a second call confirms the pick. (Asking how far a single sideways
    scan is turned was routinely answered "0".) If that fails, a portrait page
    is assumed to be a sideways landscape form and rotated 90 degrees.
-3. The upright page images are sent to the read model (``claude-opus-5`` by
-   default) **twice**, as two independent requests, asking for the transaction
-   grid back as schema-constrained JSON. The model is not deterministic, so a
-   field is only trusted when both reads agree on it. Disagreements are nulled
-   and the row is marked ``illegible``; rows only one read saw are kept but
-   marked ``illegible``; a row-count mismatch forces manual review.
-4. When ``pymupdf`` is not importable the PDF itself is sent as a ``document``
+3. Landscape pages (the paper checkbox form) also get two close-up strips of
+   the right-hand 58% of the page rendered at twice the zoom, so the amount
+   ladder's tick boxes are unambiguous; the model reports the column letter
+   (A-K) and the band must agree with it.
+4. Pages are grouped into chunks of :func:`resolve_chunk_pages` (default 4)
+   and each chunk is sent to the read model (``claude-opus-5`` by default)
+   **twice**, as two independent requests, asking for the transaction grid
+   back as schema-constrained JSON. The model is not deterministic, so a field
+   is only trusted when both reads agree on it. Disagreements are nulled and
+   the row is marked ``illegible``; rows only one read saw are kept but marked
+   ``illegible``; a row-count mismatch forces manual review. A read that
+   truncates at ``max_tokens`` is retried once with the page group halved.
+5. When ``pymupdf`` is not importable the PDF itself is sent as a ``document``
    block instead, and orientation is left to the model.
+
+A filing whose reads both return zero rows and both report that the form
+states there is nothing to report is a terminal ``no_transactions`` result,
+not a review item.
 
 This module is a peer of :mod:`capitol_pipeline.parsers.ptr_llm_fallback`
 (the Haiku text fallback, still used when the OCR text layer is decent), not a
@@ -34,6 +44,10 @@ Guardrails
 * ``CAPITOL_PTR_VISION_DISABLED=1`` kills the path at runtime.
 * PDFs over :data:`MAX_VISION_PDF_PAGES` pages or :data:`MAX_VISION_PDF_BYTES`
   bytes are skipped with a reason; the stub stays ``needs_review``.
+* The estimated cost (pages x two reads x per-page rate, plus orientation) must
+  stay under :func:`resolve_max_filing_cost_usd` (``CAPITOL_PTR_VISION_MAX_COST_USD``,
+  default $25); a filing over it is refused with the estimate in the reason, and
+  a filing that overruns 1.5x the ceiling while running is abandoned.
 * One filing per call, one retry on 429/5xx per read, and the caller caps
   filings per run with ``--limit``.
 
@@ -45,11 +59,13 @@ from __future__ import annotations
 
 import base64
 import difflib
+import hashlib
 import json
 import logging
 import os
 import re
 import time
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
@@ -87,14 +103,54 @@ def is_vision_parser_version(version: object) -> bool:
 
 # -- Guardrails -------------------------------------------------------------
 
-MAX_VISION_PDF_PAGES = 25
+MAX_VISION_PDF_PAGES = 60
 MAX_VISION_PDF_BYTES = 20 * 1024 * 1024
-MAX_OUTPUT_TOKENS = 16000
-EFFORT = "high"
+#: Streaming, so this is room rather than a target: a four-page chunk of a
+#: dense attachment is ~90 rows (~7K tokens of JSON) plus adaptive thinking,
+#: which at medium effort ran to ~25K tokens on such a chunk (a 32K cap
+#: truncated one and cost a halved retry).
+MAX_OUTPUT_TOKENS = 64000
 RETRY_SLEEP_SECONDS = 5.0
 
 #: Independent reads of the same page images per filing.
 READS_PER_FILING = 2
+
+#: Reasoning effort for the read model. ``medium`` is enough for typed pages;
+#: set ``CAPITOL_PTR_VISION_EFFORT=high`` for a queue of handwritten forms.
+DEFAULT_EFFORT = "medium"
+EFFORT_LEVELS: tuple[str, ...] = ("low", "medium", "high", "xhigh", "max")
+#: Kept for callers that only need the default; :func:`resolve_effort` is what
+#: requests use.
+EFFORT = DEFAULT_EFFORT
+
+#: Pages per request (paper attachments run 16-18 rows a page, so four pages
+#: is ~70 rows of JSON). Override with ``CAPITOL_PTR_VISION_CHUNK_PAGES``.
+DEFAULT_CHUNK_PAGES = 4
+MAX_CHUNK_PAGES = 12
+
+#: Cost ceiling per filing in USD, compared against the pre-flight estimate;
+#: sized so a 60-page filing (two reads, close-up strips, ~$0.40 a page at
+#: medium effort) still fits. Override with ``CAPITOL_PTR_VISION_MAX_COST_USD``;
+#: ``CAPITOL_PTR_VISION_EFFORT=low`` is the lever that cuts the thinking that
+#: dominates the bill.
+DEFAULT_MAX_FILING_COST_USD = 25.0
+#: A filing whose running cost passes this multiple of the ceiling is abandoned.
+COST_OVERRUN_FACTOR = 1.5
+
+#: Days a stub's previous vision result stays reusable when the PDF is unchanged.
+VISION_REUSE_MAX_AGE_DAYS = 30
+
+# -- Cost estimate inputs (tokens per page, calibrated on live runs) ---------
+# Measured on a 23-page typed attachment (8219444) at medium effort with the
+# close-up strips on: 503K input tokens over 14 reads (~9K per page) and 285K
+# output tokens (~6.2K per page-read, of which ~1.6K is the JSON and the rest
+# adaptive thinking), $9.23 for the filing, $0.40 a page.
+
+EST_TOKENS_FULL_PAGE = 2600
+EST_TOKENS_GRID_STRIP = 3200
+EST_OUTPUT_TOKENS_PER_PAGE = 6200
+EST_CACHED_PROMPT_TOKENS = 5300
+EST_ORIENTATION_COST_PER_PAGE_USD = 0.006
 
 # -- Page rendering ---------------------------------------------------------
 
@@ -107,6 +163,21 @@ ORIENTATION_MAX_TOKENS = 8
 #: than the read images: legible enough to tell upright from sideways, cheap
 #: enough that four of them cost less than one read image.
 ORIENTATION_CANDIDATE_LONG_EDGE = 1000
+
+# -- Transaction-grid close-ups --------------------------------------------
+# The paper form is landscape; its amount ladder sits at the right edge and a
+# tick one column off is the one field the two reads routinely agree on
+# wrongly. Landscape pages therefore also get close-up strips of the
+# right-hand part of the page rendered at a higher zoom.
+
+#: Fraction of the page width where the close-up starts (right-hand 58%).
+GRID_CROP_X_FRACTION = 0.42
+#: Vertical strips per page; each covers (1/strips + overlap) of the height.
+GRID_CROP_STRIPS = 2
+GRID_CROP_OVERLAP = 0.10
+#: Zoom relative to the full-page render, capped by MAX_IMAGE_LONG_EDGE.
+#: Override with ``CAPITOL_PTR_VISION_GRID_ZOOM``; 0 disables the close-ups.
+DEFAULT_GRID_CROP_ZOOM = 2.0
 
 # -- Pricing (USD per MTok: input, output) ----------------------------------
 
@@ -153,6 +224,22 @@ LEGIBILITY_WEIGHTS: dict[str, float] = {
 
 _LEGIBILITY_RANK: dict[str, int] = {"clear": 0, "partial": 1, "illegible": 2}
 _LEGIBILITY_BY_RANK: tuple[str, ...] = ("clear", "partial", "illegible")
+
+#: Amount ladder as lettered on the paper form. K is a flag column ("Transaction
+#: in a Spouse or Dependent Child Asset over $1,000,000"), not a band.
+AMOUNT_LETTER_BANDS: dict[str, tuple[int, int]] = {
+    "A": (1001, 15000),
+    "B": (15001, 50000),
+    "C": (50001, 100000),
+    "D": (100001, 250000),
+    "E": (250001, 500000),
+    "F": (500001, 1000000),
+    "G": (1000001, 5000000),
+    "H": (5000001, 25000000),
+    "I": (25000001, 50000000),
+    "J": (50000001, 100000000),
+}
+AMOUNT_LETTERS: tuple[str, ...] = tuple(AMOUNT_LETTER_BANDS) + ("K",)
 
 # -- Two-read agreement -----------------------------------------------------
 
@@ -237,6 +324,19 @@ TRANSACTION_ITEM_SCHEMA: dict[str, Any] = {
                 "Upper bound of the checked amount bucket in whole dollars. 0 if unreadable."
             ),
         },
+        "amount_column_letter": {
+            "anyOf": [
+                {"type": "string", "enum": list(AMOUNT_LETTERS)},
+                {"type": "null"},
+            ],
+            "description": (
+                "On the paper form, the letter printed above the ticked amount "
+                "column (A = $1,001-$15,000 ... J = Over $50,000,000, K = the "
+                "spouse/dependent over-$1,000,000 flag), found by counting boxes "
+                "from column A. Null on typed forms that print the dollar band, "
+                "or when no box is ticked."
+            ),
+        },
         "cap_gains_over_200": {
             "type": ["boolean", "null"],
             "description": (
@@ -271,6 +371,7 @@ TRANSACTION_ITEM_SCHEMA: dict[str, Any] = {
         "notification_date",
         "amount_min",
         "amount_max",
+        "amount_column_letter",
         "cap_gains_over_200",
         "comment",
         "legibility",
@@ -300,13 +401,29 @@ PTR_VISION_SCHEMA: dict[str, Any] = {
                 "whether the scan is rotated or cropped."
             ),
         },
+        "no_transactions_stated": {
+            "type": "boolean",
+            "description": (
+                "True only when the pages you were shown carry an explicit statement "
+                "that there is nothing to report (for example 'Nothing to report', "
+                "'No reportable transactions', 'None'). False when the grid simply "
+                "has rows, or is blank without such a statement."
+            ),
+        },
         "transactions": {
             "type": "array",
             "description": "One entry per transaction row on the form, in printed order.",
             "items": TRANSACTION_ITEM_SCHEMA,
         },
     },
-    "required": ["filer_name", "filing_date", "page_count", "notes", "transactions"],
+    "required": [
+        "filer_name",
+        "filing_date",
+        "page_count",
+        "notes",
+        "no_transactions_stated",
+        "transactions",
+    ],
 }
 
 
@@ -420,11 +537,25 @@ The Amount column is a checkbox or a circle against a printed ladder of ranges. 
 
 The top three brackets are only available to a spouse or dependent child, so seeing one on a filer-owned row is a signal you may have misread the check mark. If no bucket is marked, or you cannot tell which of two adjacent boxes carries the mark, report 0 for both bounds and say so in that row's comment. Never average two buckets, and never invent a precise dollar figure: the form does not carry one.
 
+On the paper form the amount columns are lettered A through K across the top of the ladder: A is $1,001-$15,000, B $15,001-$50,000, C $50,001-$100,000, D $100,001-$250,000, E $250,001-$500,000, F $500,001-$1,000,000, G $1,000,001-$5,000,000, H $5,000,001-$25,000,000, I $25,000,001-$50,000,000, J Over $50,000,000, and K is a separate flag column for a transaction in a spouse's or dependent child's asset over $1,000,000. For every ticked row report `amount_column_letter`: find the ticked box, then count boxes leftward to column A (the first, leftmost box) and name the letter you land on. Then set amount_min and amount_max to that letter's band; the letter and the band must agree, and if they do not, you have miscounted - recount. Adjacent columns are the usual mistake, so use the close-up strips when they are provided. On typed electronic forms that print the dollar band as text there are no letters: report null.
+
+## Close-up strips
+
+For each landscape page you may also be given one or more close-up strips of its right-hand part, labelled as such, rendered at a higher zoom. They show the same rows as the full page: use them to resolve which box carries a tick and to read dates, and use the full page for the asset names and the owner column. Do not report rows twice because they appear in both.
+
 ## Dates
 
 The paper form itself carries a PRE-PRINTED EXAMPLE ROW in the transaction grid, typeset in the same place as a real entry: asset "Example: Mega Corp. Common Stock", an x under Sale, transaction date 02/05/20, notification date 03/07/20, and an x in the $15,001-$50,000 column. It is part of the blank form, not a transaction. Never return it as a row, and never let its values leak into the rows above or below it: if you find yourself writing 2020-02-05, 2020-03-07 or the $15,001-$50,000 band for a row whose own handwritten date or check mark you cannot actually read, you have copied the example - report null for that field and mark the row partial or illegible instead. Every real row has its own handwritten date; read each one on its own line, and read the check mark in the amount column on that same line.
 
 Scans are often rotated ninety degrees or upside down; read them in the orientation of the printed text.
+
+## Nothing to report
+
+Some filings state in the grid, or in place of it, that there is nothing to report: "NOTHING TO REPORT FOR JANUARY 2023", "No reportable transactions", "None". Return an empty transactions array and set `no_transactions_stated` to true. Set it to false whenever the pages carry rows, and also when the grid is merely blank with no such statement - a blank grid may be a continuation page or a bad scan, and it is for a human to decide.
+
+## Long filings
+
+Long filings are sent in groups of pages. When you are told you are looking at pages 6 to 10 of 23, transcribe only the rows on those pages, do not invent the header from memory (report null for filer_name and filing_date unless they are on the pages you can see), and keep the rows in the printed order of those pages.
 
 Dates are printed on the form as MM/DD/YYYY, and handwritten as M/D/YY more often than not. Convert every date to YYYY-MM-DD. Two-digit years belong to the reporting period; use the calendar year in the header, or the filing date you are told, to resolve them. The Transaction Date is when the trade happened; the Notification Date is when the filer learned of it, and for a self-directed account the two are often identical. The two dates sit in two separate columns: never read the notification column and report it as the transaction date, and never copy one column into the other. The Notification Date is frequently blank on handwritten forms - report null, not a copy of the transaction date. No date on the form can be later than the date the report was filed. If a date is smudged, cropped, or overwritten so that you cannot read it, report null and mark the row's legibility accordingly. A date you cannot read is never worth guessing: a wrong date silently corrupts the disclosure timeline that this data feeds.
 
@@ -506,6 +637,47 @@ def resolve_model_id() -> str:
     return os.environ.get("CAPITOL_PTR_VISION_MODEL", "").strip() or MODEL_ID
 
 
+def resolve_effort() -> str:
+    """Return the configured reasoning effort for the read model."""
+
+    raw = os.environ.get("CAPITOL_PTR_VISION_EFFORT", "").strip().lower()
+    return raw if raw in EFFORT_LEVELS else DEFAULT_EFFORT
+
+
+def _env_number(name: str, default: float, *, low: float, high: float) -> float:
+    raw = os.environ.get(name, "").strip()
+    if not raw:
+        return default
+    try:
+        value = float(raw)
+    except ValueError:
+        logger.warning("ptr_vision: ignoring non-numeric %s=%r", name, raw)
+        return default
+    return min(high, max(low, value))
+
+
+def resolve_chunk_pages() -> int:
+    """Pages per read request."""
+
+    return int(
+        _env_number("CAPITOL_PTR_VISION_CHUNK_PAGES", DEFAULT_CHUNK_PAGES, low=1, high=MAX_CHUNK_PAGES)
+    )
+
+
+def resolve_max_filing_cost_usd() -> float:
+    """Per-filing cost ceiling in USD."""
+
+    return _env_number(
+        "CAPITOL_PTR_VISION_MAX_COST_USD", DEFAULT_MAX_FILING_COST_USD, low=0.01, high=1000.0
+    )
+
+
+def resolve_grid_zoom() -> float:
+    """Close-up zoom relative to the full page; 0 disables the strips."""
+
+    return _env_number("CAPITOL_PTR_VISION_GRID_ZOOM", DEFAULT_GRID_CROP_ZOOM, low=0.0, high=4.0)
+
+
 def vision_disabled() -> bool:
     """Return whether the env kill switch is engaged."""
 
@@ -579,6 +751,31 @@ def estimate_cost_usd(usage: dict[str, int], model: str | None = None) -> float:
         + int(usage.get("output") or 0) * price_out
     ) / 1_000_000
     return round(dollars, 6)
+
+
+def estimate_filing_cost_usd(
+    page_count: int,
+    *,
+    model: str | None = None,
+    strips_per_page: float = 0.0,
+    chunk_pages: int | None = None,
+) -> float:
+    """Pre-flight estimate: pages x two reads x per-page rate, plus orientation.
+
+    ``strips_per_page`` is the average number of close-up strips sent per page
+    (0 before orientation is known, when every page might be portrait).
+    """
+
+    pages = max(0, int(page_count))
+    if pages == 0:
+        return 0.0
+    price_in, price_out = pricing_for_model(model or resolve_model_id())
+    requests = -(-pages // max(1, chunk_pages or resolve_chunk_pages()))
+    input_tokens = pages * (EST_TOKENS_FULL_PAGE + strips_per_page * EST_TOKENS_GRID_STRIP)
+    cached_tokens = requests * EST_CACHED_PROMPT_TOKENS * CACHE_READ_MULTIPLIER
+    output_tokens = pages * EST_OUTPUT_TOKENS_PER_PAGE
+    per_read = ((input_tokens + cached_tokens) * price_in + output_tokens * price_out) / 1_000_000
+    return round(per_read * READS_PER_FILING + pages * EST_ORIENTATION_COST_PER_PAGE_USD, 4)
 
 
 def _normalize_usage(usage: Any) -> dict[str, int]:
@@ -663,9 +860,18 @@ def _skip(reason: str, **extra: Any) -> dict[str, Any]:
         "orientation": None,
         "read_agreement": None,
         "calls": [],
+        "no_transactions": False,
+        "chunks": [],
+        "effort": resolve_effort(),
+        "pdf_sha256": None,
+        "at": _now_iso(),
     }
     payload.update(extra)
     return payload
+
+
+def _now_iso() -> str:
+    return datetime.now(timezone.utc).isoformat(timespec="seconds")
 
 
 def _is_retryable(error: Exception) -> bool:
@@ -715,6 +921,12 @@ def _image_block(png: bytes) -> dict[str, Any]:
     }
 
 
+def _page_zoom(rect: Any, max_long_edge: int = MAX_IMAGE_LONG_EDGE) -> float:
+    # pymupdf rounds pixel dimensions up, so aim one pixel under the cap.
+    long_edge = float(max(rect.width, rect.height)) or 1.0
+    return min(RENDER_DPI / 72.0, (max_long_edge - 1) / long_edge)
+
+
 def _render_page(
     page: Any,
     module: Any,
@@ -731,11 +943,61 @@ def _render_page(
     """
 
     page.set_rotation((base_rotation + rotation) % 360)
-    rect = page.rect
-    long_edge = float(max(rect.width, rect.height)) or 1.0
-    zoom = min(RENDER_DPI / 72.0, max_long_edge / long_edge)
+    zoom = _page_zoom(page.rect, max_long_edge)
     pixmap = page.get_pixmap(matrix=module.Matrix(zoom, zoom), alpha=False)
     return pixmap.tobytes("png"), int(pixmap.width), int(pixmap.height)
+
+
+def grid_strip_rects(
+    width: float, height: float
+) -> list[tuple[tuple[float, float, float, float], str]]:
+    """Clip rectangles (x0, y0, x1, y1) and labels for the close-up strips."""
+
+    strips = max(1, GRID_CROP_STRIPS)
+    x0 = width * GRID_CROP_X_FRACTION
+    step = height / strips
+    overlap = height * GRID_CROP_OVERLAP
+    rects: list[tuple[tuple[float, float, float, float], str]] = []
+    for index in range(strips):
+        y0 = max(0.0, index * step - (overlap if index else 0.0))
+        y1 = min(height, (index + 1) * step + (overlap if index < strips - 1 else 0.0))
+        if strips == 1:
+            label = "full height"
+        elif index == 0:
+            label = "top part"
+        elif index == strips - 1:
+            label = "bottom part"
+        else:
+            label = f"part {index + 1}"
+        rects.append(((x0, y0, width, y1), label))
+    return rects
+
+
+def _render_grid_strips(page: Any, module: Any, zoom_factor: float) -> list[dict[str, Any]]:
+    """Close-up strips of the right-hand part of an already-rotated page.
+
+    Each strip is rendered at ``zoom_factor`` times the full-page zoom, capped
+    so its long edge stays within :data:`MAX_IMAGE_LONG_EDGE`.
+    """
+
+    rect = page.rect
+    full_zoom = _page_zoom(rect)
+    strips: list[dict[str, Any]] = []
+    for (x0, y0, x1, y1), label in grid_strip_rects(float(rect.width), float(rect.height)):
+        clip = module.Rect(rect.x0 + x0, rect.y0 + y0, rect.x0 + x1, rect.y0 + y1)
+        long_edge = float(max(clip.width, clip.height)) or 1.0
+        zoom = min(full_zoom * zoom_factor, (MAX_IMAGE_LONG_EDGE - 1) / long_edge)
+        pixmap = page.get_pixmap(matrix=module.Matrix(zoom, zoom), clip=clip, alpha=False)
+        strips.append(
+            {
+                "png": pixmap.tobytes("png"),
+                "width": int(pixmap.width),
+                "height": int(pixmap.height),
+                "label": label,
+                "zoom": round(zoom / full_zoom, 2),
+            }
+        )
+    return strips
 
 
 def orientation_heuristic(width: int, height: int) -> int:
@@ -839,9 +1101,10 @@ def prepare_page_images(
     """Render every page upright.
 
     Returns ``(pages, orientation, usage)`` or None when pymupdf is unavailable
-    or cannot open the file. Each page is ``{"index", "png", "width", "height"}``
-    and each orientation entry ``{"page", "rotation", "method", "width",
-    "height"}``. ``usage`` is the orientation model's summed token usage.
+    or cannot open the file. Each page is ``{"index", "png", "width", "height",
+    "crops"}`` (``crops`` holds the close-up strips of a landscape page) and
+    each orientation entry ``{"page", "rotation", "method", "width", "height",
+    "strips"}``. ``usage`` is the orientation model's summed token usage.
     """
 
     module = _pdf_module()
@@ -856,6 +1119,7 @@ def prepare_page_images(
     pages: list[dict[str, Any]] = []
     orientation: list[dict[str, Any]] = []
     usage = dict(_EMPTY_USAGE)
+    grid_zoom = resolve_grid_zoom()
     try:
         with document:
             for position in range(int(document.page_count)):
@@ -877,7 +1141,19 @@ def prepare_page_images(
                 )
                 usage = sum_usage(usage, call_usage)
                 png, width, height = _render_page(page, module, base_rotation, rotation)
-                pages.append({"index": position + 1, "png": png, "width": width, "height": height})
+                crops: list[dict[str, Any]] = []
+                if width > height and grid_zoom > 0:
+                    # Landscape after rotation: the paper checkbox form.
+                    crops = _render_grid_strips(page, module, grid_zoom)
+                pages.append(
+                    {
+                        "index": position + 1,
+                        "png": png,
+                        "width": width,
+                        "height": height,
+                        "crops": crops,
+                    }
+                )
                 orientation.append(
                     {
                         "page": position + 1,
@@ -885,6 +1161,7 @@ def prepare_page_images(
                         "method": method,
                         "width": width,
                         "height": height,
+                        "strips": len(crops),
                     }
                 )
     except Exception as error:  # noqa: BLE001 - fall back to the document block
@@ -911,21 +1188,61 @@ def filing_context(filing_year: int | None, filing_date: str | None) -> str:
     return " ".join(parts)
 
 
+def chunk_context(pages: list[dict[str, Any]], total_pages: int) -> str:
+    """Tell the model which pages of the filing it is looking at."""
+
+    if not pages:
+        return ""
+    first, last = pages[0]["index"], pages[-1]["index"]
+    if total_pages <= len(pages) and first == 1:
+        return f"This filing has {total_pages} page(s); all of them are shown."
+    shown = f"page {first}" if first == last else f"pages {first} to {last}"
+    text = f"This filing has {total_pages} pages; you are shown {shown}."
+    if first > 1:
+        text += (
+            " Earlier pages are not shown: transcribe only the rows on these pages, "
+            "and report null for filer_name and filing_date unless they appear here."
+        )
+    return text
+
+
 def build_image_content(
     pages: list[dict[str, Any]],
     filename: str,
     context: str = "",
+    total_pages: int | None = None,
 ) -> list[dict[str, Any]]:
-    """User content: a label and image per page, then the instruction."""
+    """User content: per page a label, the image and any close-up strips, then the instruction."""
 
-    total = len(pages)
+    total = total_pages or len(pages)
     blocks: list[dict[str, Any]] = []
     for page in pages:
         blocks.append({"type": "text", "text": f"Page {page['index']} of {total}:"})
         blocks.append(_image_block(page["png"]))
-    text = f"{USER_INSTRUCTION}\n\n{context}".rstrip() + f"\n\nFile: {filename}"
-    blocks.append({"type": "text", "text": text})
+        strips = page.get("crops") or []
+        for position, strip in enumerate(strips, start=1):
+            blocks.append(
+                {
+                    "type": "text",
+                    "text": (
+                        f"Page {page['index']}, close-up strip {position} of {len(strips)} "
+                        f"(right-hand part of the page, {strip['label']}, higher zoom):"
+                    ),
+                }
+            )
+            blocks.append(_image_block(strip["png"]))
+    text = "\n\n".join(
+        part for part in (USER_INSTRUCTION, chunk_context(pages, total), context) if part
+    )
+    blocks.append({"type": "text", "text": f"{text}\n\nFile: {filename}"})
     return blocks
+
+
+def chunk_page_list(pages: list[dict[str, Any]], chunk_pages: int) -> list[list[dict[str, Any]]]:
+    """Split rendered pages into consecutive groups of at most ``chunk_pages``."""
+
+    size = max(1, int(chunk_pages))
+    return [pages[start : start + size] for start in range(0, len(pages), size)]
 
 
 def build_document_content(
@@ -978,14 +1295,15 @@ def _request_kwargs(
         "thinking": {"type": "adaptive"},
         "messages": [{"role": "user", "content": content}],
     }
+    effort = resolve_effort()
     if structured:
         kwargs["output_config"] = {
-            "effort": EFFORT,
+            "effort": effort,
             "format": {"type": "json_schema", "schema": PTR_VISION_SCHEMA},
         }
     else:
         if with_output_config:
-            kwargs["output_config"] = {"effort": EFFORT}
+            kwargs["output_config"] = {"effort": effort}
         kwargs["tools"] = [
             {
                 "name": VISION_TOOL_NAME,
@@ -1225,6 +1543,10 @@ def _comparable(row: dict[str, Any], field: str) -> Any:
     if isinstance(value, bool):
         return value
     text = str(value).strip().lower()
+    if field == "transaction_type" and text == "sale_partial":
+        # The attachment form ticks "Sale" and "Partial Sale" together, and the
+        # site collapses both to "sale": the two readings agree on the trade.
+        return "sale"
     return text or None
 
 
@@ -1287,18 +1609,59 @@ def _merge_comment(*comments: Any) -> str | None:
     return max(texts, key=len)
 
 
+def _letter(row: dict[str, Any]) -> str | None:
+    value = row.get("amount_column_letter")
+    if value is None:
+        return None
+    text = str(value).strip().upper()
+    return text if text in AMOUNT_LETTERS else None
+
+
+def apply_amount_letter_check(rows: list[dict[str, Any]]) -> tuple[list[dict[str, Any]], int]:
+    """Null the amount on rows whose column letter and dollar band disagree.
+
+    The prompt asks the model to count boxes from column A and to make the
+    band agree with the letter; when it did not, one of the two is a miscount
+    and neither can be trusted. The row is downgraded to ``partial`` and
+    flagged so :func:`merge_matched_rows` treats its amount as unconfirmed.
+    Returns ``(rows, conflicts)``.
+    """
+
+    conflicts = 0
+    for row in rows:
+        letter = _letter(row)
+        band = AMOUNT_LETTER_BANDS.get(letter or "")
+        if band is None:
+            continue
+        if _comparable(row, "amount") != band:
+            conflicts += 1
+            row["amount_min"] = None
+            row["amount_max"] = None
+            row["_amount_letter_conflict"] = True
+            row["legibility"] = _downgrade(
+                _worst_legibility(row.get("legibility")), "partial"
+            )
+            note = f"amount column letter {letter} does not match the reported band"
+            existing = _merge_comment(row.get("comment"))
+            row["comment"] = f"{existing}; {note}" if existing else note
+    return rows, conflicts
+
+
 def merge_matched_rows(row_a: dict[str, Any], row_b: dict[str, Any]) -> tuple[dict[str, Any], list[str]]:
     """Merge one matched pair, keeping only fields both reads agree on.
 
     Returns ``(merged_row, disagreements)``. A disagreement on a
     :data:`CRITICAL_FIELDS` entry nulls the field and marks the row
     ``illegible``; on a :data:`SOFT_FIELDS` entry it nulls the field and marks
-    the row at least ``partial``. The asset description keeps the reading the
-    model was more confident about (``clear`` over ``partial``), and the longer
-    of the two when it rated both the same.
+    the row at least ``partial``. A disagreement on the amount column letter,
+    or a letter/band conflict inside either read, nulls the amount and marks
+    the row ``partial``. The asset description keeps the reading the model was
+    more confident about (``clear`` over ``partial``), and the longer of the
+    two when it rated both the same.
     """
 
     merged: dict[str, Any] = dict(row_a)
+    merged.pop("_amount_letter_conflict", None)
     disagreements: list[str] = []
 
     desc_a = str(row_a.get("asset_description") or "").strip()
@@ -1310,17 +1673,36 @@ def merge_matched_rows(row_a: dict[str, Any], row_b: dict[str, Any]) -> tuple[di
     else:
         merged["asset_description"] = desc_a
 
+    letter_a, letter_b = _letter(row_a), _letter(row_b)
+    letter_conflict = bool(
+        row_a.get("_amount_letter_conflict") or row_b.get("_amount_letter_conflict")
+    )
+    letters_disagree = bool(letter_a and letter_b and letter_a != letter_b)
+
     for field in CRITICAL_FIELDS + SOFT_FIELDS:
         value_a = _comparable(row_a, field)
         value_b = _comparable(row_b, field)
         if field == "amount":
-            if value_a != value_b:
+            if letters_disagree or letter_conflict:
                 merged["amount_min"] = None
                 merged["amount_max"] = None
+                merged["amount_column_letter"] = None
+                disagreements.append("amount_column_letter")
+            elif value_a != value_b:
+                merged["amount_min"] = None
+                merged["amount_max"] = None
+                merged["amount_column_letter"] = None
                 disagreements.append("amount")
+            else:
+                merged["amount_column_letter"] = letter_a or letter_b
             continue
         if value_a == value_b:
             merged[field] = row_a.get(field) if row_a.get(field) is not None else row_b.get(field)
+            if field == "transaction_type" and "sale_partial" in (
+                str(row_a.get(field) or "").lower(),
+                str(row_b.get(field) or "").lower(),
+            ):
+                merged[field] = "sale_partial"  # keep the more specific reading
         else:
             merged[field] = None
             disagreements.append(field)
@@ -1342,6 +1724,7 @@ def merge_matched_rows(row_a: dict[str, Any], row_b: dict[str, Any]) -> tuple[di
 
 def _unmatched(row: dict[str, Any], label: str) -> dict[str, Any]:
     copy = dict(row)
+    copy.pop("_amount_letter_conflict", None)
     copy["legibility"] = "illegible"
     note = f"seen by only one of two reads ({label})"
     existing = _merge_comment(copy.get("comment"))
@@ -1392,6 +1775,23 @@ def reconcile_reads(
     return merged_rows, agreement
 
 
+def _single_read_fallback(rows_a: list[dict[str, Any]], reason: str) -> tuple[list[dict[str, Any]], dict[str, Any]]:
+    """Only read A is usable: nothing can be confirmed, so every row goes to a human."""
+
+    rows = [_unmatched(row, "read A") for row in rows_a]
+    agreement = {
+        "rowsA": len(rows_a),
+        "rowsB": None,
+        "matched": 0,
+        "unmatchedA": len(rows_a),
+        "unmatchedB": 0,
+        "rowCountsAgree": False,
+        "fieldDisagreements": {},
+        "readBFailed": reason,
+    }
+    return rows, agreement
+
+
 # -- Metadata ---------------------------------------------------------------
 
 
@@ -1401,7 +1801,8 @@ def build_vision_metadata(report: dict[str, Any]) -> dict[str, Any]:
     The raw transcription is deliberately dropped: the normalized rows already
     land in ``metadata.parsedTransactions``, and this record only has to explain
     what the model was asked, what it cost, and why a filing did or did not
-    leave the review queue.
+    leave the review queue. ``pdfSha256`` and ``at`` let a later run reuse the
+    result instead of paying for it again.
     """
 
     usage = report.get("usage") or {}
@@ -1413,6 +1814,9 @@ def build_vision_metadata(report: dict[str, Any]) -> dict[str, Any]:
         "model": model,
         "orientationModel": orientation_model,
         "parserVersion": report.get("parser_version"),
+        "effort": report.get("effort"),
+        "at": report.get("at"),
+        "pdfSha256": report.get("pdf_sha256"),
         "ok": bool(report.get("ok")),
         "skipped": bool(report.get("skipped")),
         "reason": report.get("reason"),
@@ -1420,15 +1824,20 @@ def build_vision_metadata(report: dict[str, Any]) -> dict[str, Any]:
         "attempts": report.get("attempts"),
         "structuredOutput": report.get("structuredOutput"),
         "rowCount": len(report.get("transactions") or []),
+        "noTransactions": bool(report.get("no_transactions")),
         "legibility": report.get("legibility"),
         "confidence": report.get("confidence"),
         "needsReview": bool(report.get("needs_review", True)),
+        "needsReviewReasons": report.get("needs_review_reasons") or [],
         "pageCount": report.get("page_count"),
+        "chunkPages": report.get("chunk_pages"),
+        "chunks": report.get("chunks") or [],
         "filerName": report.get("filer_name"),
         "filingDate": report.get("filing_date"),
         "notes": (report.get("notes") or None),
         "orientation": report.get("orientation"),
         "readAgreement": report.get("read_agreement"),
+        "amountLetterConflicts": int(report.get("amount_letter_conflicts") or 0),
         "calls": report.get("calls") or [],
         "usage": {
             "inputTokens": int(usage.get("input") or 0),
@@ -1437,6 +1846,8 @@ def build_vision_metadata(report: dict[str, Any]) -> dict[str, Any]:
             "outputTokens": int(usage.get("output") or 0),
         },
         "costUsd": report.get("cost_usd", 0.0),
+        "costEstimateUsd": report.get("cost_estimate_usd"),
+        "costCeilingUsd": report.get("cost_ceiling_usd"),
         "pricing": {
             "inputPerMTok": price_in,
             "outputPerMTok": price_out,
@@ -1452,6 +1863,9 @@ def build_vision_metadata(report: dict[str, Any]) -> dict[str, Any]:
 
 
 # -- Entry point ------------------------------------------------------------
+
+#: Row summaries kept per call record; the rest is counted, not stored.
+MAX_ROW_SUMMARIES_PER_CALL = 60
 
 
 def _call_record(label: str, model: str, usage: dict[str, int], cost: float, **extra: Any) -> dict[str, Any]:
@@ -1473,6 +1887,9 @@ def row_summary(row: dict[str, Any]) -> str:
     """
 
     amount = f"{row.get('amount_min')}-{row.get('amount_max')}"
+    letter = _letter(row)
+    if letter:
+        amount = f"{amount} ({letter})"
     parts = (
         str(row.get("asset_description") or "").strip(),
         str(row.get("transaction_type") or "?"),
@@ -1485,6 +1902,133 @@ def row_summary(row: dict[str, Any]) -> str:
     return " | ".join(parts)
 
 
+def _row_summaries(rows: list[dict[str, Any]]) -> list[str]:
+    summaries = [row_summary(row) for row in rows[:MAX_ROW_SUMMARIES_PER_CALL]]
+    if len(rows) > MAX_ROW_SUMMARIES_PER_CALL:
+        summaries.append(f"... {len(rows) - MAX_ROW_SUMMARIES_PER_CALL} more row(s)")
+    return summaries
+
+
+def _page_range(pages: list[dict[str, Any]] | None) -> str:
+    if not pages:
+        return "all"
+    first, last = pages[0]["index"], pages[-1]["index"]
+    return str(first) if first == last else f"{first}-{last}"
+
+
+def _read_pages(
+    client: Any,
+    pages: list[dict[str, Any]] | None,
+    state: _ReadState,
+    *,
+    label: str,
+    filename: str,
+    context: str,
+    total_pages: int,
+    content: list[dict[str, Any]] | None = None,
+    depth: int = 0,
+) -> dict[str, Any]:
+    """One logical read of a page group.
+
+    A read that stops at ``max_tokens`` is retried once as two half-size
+    groups (``depth`` 1); a half that still truncates fails the read. Returns
+    ``{"ok", "reason", "stop_reason", "payloads", "rows", "flags", "calls",
+    "usage", "cost_usd", "attempts", "halved"}`` where ``flags`` collects
+    ``no_transactions_stated`` from each payload.
+    """
+
+    if content is None:
+        content = build_image_content(pages or [], filename, context, total_pages)
+    page_range = _page_range(pages)
+    outcome = _read_once(client, content, state, label=f"{label} pages {page_range}", filename=filename)
+    rows = _coerce_transactions((outcome["payload"] or {}).get("transactions"))
+    call = _call_record(
+        label,
+        resolve_model_id(),
+        outcome["usage"],
+        outcome["cost_usd"],
+        pages=page_range,
+        ok=outcome["ok"],
+        reason=outcome["reason"],
+        attempts=outcome["attempts"],
+        stopReason=outcome["stop_reason"],
+        rows=_row_summaries(rows) if outcome["ok"] else None,
+    )
+    result: dict[str, Any] = {
+        "ok": outcome["ok"],
+        "reason": outcome["reason"],
+        "stop_reason": outcome["stop_reason"],
+        "payloads": [outcome["payload"]] if outcome["ok"] else [],
+        "rows": rows if outcome["ok"] else [],
+        "flags": [bool((outcome["payload"] or {}).get("no_transactions_stated"))] if outcome["ok"] else [],
+        "calls": [call],
+        "usage": dict(outcome["usage"]),
+        "cost_usd": float(outcome["cost_usd"]),
+        "attempts": int(outcome["attempts"]),
+        "halved": False,
+    }
+
+    if outcome["stop_reason"] != "max_tokens" or not pages or len(pages) < 2 or depth > 0:
+        return result
+
+    # Truncated: retry once with the page group halved.
+    middle = len(pages) // 2
+    logger.warning(
+        "ptr_vision: %s pages %s truncated at max_tokens; retrying as two halves",
+        label,
+        page_range,
+    )
+    combined: dict[str, Any] = {
+        "ok": True,
+        "reason": None,
+        "stop_reason": None,
+        "payloads": [],
+        "rows": [],
+        "flags": [],
+        "calls": list(result["calls"]),
+        "usage": dict(result["usage"]),
+        "cost_usd": result["cost_usd"],
+        "attempts": result["attempts"],
+        "halved": True,
+    }
+    for half in (pages[:middle], pages[middle:]):
+        sub = _read_pages(
+            client,
+            half,
+            state,
+            label=label,
+            filename=filename,
+            context=context,
+            total_pages=total_pages,
+            depth=depth + 1,
+        )
+        combined["calls"].extend(sub["calls"])
+        combined["usage"] = sum_usage(combined["usage"], sub["usage"])
+        combined["cost_usd"] = round(combined["cost_usd"] + sub["cost_usd"], 6)
+        combined["attempts"] += sub["attempts"]
+        if not sub["ok"]:
+            combined["ok"] = False
+            combined["reason"] = (
+                f"{sub['reason']} (pages {_page_range(half)}, after halving)"
+                if sub["stop_reason"] == "max_tokens"
+                else sub["reason"]
+            )
+            combined["stop_reason"] = sub["stop_reason"]
+            break
+        combined["payloads"].extend(sub["payloads"])
+        combined["rows"].extend(sub["rows"])
+        combined["flags"].extend(sub["flags"])
+    return combined
+
+
+def _first_header(payloads: list[dict[str, Any]], field: str) -> Any:
+    for payload in payloads:
+        value = payload.get(field)
+        if value is not None:
+            return value
+    return None
+
+
 def extract_via_vision(
     pdf_path: Path,
     *,
@@ -1495,9 +2039,11 @@ def extract_via_vision(
 
     Always returns a dict. ``ok`` is False and ``reason`` is set whenever the
     filing was skipped or the call failed; the caller then leaves the stub in
-    ``needs_review`` and records ``reason`` in its metadata. ``filing_year``
-    drives the example-row scrub; ``filing_date`` (YYYY-MM-DD) is passed to the
-    model as a hint for two-digit years.
+    ``needs_review`` and records ``reason`` in its metadata. ``ok`` is True
+    with an empty ``transactions`` list and ``no_transactions`` set when both
+    reads agree the form states there is nothing to report. ``filing_year``
+    drives the example-row scrub; ``filing_date`` (YYYY-MM-DD) is passed to
+    the model as a hint for two-digit years.
     """
 
     if vision_disabled():
@@ -1512,12 +2058,15 @@ def extract_via_vision(
         return _skip(f"pdf not found: {pdf_path}")
 
     pdf_bytes = pdf_path.read_bytes()
+    pdf_sha256 = hashlib.sha256(pdf_bytes).hexdigest()
     size = len(pdf_bytes)
     if size > MAX_VISION_PDF_BYTES:
         logger.warning(
             "ptr_vision: %s is %d bytes (> %d)", pdf_path.name, size, MAX_VISION_PDF_BYTES
         )
-        return _skip(f"pdf too large: {size} bytes (limit {MAX_VISION_PDF_BYTES})")
+        return _skip(
+            f"pdf too large: {size} bytes (limit {MAX_VISION_PDF_BYTES})", pdf_sha256=pdf_sha256
+        )
 
     page_count = count_pdf_pages(pdf_path)
     if page_count is not None and page_count > MAX_VISION_PDF_PAGES:
@@ -1530,17 +2079,49 @@ def extract_via_vision(
         return _skip(
             f"pdf too long: {page_count} pages (limit {MAX_VISION_PDF_PAGES})",
             page_count=page_count,
+            pdf_sha256=pdf_sha256,
         )
     if page_count is None:
         logger.debug("ptr_vision: no PDF reader available; skipping the page-count guardrail")
 
-    client = _client_once()
     model = resolve_model_id()
+    chunk_pages = resolve_chunk_pages()
+    ceiling = resolve_max_filing_cost_usd()
+    estimate = 0.0
+    if page_count:
+        # Pre-flight, before any API call: no close-up strips are assumed yet.
+        estimate = estimate_filing_cost_usd(page_count, model=model, chunk_pages=chunk_pages)
+        if estimate > ceiling:
+            logger.warning(
+                "ptr_vision: %s refused: estimated $%.2f for %d pages > $%.2f ceiling",
+                pdf_path.name,
+                estimate,
+                page_count,
+                ceiling,
+            )
+            return _skip(
+                f"estimated cost ${estimate:.2f} for {page_count} pages exceeds the "
+                f"${ceiling:.2f} ceiling (CAPITOL_PTR_VISION_MAX_COST_USD)",
+                page_count=page_count,
+                pdf_sha256=pdf_sha256,
+                cost_estimate_usd=estimate,
+                cost_ceiling_usd=ceiling,
+            )
+
+    client = _client_once()
     context = filing_context(filing_year, filing_date)
     calls: list[dict[str, Any]] = []
 
+    def _cost_so_far() -> float:
+        return round(sum(float(call["costUsd"]) for call in calls), 6)
+
+    def _usage_so_far() -> dict[str, int]:
+        return sum_usage(*(call["usage"] for call in calls))
+
     # Upright page images when pymupdf can render them, the raw PDF otherwise.
     orientation: list[dict[str, Any]] | None = None
+    chunks: list[list[dict[str, Any]] | None]
+    document_content: list[dict[str, Any]] | None = None
     prepared = prepare_page_images(pdf_path, client)
     if prepared is not None:
         pages, orientation, orient_usage = prepared
@@ -1551,160 +2132,287 @@ def extract_via_vision(
                 ORIENTATION_MODEL_ID,
                 orient_usage,
                 orient_cost,
-                pages=len(pages),
+                pages=_page_range(pages),
             )
         )
-        content = build_image_content(pages, pdf_path.name, context)
-        if page_count is None:
+        if page_count is None or page_count != len(pages):
             page_count = len(pages)
+        strips = sum(len(page.get("crops") or []) for page in pages)
+        estimate = estimate_filing_cost_usd(
+            len(pages),
+            model=model,
+            strips_per_page=strips / max(1, len(pages)),
+            chunk_pages=chunk_pages,
+        )
+        if estimate > ceiling:
+            logger.warning(
+                "ptr_vision: %s refused after rendering: estimated $%.2f (%d pages, %d strips) > $%.2f",
+                pdf_path.name,
+                estimate,
+                len(pages),
+                strips,
+                ceiling,
+            )
+            return _skip(
+                f"estimated cost ${estimate:.2f} for {len(pages)} pages with {strips} close-up "
+                f"strips exceeds the ${ceiling:.2f} ceiling (CAPITOL_PTR_VISION_MAX_COST_USD)",
+                page_count=page_count,
+                pdf_sha256=pdf_sha256,
+                cost_estimate_usd=estimate,
+                cost_ceiling_usd=ceiling,
+                orientation=orientation,
+                calls=calls,
+                usage=_usage_so_far(),
+                cost_usd=_cost_so_far(),
+            )
+        chunks = list(chunk_page_list(pages, chunk_pages))
         logger.info(
-            "ptr_vision: %s -> %d upright page image(s) %s",
+            "ptr_vision: %s -> %d upright page image(s), %d close-up strip(s), %d chunk(s) of <=%d; "
+            "estimate $%.2f (ceiling $%.2f) %s",
             pdf_path.name,
             len(pages),
+            strips,
+            len(chunks),
+            chunk_pages,
+            estimate,
+            ceiling,
             [(entry["rotation"], entry["method"]) for entry in orientation],
         )
     else:
         # Base64 with no newlines, as the document content block requires.
         pdf_b64 = base64.standard_b64encode(pdf_bytes).decode("ascii")
-        content = build_document_content(pdf_b64, pdf_path.name, context)
+        document_content = build_document_content(pdf_b64, pdf_path.name, context)
+        chunks = [None]
         logger.info("ptr_vision: %s -> sending the PDF as a document block", pdf_path.name)
 
     state = _ReadState()
-    reads: list[dict[str, Any]] = []
-    for position in range(READS_PER_FILING):
-        label = f"read {'AB'[position] if position < 2 else position + 1}"
-        outcome = _read_once(client, content, state, label=label, filename=pdf_path.name)
-        raw_rows = _coerce_transactions((outcome["payload"] or {}).get("transactions"))
-        calls.append(
-            _call_record(
-                label,
-                model,
-                outcome["usage"],
-                outcome["cost_usd"],
-                ok=outcome["ok"],
-                reason=outcome["reason"],
-                attempts=outcome["attempts"],
-                stopReason=outcome["stop_reason"],
-                rows=[row_summary(row) for row in raw_rows] if outcome["ok"] else None,
-            )
-        )
-        reads.append(outcome)
-        if position == 0 and not outcome["ok"]:
-            # A first read that refused, truncated, or errored would fail the
-            # same way again; do not pay for the second.
-            break
+    total_pages = int(page_count or 0)
+    all_rows: list[dict[str, Any]] = []
+    payloads: list[dict[str, Any]] = []
+    chunk_records: list[dict[str, Any]] = []
+    attempts = 0
+    scrubs_total = 0
+    letter_conflicts_total = 0
+    disagreement_totals: dict[str, int] = {}
+    rows_a_total = rows_b_total = matched_total = unmatched_a_total = unmatched_b_total = 0
+    row_counts_agree = True
+    read_b_failures: list[str] = []
+    no_transactions_chunks = 0
+    stop_reason: Any = None
 
-    usage = sum_usage(*(call["usage"] for call in calls))
-    cost = round(sum(float(call["costUsd"]) for call in calls), 6)
-    attempts = sum(int(read["attempts"]) for read in reads)
-    read_a = reads[0]
-    if not read_a["ok"]:
-        return _skip(
-            str(read_a["reason"]),
-            usage=usage,
-            cost_usd=cost,
-            stop_reason=read_a["stop_reason"],
-            attempts=attempts,
-            orientation=orientation,
-            calls=calls,
-            page_count=page_count,
-        )
-
-    payload_a = read_a["payload"] or {}
-    rows_a, scrubs_a = scrub_example_row_values(
-        _coerce_transactions(payload_a.get("transactions")), filing_year
-    )
-
-    read_b = reads[1] if len(reads) > 1 else None
-    payload_b: dict[str, Any] = {}
-    if read_b is not None and read_b["ok"]:
-        payload_b = read_b["payload"] or {}
-        rows_b, scrubs_b = scrub_example_row_values(
-            _coerce_transactions(payload_b.get("transactions")), filing_year
-        )
-        transactions, agreement = reconcile_reads(rows_a, rows_b)
-    else:
-        # Only one usable read: nothing can be confirmed, so every row goes to
-        # a human. Its values are kept so the reviewer has something to check.
-        scrubs_b = 0
-        transactions = [_unmatched(row, "read A") for row in rows_a]
-        agreement = {
-            "rowsA": len(rows_a),
-            "rowsB": None,
-            "matched": 0,
-            "unmatchedA": len(rows_a),
-            "unmatchedB": 0,
-            "rowCountsAgree": False,
-            "fieldDisagreements": {},
-            "readBFailed": (read_b or {}).get("reason") or "second read not attempted",
+    for chunk_index, chunk in enumerate(chunks, start=1):
+        page_range = _page_range(chunk)
+        read_kwargs: dict[str, Any] = {
+            "filename": pdf_path.name,
+            "context": context,
+            "total_pages": total_pages,
         }
+        if chunk is None:
+            read_kwargs["content"] = document_content
 
+        read_a = _read_pages(client, chunk, state, label="read A", **read_kwargs)
+        calls.extend(read_a["calls"])
+        attempts += read_a["attempts"]
+        stop_reason = read_a["stop_reason"]
+        if not read_a["ok"]:
+            # A first read that refused, truncated twice, or errored would fail
+            # the same way again; do not pay for the second.
+            reason = str(read_a["reason"])
+            if chunk is not None and len(chunks) > 1 and "pages" not in reason:
+                reason = f"{reason} (pages {page_range})"
+            return _skip(
+                reason,
+                usage=_usage_so_far(),
+                cost_usd=_cost_so_far(),
+                stop_reason=stop_reason,
+                attempts=attempts,
+                orientation=orientation,
+                calls=calls,
+                page_count=page_count,
+                chunks=chunk_records,
+                chunk_pages=chunk_pages,
+                pdf_sha256=pdf_sha256,
+                cost_estimate_usd=estimate,
+                cost_ceiling_usd=ceiling,
+            )
+
+        read_b = _read_pages(client, chunk, state, label="read B", **read_kwargs)
+        calls.extend(read_b["calls"])
+        attempts += read_b["attempts"]
+
+        rows_a, scrubs_a = scrub_example_row_values(list(read_a["rows"]), filing_year)
+        rows_a, conflicts_a = apply_amount_letter_check(rows_a)
+        scrubs_total += scrubs_a
+        letter_conflicts_total += conflicts_a
+        payloads.extend(read_a["payloads"])
+        if read_b["ok"]:
+            rows_b, scrubs_b = scrub_example_row_values(list(read_b["rows"]), filing_year)
+            rows_b, conflicts_b = apply_amount_letter_check(rows_b)
+            scrubs_total += scrubs_b
+            letter_conflicts_total += conflicts_b
+            payloads.extend(read_b["payloads"])
+            merged, agreement = reconcile_reads(rows_a, rows_b)
+            if not rows_a and not rows_b and any(read_a["flags"]) and any(read_b["flags"]):
+                no_transactions_chunks += 1
+        else:
+            merged, agreement = _single_read_fallback(rows_a, str(read_b["reason"]))
+            read_b_failures.append(f"pages {page_range}: {read_b['reason']}")
+
+        all_rows.extend(merged)
+        rows_a_total += int(agreement["rowsA"] or 0)
+        if agreement.get("rowsB") is not None:
+            rows_b_total += int(agreement["rowsB"])
+        matched_total += int(agreement["matched"])
+        unmatched_a_total += int(agreement["unmatchedA"])
+        unmatched_b_total += int(agreement["unmatchedB"])
+        row_counts_agree = row_counts_agree and bool(agreement.get("rowCountsAgree"))
+        for field, count in (agreement.get("fieldDisagreements") or {}).items():
+            disagreement_totals[field] = disagreement_totals.get(field, 0) + int(count)
+        chunk_usage = sum_usage(read_a["usage"], read_b["usage"])
+        chunk_records.append(
+            {
+                "chunk": chunk_index,
+                "pages": page_range,
+                "rowsA": agreement["rowsA"],
+                "rowsB": agreement.get("rowsB"),
+                "matched": agreement["matched"],
+                "fieldDisagreements": agreement.get("fieldDisagreements") or {},
+                "halvedA": read_a["halved"],
+                "halvedB": read_b["halved"],
+                "readBFailed": None if read_b["ok"] else read_b["reason"],
+                "letterConflicts": conflicts_a + (conflicts_b if read_b["ok"] else 0),
+                "usage": chunk_usage,
+                "costUsd": round(read_a["cost_usd"] + read_b["cost_usd"], 6),
+            }
+        )
+
+        spent = _cost_so_far()
+        if spent > ceiling * COST_OVERRUN_FACTOR and chunk_index < len(chunks):
+            logger.error(
+                "ptr_vision: %s abandoned after pages %s: $%.2f spent > %.1fx the $%.2f ceiling",
+                pdf_path.name,
+                page_range,
+                spent,
+                COST_OVERRUN_FACTOR,
+                ceiling,
+            )
+            return _skip(
+                f"cost ceiling exceeded mid-filing: ${spent:.2f} spent after pages {page_range} "
+                f"(ceiling ${ceiling:.2f} x {COST_OVERRUN_FACTOR})",
+                usage=_usage_so_far(),
+                cost_usd=spent,
+                stop_reason=stop_reason,
+                attempts=attempts,
+                orientation=orientation,
+                calls=calls,
+                page_count=page_count,
+                chunks=chunk_records,
+                chunk_pages=chunk_pages,
+                pdf_sha256=pdf_sha256,
+                cost_estimate_usd=estimate,
+                cost_ceiling_usd=ceiling,
+            )
+
+    read_agreement: dict[str, Any] = {
+        "rowsA": rows_a_total,
+        "rowsB": None if read_b_failures and not rows_b_total else rows_b_total,
+        "matched": matched_total,
+        "unmatchedA": unmatched_a_total,
+        "unmatchedB": unmatched_b_total,
+        "rowCountsAgree": row_counts_agree,
+        "fieldDisagreements": disagreement_totals,
+        "chunks": len(chunk_records),
+    }
+    if read_b_failures:
+        read_agreement["readBFailed"] = "; ".join(read_b_failures)
+
+    transactions = all_rows
+    no_transactions = not transactions and no_transactions_chunks > 0 and not read_b_failures
     counts = summarize_legibility(transactions)
-    confidence = legibility_confidence(counts)
+    confidence = 0.9 if no_transactions else legibility_confidence(counts)
+
     review_reasons: list[str] = []
-    if majority_illegible(counts):
+    if not no_transactions and majority_illegible(counts):
         review_reasons.append("majority illegible")
-    if not agreement.get("rowCountsAgree"):
+    if not read_agreement["rowCountsAgree"]:
         review_reasons.append("reads disagree on row count")
     critical = {
         field: count
-        for field, count in (agreement.get("fieldDisagreements") or {}).items()
+        for field, count in disagreement_totals.items()
         if field in CRITICAL_FIELDS
     }
     if critical:
         review_reasons.append("reads disagree on " + ", ".join(sorted(critical)))
+    letter_issues = letter_conflicts_total + int(disagreement_totals.get("amount_column_letter") or 0)
+    if letter_issues:
+        review_reasons.append("amount nulled after column-letter conflict")
     needs_review = bool(review_reasons)
 
-    def _header(field: str) -> Any:
-        value = payload_a.get(field)
-        return value if value is not None else payload_b.get(field)
-
-    notes = [
-        _clean_optional_text(payload_a.get("notes")),
-        _clean_optional_text(payload_b.get("notes")),
-    ]
+    notes = [_clean_optional_text(payload.get("notes")) for payload in payloads]
     unique_notes = [note for index, note in enumerate(notes) if note and note not in notes[:index]]
+    joined_notes = " | ".join(unique_notes)
+    if len(joined_notes) > 2000:
+        joined_notes = joined_notes[:1997] + "..."
 
-    reported_pages = _header("page_count")
+    reported_pages = _first_header(payloads, "page_count") if len(chunks) == 1 else None
+    if no_transactions:
+        reason: str | None = "form states no transactions"
+    elif transactions:
+        reason = None
+    else:
+        reason = "model returned no transaction rows"
+
     result: dict[str, Any] = {
-        "ok": bool(transactions),
+        "ok": bool(transactions) or no_transactions,
         "skipped": False,
-        "reason": None if transactions else "model returned no transaction rows",
+        "reason": reason,
         "model": model,
         "orientation_model": ORIENTATION_MODEL_ID,
         "parser_version": VISION_PARSER_VERSION,
-        "filer_name": _clean_optional_text(_header("filer_name")),
-        "filing_date": _clean_optional_text(_header("filing_date")),
+        "effort": resolve_effort(),
+        "at": _now_iso(),
+        "pdf_sha256": pdf_sha256,
+        "filer_name": _clean_optional_text(_first_header(payloads, "filer_name")),
+        "filing_date": _clean_optional_text(_first_header(payloads, "filing_date")),
         "page_count": reported_pages if reported_pages is not None else page_count,
-        "notes": " | ".join(unique_notes) or None,
+        "notes": joined_notes or None,
+        "no_transactions": no_transactions,
         "transactions": transactions,
         "legibility": counts,
         "confidence": confidence,
         "needs_review": needs_review,
         "needs_review_reasons": review_reasons,
-        "usage": usage,
-        "cost_usd": cost,
-        "stop_reason": read_a["stop_reason"],
+        "usage": _usage_so_far(),
+        "cost_usd": _cost_so_far(),
+        "cost_estimate_usd": estimate,
+        "cost_ceiling_usd": ceiling,
+        "stop_reason": stop_reason,
         "attempts": attempts,
         "structuredOutput": state.structured,
         "orientation": orientation,
-        "read_agreement": agreement,
-        "example_row_scrubs": scrubs_a + scrubs_b,
+        "read_agreement": read_agreement,
+        "chunks": chunk_records,
+        "chunk_pages": chunk_pages,
+        "example_row_scrubs": scrubs_total,
+        "amount_letter_conflicts": letter_conflicts_total,
         "calls": calls,
     }
 
     logger.info(
-        "ptr_vision: %s -> %d rows (clear=%d partial=%d illegible=%d) agreement=%s "
-        "confidence=%.2f needsReview=%s cost=$%.4f usage=%s",
+        "ptr_vision: %s -> %d rows (clear=%d partial=%d illegible=%d) noTransactions=%s "
+        "agreement=%s chunks=%d confidence=%.2f needsReview=%s cost=$%.4f (estimate $%.2f) usage=%s",
         pdf_path.name,
         len(transactions),
         counts["clear"],
         counts["partial"],
         counts["illegible"],
-        {k: agreement.get(k) for k in ("rowsA", "rowsB", "matched")},
+        no_transactions,
+        {k: read_agreement.get(k) for k in ("rowsA", "rowsB", "matched")},
+        len(chunk_records),
         confidence,
         needs_review,
-        cost,
-        usage,
+        result["cost_usd"],
+        estimate,
+        result["usage"],
     )
     return result

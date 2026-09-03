@@ -109,9 +109,27 @@ Required environment on the box:
   the queue. Use this first if spend or output quality looks wrong; you do not
   need to redeploy.
 
+- `CAPITOL_PTR_VISION_EFFORT` — `low`..`max`, default `medium`; use `high` for a
+  queue of handwritten forms.
+- `CAPITOL_PTR_VISION_CHUNK_PAGES` — pages per read request, default 4.
+- `CAPITOL_PTR_VISION_MAX_COST_USD` — per-filing ceiling on the pre-flight
+  estimate (pages x two reads x per-page rate + orientation), default 25 so a
+  60-page filing fits at the measured ~$0.40 a page (medium effort, strips on;
+  `CAPITOL_PTR_VISION_EFFORT=low` is the cost lever). A refused filing records `estimated cost $X ... exceeds
+  the $Y ceiling` in `visionParse.reason` with `costEstimateUsd` /
+  `costCeilingUsd`; a filing that overruns 1.5x the ceiling mid-way is
+  abandoned with what it spent recorded.
+- `CAPITOL_PTR_VISION_GRID_ZOOM` — close-up strip zoom (default 2, 0 disables).
+
 Guardrails, in order: the env kill switch, missing credentials, PDFs over 20 MB,
-PDFs over 25 pages, one filing per call, one retry on 429/5xx, and `--limit` as
-the hard per-run cap. Skipped filings keep `needs_review` and record why.
+PDFs over 60 pages, the cost ceiling, one filing per call, one retry on 429/5xx
+per read (plus one halved retry when a read truncates at `max_tokens`), and
+`--limit` as the hard per-run cap. Skipped filings keep `needs_review` and
+record why. A filing the model reads as "nothing to report" (both reads, zero
+rows, `no_transactions_stated`) ends `parsed` with zero rows and
+`visionParse.noTransactions: true`; a stub bounced for another reason (an
+unresolved member) is re-processed for free while its PDF hash and
+`visionParse.at` are within 30 days.
 
 ### Reading the summary JSON
 

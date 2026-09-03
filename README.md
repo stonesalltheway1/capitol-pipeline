@@ -244,6 +244,19 @@ disagreement on the date, type, or amount nulls the field and marks the row
 row-count mismatch or any critical disagreement keeps the stub in review. When
 pymupdf is unavailable the PDF is sent as a `document` block instead.
 
+Long filings are read in chunks of 4 pages (paper attachments run 16-18 rows a
+page), each chunk getting its own two reads, with rows concatenated and line
+numbers continuing across chunks; a read that truncates at `max_tokens` is
+retried once with the page group halved. Landscape pages (the paper checkbox
+form) also get two close-up strips of the right-hand 58% of the page at a
+higher zoom, and the model reports the amount column letter (A-K) alongside
+the band; a letter/band mismatch inside a read, or a letter disagreement
+between reads, nulls the amount and routes the filing to review. A filing whose
+reads both return zero rows and both report `no_transactions_stated` ends
+`parsed` with zero rows and `visionParse.noTransactions: true`. A stub
+re-processed within 30 days with an unchanged PDF (`visionParse.pdfSha256`)
+reuses its previous transcription instead of paying for a new read.
+
 Vision rows are normalized through exactly the same helpers as text rows
 (`clean_asset_description`, `infer_asset_type`, `normalize_date`, the crypto
 classifier, member resolution from the stub), so they land with the same
@@ -255,11 +268,20 @@ Settings:
 - `CAPITOL_PTR_VISION_DISABLED=1` — kill switch; the path skips with a reason
   and the stub stays `needs_review`.
 - `CAPITOL_PTR_VISION_MODEL` — override the read model (default `claude-opus-5`).
+- `CAPITOL_PTR_VISION_EFFORT` — reasoning effort (`low`..`max`, default `medium`).
+- `CAPITOL_PTR_VISION_CHUNK_PAGES` — pages per read request (default 4).
+- `CAPITOL_PTR_VISION_MAX_COST_USD` — per-filing ceiling on the pre-flight cost
+  estimate (default 25, sized for a 60-page filing at the measured $0.40 a page); a filing over it is refused
+  with the estimate in `visionParse.reason`, and one that overruns 1.5x the
+  ceiling while running is abandoned.
+- `CAPITOL_PTR_VISION_GRID_ZOOM` — close-up strip zoom relative to the page
+  (default 2; 0 disables the strips).
 - `ANTHROPIC_API_KEY` (or `ANTHROPIC_AUTH_TOKEN`) — required; without it the
   path skips rather than failing the run.
 
-Guardrails: one filing per call, PDFs over 25 pages or 20 MB are skipped with a
-reason, one retry on 429/5xx, and `--limit` caps filings per run.
+Guardrails: one filing per call, PDFs over 60 pages or 20 MB are skipped with a
+reason, the cost ceiling above, one retry on 429/5xx, and `--limit` caps
+filings per run.
 
 Every attempt is recorded on the stub under `metadata.visionParse` with the
 model, token usage, estimated cost, per-row legibility counts, and the skip
