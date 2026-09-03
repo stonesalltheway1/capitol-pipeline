@@ -1,4 +1,8 @@
-"""Tests for the Claude vision PTR path. Never calls the real API.
+"""Tests for the Anthropic vision PTR path. Never calls the real API.
+
+The default provider is Gemini; this file pins ``CAPITOL_PTR_VISION_PROVIDER``
+to ``anthropic`` (and the orientation pick to ``model``) so the paid path keeps
+its coverage. The free path is covered in ``test_ptr_vision_gemini.py``.
 
 Every test patches ``ptr_vision._client_once`` (the module-level client
 factory) so the request kwargs are inspectable and no network call is made.
@@ -21,7 +25,7 @@ import pytest
 from capitol_pipeline.bridges.capitol_exposed import build_trade_id
 from capitol_pipeline.cli import resolve_house_stub_status
 from capitol_pipeline.models.congress import FilingStub, HousePtrParseResult, MemberMatch
-from capitol_pipeline.parsers import house_ptr, ptr_vision
+from capitol_pipeline.parsers import house_ptr, ptr_vision, ptr_vision_provider
 from capitol_pipeline.parsers.house_ptr import parse_house_ptr_text
 from capitol_pipeline.parsers.ptr_vision import (
     MODEL_ID,
@@ -244,6 +248,12 @@ def _install_fake_client(
 def _enable(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.delenv("CAPITOL_PTR_VISION_DISABLED", raising=False)
     monkeypatch.delenv("CAPITOL_PTR_VISION_MODEL", raising=False)
+    monkeypatch.delenv("CAPITOL_PTR_VISION_MODEL_B", raising=False)
+    # This file is the Anthropic path's test: it asserts on the Messages
+    # request dict and on Claude's prices. The default provider is Gemini and
+    # the default orientation pick is the free detector, so both are pinned.
+    monkeypatch.setenv("CAPITOL_PTR_VISION_PROVIDER", "anthropic")
+    monkeypatch.setenv("CAPITOL_PTR_VISION_ORIENTATION", "model")
     monkeypatch.setenv("ANTHROPIC_API_KEY", "sk-test-not-a-real-key")
 
 
@@ -522,7 +532,8 @@ def _orientation_client(
     captured, _ = _install_fake_client(
         monkeypatch, _payload(), orientation=answers, orientation_error=error
     )
-    return ptr_vision._client_once(), captured.orientation_requests  # type: ignore[attr-defined]
+    provider = ptr_vision_provider.AnthropicProvider(ptr_vision._client_once)
+    return provider, captured.orientation_requests  # type: ignore[attr-defined]
 
 
 def _fake_render(calls: list[tuple[int, int]]) -> Any:
@@ -1032,6 +1043,7 @@ def test_run_vision_parse_keeps_bond_names_the_text_cleaner_would_gut(
     # the guard is exercised whatever the live cleaner does.
     import re as _re
 
+    _enable(monkeypatch)
     monkeypatch.setattr(
         house_ptr,
         "clean_asset_description",

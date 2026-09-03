@@ -7,6 +7,7 @@ import hashlib
 import logging
 import re
 from pathlib import Path
+from tempfile import TemporaryDirectory
 
 from capitol_pipeline.config import OcrBackend, Settings
 from capitol_pipeline.models.congress import (
@@ -18,11 +19,14 @@ from capitol_pipeline.models.congress import (
 )
 from capitol_pipeline.normalizers.crypto_assets import classify_crypto_asset
 from capitol_pipeline.parsers.ptr_llm_fallback import extract_via_haiku
+from capitol_pipeline.parsers.ptr_upright import build_upright_pdf, upright_ocr_enabled
 from capitol_pipeline.parsers.ptr_vision import (
     VISION_PARSER_VERSION,
     VISION_REUSE_MAX_AGE_DAYS,
     build_vision_metadata,
+    current_vision_parser_version,
     extract_via_vision,
+    is_vision_parser_version,
     scrub_example_row_values,
 )
 from capitol_pipeline.processors.ocr import fix_font_mojibake, OcrProcessor
@@ -32,9 +36,20 @@ logger = logging.getLogger(__name__)
 REGEX_PARSER_VERSION = "regex-v1"
 LLM_PARSER_VERSION = "haiku-4.5-fallback-v1"
 
-#: Vision parser selection. ``off`` never calls the model, ``auto`` calls it
-#: only when the text path failed, ``claude`` always calls it for the filing.
-VISION_BACKENDS: tuple[str, ...] = ("off", "auto", "claude")
+#: Rows published from a stub's stored transcription in a later run, where the
+#: original parse predates :func:`mark_house_stub_processed` recording which
+#: parser produced it. Saying "regex-v1" there would be a guess.
+REPLAY_PARSER_VERSION = "house-ptr-text-replay-v1"
+
+#: Vision parser selection: *whether* to read the pages as images, not who
+#: reads them (that is ``CAPITOL_PTR_VISION_PROVIDER``). ``off`` never calls a
+#: model, ``auto`` calls one only when the text path failed, and ``on`` always
+#: calls one. ``claude`` and ``gemini`` are accepted spellings of ``on`` so the
+#: box's existing ``HOUSE_REVIEW_VISION_BACKEND`` keeps working.
+VISION_BACKENDS: tuple[str, ...] = ("off", "auto", "on", "claude", "gemini")
+
+#: Backend values that mean "read this filing's pages whatever the text says".
+VISION_FORCE_BACKENDS: frozenset[str] = frozenset({"on", "claude", "gemini"})
 
 #: Text-parser confidence below which ``auto`` hands the PDF to the vision model.
 VISION_CONFIDENCE_FLOOR = 0.5
@@ -671,7 +686,21 @@ def score_confidence(
 def build_trade_rows_from_house_ptr(
     parsed: HousePtrParseResult,
     stub: FilingStub,
+    *,
+    provenance: str | None = None,
 ) -> list[NormalizedTradeRow]:
+    """Turn a parsed filing into trade rows.
+
+    ``provenance`` overrides the sentence appended to every row's comment. It
+    exists for the replay path, where the rows were transcribed in an earlier
+    run and are only being published now.
+    """
+
+    default_provenance = (
+        f"Parsed from House PTR {stub.doc_id} at "
+        f"{round(parsed.parser_confidence * 100)}% confidence "
+        f"[{parsed.parser_version}]"
+    )
     rows: list[NormalizedTradeRow] = []
     for transaction in parsed.transactions:
         normalized_asset = classify_crypto_asset(transaction.ticker, transaction.asset_description)
@@ -703,9 +732,7 @@ def build_trade_rows_from_house_ptr(
                     part
                     for part in (
                         (transaction.comment or "").strip(),
-                        f"Parsed from House PTR {stub.doc_id} at "
-                        f"{round(parsed.parser_confidence * 100)}% confidence "
-                        f"[{parsed.parser_version}]",
+                        provenance or default_provenance,
                     )
                     if part
                 ),
@@ -951,7 +978,10 @@ def _run_vision_parse(
 
         if not isinstance(candidate, dict) or not candidate.get("ok"):
             return None
-        if candidate.get("parserVersion") != VISION_PARSER_VERSION:
+        # A transcription only stands in for a fresh read when the same reader
+        # would produce it today: a provider switch re-reads rather than
+        # publishing rows under a version that did not write them.
+        if candidate.get("parserVersion") != current_vision_parser_version():
             return None
         if candidate.get("pdfSha256") != pdf_sha256:
             return None
@@ -1009,7 +1039,7 @@ def _run_vision_parse(
                 member_name=parse_header_name(text_preview) or stub.member.name,
                 state=parse_header_state(text_preview) or stub.member.state,
                 parser_confidence=float(reused.get("confidence") or 0.0),
-                parser_version=VISION_PARSER_VERSION,
+                parser_version=str(reused.get("parserVersion") or VISION_PARSER_VERSION),
                 raw_text_preview=text_preview[:1200],
                 transactions=valid_cached,
                 vision_report=metadata,
@@ -1039,6 +1069,8 @@ def _run_vision_parse(
         getattr(stub, "filing_year", None),
     )
     example_scrubs += int(report.get("example_row_scrubs") or 0)
+    reported_version = str(report.get("parser_version") or "")
+    parser_version = reported_version if is_vision_parser_version(reported_version) else VISION_PARSER_VERSION
     # A row whose transaction type the two reads could not agree on would
     # otherwise default to "purchase" in _vision_to_transactions. Dropping it is
     # the safe outcome; the row count mismatch already routes the stub to review.
@@ -1078,7 +1110,7 @@ def _run_vision_parse(
                 member_name=parse_header_name(text_preview) or stub.member.name,
                 state=parse_header_state(text_preview) or stub.member.state,
                 parser_confidence=float(report.get("confidence") or 0.0),
-                parser_version=VISION_PARSER_VERSION,
+                parser_version=parser_version,
                 raw_text_preview=text_preview[:1200],
                 transactions=[],
                 vision_report=metadata,
@@ -1150,7 +1182,7 @@ def _run_vision_parse(
         member_name=parse_header_name(text_preview) or stub.member.name,
         state=parse_header_state(text_preview) or stub.member.state,
         parser_confidence=confidence,
-        parser_version=VISION_PARSER_VERSION,
+        parser_version=parser_version,
         raw_text_preview=text_preview[:1200],
         transactions=valid_transactions,
         vision_report=metadata,
@@ -1160,7 +1192,7 @@ def _run_vision_parse(
         "(parser_version=%s parser_confidence=%.2f needsReview=%s cost=$%.4f)",
         len(valid_transactions),
         pdf_path.name,
-        VISION_PARSER_VERSION,
+        parser_version,
         confidence,
         metadata.get("needsReview"),
         float(report.get("cost_usd") or 0.0),
@@ -1380,6 +1412,34 @@ def _run_ocr_chain_capped(
     return text, report
 
 
+def _ocr_image_only_pdf(
+    pdf_path: Path,
+    settings: Settings,
+    backend: str | OcrBackend,
+) -> tuple[str, dict[str, object]]:
+    """OCR an image-only filing, rendering it upright first when we can.
+
+    The rotation comes from the checkbox detector, so this costs no model call.
+    If the upright copy cannot be built the original PDF is used and the report
+    says so; the caller's behaviour is otherwise unchanged.
+    """
+
+    cap = settings.ptr_ocr_time_cap_seconds
+    if not upright_ocr_enabled():
+        return _run_ocr_chain_capped(pdf_path, settings, backend, cap)
+
+    with TemporaryDirectory(prefix="capitol-upright-") as temp_dir:
+        upright_path = Path(temp_dir) / f"{pdf_path.stem}-upright.pdf"
+        report = build_upright_pdf(pdf_path, upright_path)
+        if report is None or not upright_path.exists():
+            text, ocr_report = _run_ocr_chain_capped(pdf_path, settings, backend, cap)
+            ocr_report["upright"] = {"applied": False, "reason": "could not render upright"}
+            return text, ocr_report
+        text, ocr_report = _run_ocr_chain_capped(upright_path, settings, backend, cap)
+        ocr_report["upright"] = {"applied": True, **report}
+        return text, ocr_report
+
+
 def describe_review_reason(
     probe: TextLayerProbe | None,
     ocr_report: dict[str, object] | None,
@@ -1445,9 +1505,10 @@ def parse_house_ptr_pdf(
         text = probe.text
         ocr_report = {"status": "skipped", "reason": "text layer present"}
     elif auto_backend and probe is not None:
-        text, ocr_report = _run_ocr_chain_capped(
-            pdf_path, settings, backend, settings.ptr_ocr_time_cap_seconds
-        )
+        # An image-only scan: OCR the upright copy, not the PDF as filed. Most
+        # House scans are stored rotated 270 degrees and every OCR backend
+        # reads a sideways page as noise.
+        text, ocr_report = _ocr_image_only_pdf(pdf_path, settings, backend)
     else:
         processor = OcrProcessor(settings, backend=backend)
         result = processor.process_file(pdf_path)
@@ -1468,8 +1529,8 @@ def parse_house_ptr_pdf(
     mode = str(vision_backend or "off").strip().lower()
     if mode not in VISION_BACKENDS:
         mode = "off"
-    force_vision = mode == "claude"
-    vision_enabled = mode in {"auto", "claude"}
+    force_vision = mode in VISION_FORCE_BACKENDS
+    vision_enabled = force_vision or mode == "auto"
 
     text_has_content = bool((text or "").strip())
     decent_text = ocr_text_is_decent(text)
@@ -1482,9 +1543,13 @@ def parse_house_ptr_pdf(
     if not weak_text_parse and not force_vision:
         return parsed, rows
 
-    # The Haiku text fallback still owns the case the regex missed but the OCR
-    # text layer is genuinely readable. Skip it when the caller forced vision.
-    if not parsed.transactions and decent_text and not force_vision:
+    # The Haiku text fallback still owns the case the regex missed but the text
+    # layer is genuinely readable. Skip it when the caller forced vision, and
+    # never send it a scan: since the pages are rendered upright before OCR,
+    # a photocopy's OCR text can now clear ocr_text_is_decent, and this path
+    # would then start paying a text model to read a page the vision path (or
+    # a human) should be reading as an image.
+    if not parsed.transactions and decent_text and not force_vision and not image_only:
         logger.debug(
             "house_ptr: regex found 0 rows despite %d chars of usable text for %s; "
             "invoking the Haiku text fallback",

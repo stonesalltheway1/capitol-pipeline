@@ -1,4 +1,4 @@
-"""Claude vision extraction for scanned and handwritten House PTR PDFs.
+"""Vision extraction for scanned and handwritten House PTR PDFs.
 
 Roughly 210 House periodic transaction reports sit in
 ``house_filing_stubs.status = 'needs_review'`` because they are photocopies or
@@ -11,11 +11,14 @@ How a filing is read (v2)
 -------------------------
 1. Every page is rendered with ``pymupdf`` to a PNG at about 150 DPI with the
    long edge capped at :data:`MAX_IMAGE_LONG_EDGE` pixels.
-2. Each page is also rendered small at 0, 90, 180 and 270 degrees, and a cheap
-   ``claude-haiku-4-5`` call is shown all four and asked which one reads
-   upright; a second call confirms the pick. (Asking how far a single sideways
-   scan is turned was routinely answered "0".) If that fails, a portrait page
-   is assumed to be a sideways landscape form and rotated 90 degrees.
+2. The page is analysed at 0, 90, 180 and 270 degrees by the checkbox
+   detector and the rotation whose analysis scores highest is taken as
+   upright: a complete A-K ladder, the header printed above the rows, the
+   ladder at the right margin and the wide K column on the right are all
+   asymmetries of the form itself, so the half turn is settled without a
+   model. A page with no ladder at any rotation falls back to the heuristic
+   (a portrait page is a sideways landscape form, so rotate 90). Setting
+   ``CAPITOL_PTR_VISION_ORIENTATION=model`` restores the old paid pick.
 3. Landscape pages (the paper checkbox form) also get two close-up strips of
    the right-hand 58% of the page rendered at twice the zoom, so the amount
    ladder's tick boxes are unambiguous; the model reports the column letter
@@ -25,15 +28,23 @@ How a filing is read (v2)
    rules and the ticked cell per row, and its letter must agree with the
    model's or the amount is nulled and the filing reviewed.
 4. Pages are grouped into chunks of :func:`resolve_chunk_pages` (default 4)
-   and each chunk is sent to the read model (``claude-opus-5`` by default)
-   **twice**, as two independent requests, asking for the transaction grid
-   back as schema-constrained JSON. The model is not deterministic, so a field
-   is only trusted when both reads agree on it. Disagreements are nulled and
-   the row is marked ``illegible``; rows only one read saw are kept but marked
+   and each chunk is read **twice**, as two independent requests, asking for
+   the transaction grid back as schema-constrained JSON. On the default
+   (Gemini) provider the two reads are two different model versions, which
+   makes the disagreements real rather than sampling noise. A field is only
+   trusted when both reads agree on it: disagreements are nulled and the row
+   is marked ``illegible``; rows only one read saw are kept but marked
    ``illegible``; a row-count mismatch forces manual review. A read that
    truncates at ``max_tokens`` is retried once with the page group halved.
 5. When ``pymupdf`` is not importable the PDF itself is sent as a ``document``
-   block instead, and orientation is left to the model.
+   block instead, and orientation is left to the model. Only the Anthropic
+   provider accepts that: Gemini rasterises a PDF at its own resolution and
+   reads every two-digit year one low, so it refuses the part.
+
+Which vendor answers is :mod:`capitol_pipeline.parsers.ptr_vision_provider`
+(``CAPITOL_PTR_VISION_PROVIDER``, default ``gemini``, free of charge). This
+module builds the pages, the prompt and the schema and owns the agreement
+rules; it never branches on the provider.
 
 A filing whose reads both return zero rows and both report that the form
 states there is nothing to report is a terminal ``no_transactions`` result,
@@ -46,12 +57,16 @@ replacement.
 Guardrails
 ----------
 * ``CAPITOL_PTR_VISION_DISABLED=1`` kills the path at runtime.
+* Missing credentials for the configured provider skip the filing rather than
+  falling through to another vendor.
 * PDFs over :data:`MAX_VISION_PDF_PAGES` pages or :data:`MAX_VISION_PDF_BYTES`
   bytes are skipped with a reason; the stub stays ``needs_review``.
 * The estimated cost (pages x two reads x per-page rate, plus orientation) must
   stay under :func:`resolve_max_filing_cost_usd` (``CAPITOL_PTR_VISION_MAX_COST_USD``,
   default $25); a filing over it is refused with the estimate in the reason, and
-  a filing that overruns 1.5x the ceiling while running is abandoned.
+  a filing that overruns 1.5x the ceiling while running is abandoned. On the
+  free tier every rate is zero, so the ceiling never bites and the long typed
+  attachments the paid path had to refuse go through.
 * One filing per call, one retry on 429/5xx per read, and the caller caps
   filings per run with ``--limit``.
 
@@ -61,10 +76,8 @@ Nothing here touches the database. The caller records
 
 from __future__ import annotations
 
-import base64
 import difflib
 import hashlib
-import json
 import logging
 import os
 import re
@@ -73,38 +86,62 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
-from capitol_pipeline.parsers import ptr_grid
+from capitol_pipeline.parsers import ptr_grid, ptr_vision_provider
 
 logger = logging.getLogger(__name__)
 
 # -- Model + version --------------------------------------------------------
 
-#: Default read model. Override per-run with ``CAPITOL_PTR_VISION_MODEL``.
-MODEL_ID = "claude-opus-5"
+#: Default Anthropic read model. Override per-run with
+#: ``CAPITOL_PTR_VISION_MODEL``; which vendor answers is
+#: ``CAPITOL_PTR_VISION_PROVIDER`` (see :mod:`ptr_vision_provider`).
+MODEL_ID = ptr_vision_provider.ANTHROPIC_MODEL_ID
 
-#: Cheap model used only to decide page orientation.
-ORIENTATION_MODEL_ID = "claude-haiku-4-5"
+#: Anthropic model used only to decide page orientation, and only when
+#: ``CAPITOL_PTR_VISION_ORIENTATION=model``. The default orientation pick is
+#: free and deterministic (:func:`detect_orientation_from_grid`).
+ORIENTATION_MODEL_ID = ptr_vision_provider.ANTHROPIC_ORIENTATION_MODEL_ID
 
-#: Recorded as ``parser_version`` on every row this path produces. Named
-#: generically so a model swap does not need a new literal everywhere; use
-#: :func:`is_vision_parser_version` rather than comparing against it.
-VISION_PARSER_VERSION = "claude-vision-v2"
+#: Recorded as ``parser_version`` on every row this path produces, one per
+#: vendor so a published row says who read the page. The Anthropic literal is
+#: the one already stored on thousands of rows and does not change. Use
+#: :func:`is_vision_parser_version` rather than comparing against either.
+VISION_PARSER_VERSIONS: dict[str, str] = {
+    "anthropic": "claude-vision-v2",
+    "gemini": "gemini-vision-v2",
+}
+VISION_PARSER_VERSION = VISION_PARSER_VERSIONS["anthropic"]
+
+#: Vendor prefixes :func:`is_vision_parser_version` recognises.
+_VISION_VERSION_PREFIXES: tuple[str, ...] = ("claude-", "gemini-")
+
+
+def vision_parser_version(provider_name: str) -> str:
+    """The ``parser_version`` a given provider's transcriptions carry."""
+
+    return VISION_PARSER_VERSIONS.get(provider_name, f"{provider_name}-vision-v2")
+
+
+def current_vision_parser_version() -> str:
+    """The ``parser_version`` a read started right now would carry."""
+
+    return vision_parser_version(ptr_vision_provider.resolve_provider_name())
 
 #: Used when the installed SDK rejects ``output_config`` and we fall back to
 #: a single strict tool.
-VISION_TOOL_NAME = "record_ptr_transactions"
+VISION_TOOL_NAME = ptr_vision_provider.VISION_TOOL_NAME
 
 
 def is_vision_parser_version(version: object) -> bool:
     """Return whether a ``parser_version`` string came from this module.
 
-    Matches every version this path has ever written (``claude-sonnet-5-vision-v1``
-    and ``claude-vision-v2`` alike) so status decisions keyed on the literal
-    keep working across model changes.
+    Matches every version this path has ever written (``claude-sonnet-5-vision-v1``,
+    ``claude-vision-v2``, ``gemini-vision-v2``) so status decisions keyed on the
+    literal keep working across model and vendor changes.
     """
 
     text = str(version or "").strip().lower()
-    return text.startswith("claude-") and "vision" in text
+    return text.startswith(_VISION_VERSION_PREFIXES) and "vision" in text
 
 
 # -- Guardrails -------------------------------------------------------------
@@ -187,26 +224,15 @@ DEFAULT_GRID_CROP_ZOOM = 2.0
 
 # -- Pricing (USD per MTok: input, output) ----------------------------------
 
-MODEL_PRICING: dict[str, tuple[float, float]] = {
-    "claude-opus-5": (5.0, 25.0),
-    "claude-opus-4-8": (5.0, 25.0),
-    "claude-opus-4-7": (5.0, 25.0),
-    "claude-opus-4-6": (5.0, 25.0),
-    "claude-sonnet-5": (2.0, 10.0),
-    "claude-sonnet-4-6": (3.0, 15.0),
-    "claude-haiku-4-5": (1.0, 5.0),
-}
+MODEL_PRICING: dict[str, tuple[float, float]] = ptr_vision_provider.ANTHROPIC_PRICING
 
 #: Family fallbacks for dated or future ids, checked by prefix in this order.
 _FAMILY_PRICING: tuple[tuple[str, tuple[float, float]], ...] = (
-    ("claude-opus", (5.0, 25.0)),
-    ("claude-sonnet-5", (2.0, 10.0)),
-    ("claude-sonnet", (3.0, 15.0)),
-    ("claude-haiku", (1.0, 5.0)),
+    ptr_vision_provider.ANTHROPIC_FAMILY_PRICING
 )
 
-#: Unknown model: assume the Opus tier so estimates err high.
-DEFAULT_PRICING: tuple[float, float] = (5.0, 25.0)
+#: Unknown Anthropic model: assume the Opus tier so estimates err high.
+DEFAULT_PRICING: tuple[float, float] = ptr_vision_provider.ANTHROPIC_DEFAULT_PRICING
 
 CACHE_READ_MULTIPLIER = 0.1
 CACHE_WRITE_MULTIPLIER = 1.25
@@ -646,9 +672,36 @@ def _client_once() -> Any:
 
 
 def resolve_model_id() -> str:
-    """Return the configured vision model id."""
+    """Return the read model id for the configured provider."""
 
-    return os.environ.get("CAPITOL_PTR_VISION_MODEL", "").strip() or MODEL_ID
+    override = os.environ.get("CAPITOL_PTR_VISION_MODEL", "").strip()
+    if override:
+        return override
+    if ptr_vision_provider.resolve_provider_name() == "gemini":
+        return ptr_vision_provider.GEMINI_MODEL_ID
+    return MODEL_ID
+
+
+#: How a page's upright rotation is chosen. ``grid`` is free and deterministic
+#: (the checkbox detector's own ladder, scored at all four rotations);
+#: ``model`` asks :data:`ORIENTATION_MODEL_ID`, which is what this path did
+#: before and what the Anthropic tests exercise; ``heuristic`` skips both.
+ORIENTATION_MODES: tuple[str, ...] = ("grid", "model", "heuristic")
+DEFAULT_ORIENTATION_MODE = "grid"
+
+
+def resolve_orientation_mode() -> str:
+    """Return the configured orientation strategy (``CAPITOL_PTR_VISION_ORIENTATION``)."""
+
+    raw = os.environ.get("CAPITOL_PTR_VISION_ORIENTATION", "").strip().lower()
+    if raw and raw not in ORIENTATION_MODES:
+        logger.warning(
+            "ptr_vision: unknown CAPITOL_PTR_VISION_ORIENTATION=%r; using %s",
+            raw,
+            DEFAULT_ORIENTATION_MODE,
+        )
+        return DEFAULT_ORIENTATION_MODE
+    return raw or DEFAULT_ORIENTATION_MODE
 
 
 def resolve_effort() -> str:
@@ -722,13 +775,6 @@ def vision_disabled() -> bool:
     return raw in {"1", "true", "yes", "on"}
 
 
-def _has_credentials() -> bool:
-    return bool(
-        (os.environ.get("ANTHROPIC_API_KEY") or "").strip()
-        or (os.environ.get("ANTHROPIC_AUTH_TOKEN") or "").strip()
-    )
-
-
 # -- Helpers ----------------------------------------------------------------
 
 
@@ -762,9 +808,15 @@ def count_pdf_pages(pdf_path: Path) -> int | None:
 
 
 def pricing_for_model(model: str | None) -> tuple[float, float]:
-    """Return ``(input, output)`` USD per MTok for a model id."""
+    """Return ``(input, output)`` USD per MTok for a model id.
+
+    Gemini's flash tiers are free of charge on the free tier, so every cost in
+    the record is a true zero rather than an estimate nobody paid.
+    """
 
     key = (model or "").strip().lower()
+    if key.startswith("gemini"):
+        return ptr_vision_provider.GEMINI_PRICING
     if key in MODEL_PRICING:
         return MODEL_PRICING[key]
     for family, price in _FAMILY_PRICING:
@@ -776,11 +828,12 @@ def pricing_for_model(model: str | None) -> tuple[float, float]:
 def estimate_cost_usd(usage: dict[str, int], model: str | None = None) -> float:
     """Estimate request cost in USD from a normalized usage dict.
 
-    ``model`` defaults to the configured read model; pass
-    :data:`ORIENTATION_MODEL_ID` for the orientation calls.
+    ``model`` names the model that was billed; it defaults to the Anthropic
+    read model so the pricing arithmetic stays checkable on its own. Every
+    call site inside this module passes the model that actually answered.
     """
 
-    price_in, price_out = pricing_for_model(model or resolve_model_id())
+    price_in, price_out = pricing_for_model(model or MODEL_ID)
     dollars = (
         int(usage.get("input") or 0) * price_in
         + int(usage.get("cache_read") or 0) * price_in * CACHE_READ_MULTIPLIER
@@ -796,34 +849,31 @@ def estimate_filing_cost_usd(
     model: str | None = None,
     strips_per_page: float = 0.0,
     chunk_pages: int | None = None,
+    orientation_cost_per_page: float | None = None,
 ) -> float:
     """Pre-flight estimate: pages x two reads x per-page rate, plus orientation.
 
     ``strips_per_page`` is the average number of close-up strips sent per page
     (0 before orientation is known, when every page might be portrait).
+    ``orientation_cost_per_page`` is 0 when the rotation is decided by the free
+    detector rather than by a model.
     """
 
     pages = max(0, int(page_count))
     if pages == 0:
         return 0.0
-    price_in, price_out = pricing_for_model(model or resolve_model_id())
+    price_in, price_out = pricing_for_model(model or MODEL_ID)
     requests = -(-pages // max(1, chunk_pages or resolve_chunk_pages()))
     input_tokens = pages * (EST_TOKENS_FULL_PAGE + strips_per_page * EST_TOKENS_GRID_STRIP)
     cached_tokens = requests * EST_CACHED_PROMPT_TOKENS * CACHE_READ_MULTIPLIER
     output_tokens = pages * EST_OUTPUT_TOKENS_PER_PAGE
     per_read = ((input_tokens + cached_tokens) * price_in + output_tokens * price_out) / 1_000_000
-    return round(per_read * READS_PER_FILING + pages * EST_ORIENTATION_COST_PER_PAGE_USD, 4)
-
-
-def _normalize_usage(usage: Any) -> dict[str, int]:
-    if usage is None:
-        return dict(_EMPTY_USAGE)
-    return {
-        "input": int(getattr(usage, "input_tokens", 0) or 0),
-        "cache_read": int(getattr(usage, "cache_read_input_tokens", 0) or 0),
-        "cache_write": int(getattr(usage, "cache_creation_input_tokens", 0) or 0),
-        "output": int(getattr(usage, "output_tokens", 0) or 0),
-    }
+    orientation = (
+        EST_ORIENTATION_COST_PER_PAGE_USD
+        if orientation_cost_per_page is None
+        else max(0.0, float(orientation_cost_per_page))
+    )
+    return round(per_read * READS_PER_FILING + pages * orientation, 4)
 
 
 def sum_usage(*usages: dict[str, int] | None) -> dict[str, int]:
@@ -874,14 +924,17 @@ def majority_illegible(counts: dict[str, int]) -> bool:
     return int(counts.get("illegible") or 0) * 2 > total
 
 
-def _skip(reason: str, **extra: Any) -> dict[str, Any]:
+def _skip(reason: str, *, provider: Any = None, **extra: Any) -> dict[str, Any]:
+    provider_name = getattr(provider, "name", None) or ptr_vision_provider.resolve_provider_name()
     payload: dict[str, Any] = {
         "ok": False,
         "skipped": True,
         "reason": reason,
-        "model": resolve_model_id(),
-        "orientation_model": ORIENTATION_MODEL_ID,
-        "parser_version": VISION_PARSER_VERSION,
+        "provider": provider_name,
+        "model": getattr(provider, "read_model", None) or resolve_model_id(),
+        "model_b": getattr(provider, "read_model_b", None),
+        "orientation_model": getattr(provider, "orientation_model", None) or ORIENTATION_MODEL_ID,
+        "parser_version": vision_parser_version(provider_name),
         "filer_name": None,
         "filing_date": None,
         "page_count": None,
@@ -900,6 +953,7 @@ def _skip(reason: str, **extra: Any) -> dict[str, Any]:
         "no_transactions": False,
         "chunks": [],
         "effort": resolve_effort(),
+        "orientation_mode": resolve_orientation_mode(),
         "pdf_sha256": None,
         "at": _now_iso(),
     }
@@ -911,57 +965,27 @@ def _now_iso() -> str:
     return datetime.now(timezone.utc).isoformat(timespec="seconds")
 
 
-def _is_retryable(error: Exception) -> bool:
-    """Return whether an SDK error is worth exactly one more attempt."""
-
-    status = getattr(error, "status_code", None)
-    if status is None:
-        status = getattr(error, "status", None)
-    try:
-        status_int = int(status)  # type: ignore[arg-type]
-    except (TypeError, ValueError):
-        status_int = 0
-    if status_int == 429 or 500 <= status_int <= 599:
-        return True
-    return type(error).__name__ in {
-        "RateLimitError",
-        "InternalServerError",
-        "APIConnectionError",
-        "APITimeoutError",
-        "OverloadedError",
-    }
-
-
-def _rejected_structured_output(error: Exception) -> bool:
-    """Return whether a 400 looks like the API refusing ``output_config.format``."""
-
-    status = getattr(error, "status_code", None)
-    if status is None:
-        status = getattr(error, "status", None)
-    if status not in (400, 422):
-        return False
-    message = str(error).lower()
-    return any(token in message for token in ("output_config", "json_schema", "output_format"))
-
-
 # -- Page images + orientation ---------------------------------------------
 
 
-def _image_block(png: bytes) -> dict[str, Any]:
-    return {
-        "type": "image",
-        "source": {
-            "type": "base64",
-            "media_type": "image/png",
-            "data": base64.standard_b64encode(png).decode("ascii"),
-        },
-    }
+def _image_part(png: bytes) -> dict[str, Any]:
+    """One image in the neutral content form every provider serialises."""
+
+    return {"kind": "image", "png": png}
 
 
-def _page_zoom(rect: Any, max_long_edge: int = MAX_IMAGE_LONG_EDGE) -> float:
+def _text_part(text: str) -> dict[str, Any]:
+    return {"kind": "text", "text": text}
+
+
+def _page_zoom(
+    rect: Any,
+    max_long_edge: int = MAX_IMAGE_LONG_EDGE,
+    dpi: int = RENDER_DPI,
+) -> float:
     # pymupdf rounds pixel dimensions up, so aim one pixel under the cap.
     long_edge = float(max(rect.width, rect.height)) or 1.0
-    return min(RENDER_DPI / 72.0, (max_long_edge - 1) / long_edge)
+    return min(dpi / 72.0, (max_long_edge - 1) / long_edge)
 
 
 def _render_page(
@@ -970,6 +994,7 @@ def _render_page(
     base_rotation: int,
     rotation: int,
     max_long_edge: int = MAX_IMAGE_LONG_EDGE,
+    dpi: int = RENDER_DPI,
 ) -> tuple[bytes, int, int]:
     """Render one page as PNG bytes with ``rotation`` degrees clockwise applied.
 
@@ -980,7 +1005,7 @@ def _render_page(
     """
 
     page.set_rotation((base_rotation + rotation) % 360)
-    zoom = _page_zoom(page.rect, max_long_edge)
+    zoom = _page_zoom(page.rect, max_long_edge, dpi)
     pixmap = page.get_pixmap(matrix=module.Matrix(zoom, zoom), alpha=False)
     return pixmap.tobytes("png"), int(pixmap.width), int(pixmap.height)
 
@@ -1048,21 +1073,14 @@ def orientation_heuristic(width: int, height: int) -> int:
     return 90 if height > width else 0
 
 
-def _first_text(message: Any) -> str:
-    for block in list(getattr(message, "content", None) or []):
-        if getattr(block, "type", None) == "text":
-            return str(getattr(block, "text", "") or "")
-    return ""
-
-
-def _ask_orientation(client: Any, content: list[dict[str, Any]]) -> tuple[str, dict[str, int]]:
-    response = client.messages.create(
-        model=ORIENTATION_MODEL_ID,
-        max_tokens=ORIENTATION_MAX_TOKENS,
+def _ask_orientation(provider: Any, parts: list[dict[str, Any]]) -> tuple[str, dict[str, int]]:
+    response = provider.ask_short(
+        parts,
+        model=provider.orientation_model,
         system=ORIENTATION_SYSTEM_PROMPT,
-        messages=[{"role": "user", "content": content}],
+        max_tokens=ORIENTATION_MAX_TOKENS,
     )
-    return _first_text(response), _normalize_usage(getattr(response, "usage", None))
+    return response["text"], response["usage"]
 
 
 def _said_no(answer: str) -> bool:
@@ -1072,13 +1090,16 @@ def _said_no(answer: str) -> bool:
 
 
 def detect_orientation(
-    client: Any,
+    provider: Any,
     render: Any,
     *,
     width: int,
     height: int,
 ) -> tuple[int, str, dict[str, int]]:
-    """Return ``(rotation, method, usage)`` for one page.
+    """Return ``(rotation, method, usage)`` for one page, asking a model.
+
+    Only used when ``CAPITOL_PTR_VISION_ORIENTATION=model``; the default path
+    is :func:`detect_orientation_from_grid`, which costs nothing.
 
     ``render`` is a callable ``(rotation, max_long_edge) -> png``. All four
     rotations are rendered small and shown together to
@@ -1097,10 +1118,10 @@ def detect_orientation(
         }
         content: list[dict[str, Any]] = []
         for rotation in ROTATIONS:
-            content.append({"type": "text", "text": f"Label {rotation}:"})
-            content.append(_image_block(candidates[rotation]))
-        content.append({"type": "text", "text": ORIENTATION_QUESTION})
-        answer, call_usage = _ask_orientation(client, content)
+            content.append(_text_part(f"Label {rotation}:"))
+            content.append(_image_part(candidates[rotation]))
+        content.append(_text_part(ORIENTATION_QUESTION))
+        answer, call_usage = _ask_orientation(provider, content)
         usage = sum_usage(usage, call_usage)
         match = re.search(r"\b(0|90|180|270)\b", answer)
         if match is None:
@@ -1109,8 +1130,8 @@ def detect_orientation(
         rotation = int(match.group(1))
 
         confirmation, call_usage = _ask_orientation(
-            client,
-            [_image_block(candidates[rotation]), {"type": "text", "text": ORIENTATION_CONFIRM_QUESTION}],
+            provider,
+            [_image_part(candidates[rotation]), _text_part(ORIENTATION_CONFIRM_QUESTION)],
         )
         usage = sum_usage(usage, call_usage)
         if _said_no(confirmation):
@@ -1131,18 +1152,154 @@ def detect_orientation(
     return orientation_heuristic(width, height), "heuristic", usage
 
 
+#: A page whose own best rotation beats the document's consensus rotation by
+#: less than this keeps the consensus. A filing goes through the scanner once,
+#: so its pages share a rotation; on a ruled brokerage grid the upright and
+#: upside-down scores can land within a few hundredths of each other, and on
+#: those pages the other twenty-two pages are better evidence than this one.
+ORIENTATION_CONSENSUS_MARGIN = 0.75
+
+
+def score_page_orientations(analyze: Any) -> dict[int, float]:
+    """Score one page at all four rotations. ``analyze`` is ``(rotation) -> grid``."""
+
+    return {rotation: ptr_grid.orientation_score(analyze(rotation)) for rotation in ROTATIONS}
+
+
+def choose_orientations(
+    scores_per_page: list[dict[int, float]],
+    fallbacks: list[int],
+) -> list[tuple[int, str]]:
+    """Pick a rotation per page from the scored rotations of the whole filing.
+
+    Per page the highest-scoring rotation wins, except where the filing as a
+    whole disagrees by less than :data:`ORIENTATION_CONSENSUS_MARGIN` -- then
+    the filing wins, because one page's hundredths are not evidence against
+    twenty-two pages. A page that scores zero everywhere (a cover sheet, a
+    typed electronic form, a scan too poor to show rules) falls back to
+    :func:`orientation_heuristic` via ``fallbacks``.
+    """
+
+    totals = {
+        rotation: sum(scores.get(rotation, 0.0) for scores in scores_per_page)
+        for rotation in ROTATIONS
+    }
+    consensus = max(ROTATIONS, key=lambda rotation: totals[rotation])
+    if totals[consensus] <= 0:
+        consensus = None  # type: ignore[assignment]
+
+    chosen: list[tuple[int, str]] = []
+    for scores, fallback in zip(scores_per_page, fallbacks):
+        best = max(ROTATIONS, key=lambda rotation: scores.get(rotation, 0.0))
+        if scores.get(best, 0.0) <= 0:
+            # No ladder at any rotation: a cover sheet, a signature page, a
+            # broker's letter. Follow the rest of the filing when it agrees
+            # about the quarter turn -- the pages went through the scanner
+            # together -- and otherwise fall back to the shape of the page.
+            if (
+                consensus is not None
+                and consensus != fallback
+                and consensus % 180 == fallback % 180
+            ):
+                chosen.append((consensus, "grid-consensus"))
+                continue
+            chosen.append((fallback, "heuristic"))
+            continue
+        if (
+            consensus is not None
+            and consensus != best
+            and scores.get(consensus, 0.0) > 0
+            and scores[best] - scores[consensus] <= ORIENTATION_CONSENSUS_MARGIN
+        ):
+            chosen.append((consensus, "grid-consensus"))
+            continue
+        chosen.append((best, "grid"))
+    return chosen
+
+
+def detect_orientation_from_grid(
+    analyze: Any,
+    *,
+    width: int,
+    height: int,
+) -> tuple[int, str, dict[str, Any] | None]:
+    """Return ``(rotation, method, grid)`` for a single page, with no model call.
+
+    The page is analysed at all four rotations and
+    :func:`capitol_pipeline.parsers.ptr_grid.orientation_score` says which one
+    reads upright; the House form's own asymmetries (a complete A-K ladder,
+    the header printed above the rows, the ladder at the right margin and the
+    wide K column on the right) settle the half turn that defeats a bare "did I
+    find a ladder" test.
+
+    Use :func:`plan_orientations` for a whole filing: it adds the document-wide
+    consensus, which is what settles the close calls.
+    """
+
+    scores = score_page_orientations(analyze)
+    fallback = orientation_heuristic(width, height)
+    (rotation, method), = choose_orientations([scores], [fallback])
+    grid = analyze(rotation) if method != "heuristic" else None
+    return rotation, method, grid
+
+
+def plan_orientations(
+    document: Any,
+    module: Any,
+    positions: Any,
+) -> list[dict[str, Any]]:
+    """Decide every page's upright rotation for one filing, with no model call.
+
+    Returns one entry per position: ``{"position", "rotation", "method",
+    "scores", "grid"}``, where ``grid`` is the detector's analysis at the
+    chosen rotation (None when no ladder was found). The page objects are left
+    rotated as chosen, ready to render.
+    """
+
+    entries: list[dict[str, Any]] = []
+    scores_per_page: list[dict[int, float]] = []
+    fallbacks: list[int] = []
+    for position in positions:
+        page = document[position]
+        base_rotation = int(getattr(page, "rotation", 0) or 0)
+        rect = page.rect
+
+        def _analyze(
+            rotation: int,
+            _page: Any = page,
+            _base: int = base_rotation,
+        ) -> dict[str, Any] | None:
+            _page.set_rotation((_base + rotation) % 360)
+            return _analyze_page_grid(_page, module)
+
+        scores_per_page.append(score_page_orientations(_analyze))
+        fallbacks.append(orientation_heuristic(int(rect.width), int(rect.height)))
+        entries.append({"position": position, "analyze": _analyze})
+
+    chosen = choose_orientations(scores_per_page, fallbacks)
+    for index, (entry, (rotation, method)) in enumerate(zip(entries, chosen)):
+        analyze = entry.pop("analyze")
+        entry["rotation"] = rotation
+        entry["method"] = method
+        entry["scores"] = scores_per_page[index]
+        entry["grid"] = analyze(rotation) if method != "heuristic" else None
+    return entries
+
+
 def prepare_page_images(
     pdf_path: Path,
-    client: Any,
-) -> tuple[list[dict[str, Any]], list[dict[str, Any]], dict[str, int]] | None:
+    provider: Any,
+) -> tuple[list[dict[str, Any]], list[dict[str, Any]], dict[str, int], int] | None:
     """Render every page upright.
 
     Returns ``(pages, orientation, usage, total_pages)`` or None when pymupdf
     is unavailable or cannot open the file. ``total_pages`` is the filing's
-    page count even when a page range limited what was rendered. Each page is ``{"index", "png", "width", "height",
-    "crops"}`` (``crops`` holds the close-up strips of a landscape page) and
-    each orientation entry ``{"page", "rotation", "method", "width", "height",
-    "strips"}``. ``usage`` is the orientation model's summed token usage.
+    page count even when a page range limited what was rendered. Each page is
+    ``{"index", "png", "width", "height", "crops", "grid"}`` (``crops`` holds
+    the close-up strips of a landscape page) and each orientation entry
+    ``{"page", "rotation", "method", "width", "height", "strips",
+    "gridColumns"}``. ``usage`` is the orientation model's summed token usage,
+    which is empty unless ``CAPITOL_PTR_VISION_ORIENTATION=model``.
     """
 
     module = _pdf_module()
@@ -1159,6 +1316,7 @@ def prepare_page_images(
     usage = dict(_EMPTY_USAGE)
     grid_zoom = resolve_grid_zoom()
     page_range = resolve_page_range()
+    mode = resolve_orientation_mode()
     total_pages = 0
     try:
         with document:
@@ -1174,6 +1332,12 @@ def prepare_page_images(
                     len(positions),
                     int(document.page_count),
                 )
+            planned: dict[int, dict[str, Any]] = {}
+            if mode == "grid":
+                planned = {
+                    entry["position"]: entry
+                    for entry in plan_orientations(document, module, positions)
+                }
             for position in positions:
                 page = document[position]
                 base_rotation = int(getattr(page, "rotation", 0) or 0)
@@ -1188,29 +1352,44 @@ def prepare_page_images(
                 ) -> bytes:
                     return _render_page(_page, module, _base, rotation, max_long_edge)[0]
 
-                rotation, method, call_usage = detect_orientation(
-                    client, _render, width=int(natural_width), height=int(natural_height)
-                )
-                usage = sum_usage(usage, call_usage)
-                # The orientation model tells portrait from landscape reliably
-                # but confuses upright with upside down on typed tables. The
-                # amount ladder sits at the right edge only when the page is
-                # upright, so if the detector finds it only after a half turn,
-                # take the half turn.
-                page.set_rotation((base_rotation + rotation) % 360)
-                grid = _analyze_page_grid(page, module)
-                if grid is None:
-                    flipped = (rotation + 180) % 360
-                    page.set_rotation((base_rotation + flipped) % 360)
-                    flipped_grid = _analyze_page_grid(page, module)
-                    if flipped_grid is not None:
-                        logger.info(
-                            "ptr_vision: page %d: ladder found only after a half turn (%d -> %d)",
-                            position + 1,
-                            rotation,
-                            flipped,
-                        )
-                        rotation, grid, method = flipped, flipped_grid, f"{method}+grid-flip"
+                def _analyze(
+                    rotation: int,
+                    _page: Any = page,
+                    _base: int = base_rotation,
+                ) -> dict[str, Any] | None:
+                    _page.set_rotation((_base + rotation) % 360)
+                    return _analyze_page_grid(_page, module)
+
+                if mode == "model":
+                    rotation, method, call_usage = detect_orientation(
+                        provider, _render, width=int(natural_width), height=int(natural_height)
+                    )
+                    usage = sum_usage(usage, call_usage)
+                    # The orientation model tells portrait from landscape
+                    # reliably but confuses upright with upside down on typed
+                    # tables. The amount ladder sits at the right edge only
+                    # when the page is upright, so if the detector finds it
+                    # only after a half turn, take the half turn.
+                    grid = _analyze(rotation)
+                    if grid is None:
+                        flipped = (rotation + 180) % 360
+                        flipped_grid = _analyze(flipped)
+                        if flipped_grid is not None:
+                            logger.info(
+                                "ptr_vision: page %d: ladder found only after a half turn (%d -> %d)",
+                                position + 1,
+                                rotation,
+                                flipped,
+                            )
+                            rotation, grid, method = flipped, flipped_grid, f"{method}+grid-flip"
+                elif mode == "heuristic":
+                    rotation = orientation_heuristic(int(natural_width), int(natural_height))
+                    method = "heuristic"
+                    grid = _analyze(rotation)
+                else:
+                    entry = planned[position]
+                    rotation, method, grid = entry["rotation"], entry["method"], entry["grid"]
+
                 png, width, height = _render_page(page, module, base_rotation, rotation)
                 crops: list[dict[str, Any]] = []
                 if width > height and grid_zoom > 0:
@@ -1401,29 +1580,30 @@ def build_image_content(
     context: str = "",
     total_pages: int | None = None,
 ) -> list[dict[str, Any]]:
-    """User content: per page a label, the image and any close-up strips, then the instruction."""
+    """User content: per page a label, the image and any close-up strips, then the instruction.
+
+    Returns the neutral part form (:mod:`ptr_vision_provider`), which each
+    provider serialises into its own request shape.
+    """
 
     total = total_pages or len(pages)
     blocks: list[dict[str, Any]] = []
     for page in pages:
-        blocks.append({"type": "text", "text": f"Page {page['index']} of {total}:"})
-        blocks.append(_image_block(page["png"]))
+        blocks.append(_text_part(f"Page {page['index']} of {total}:"))
+        blocks.append(_image_part(page["png"]))
         strips = page.get("crops") or []
         for position, strip in enumerate(strips, start=1):
             blocks.append(
-                {
-                    "type": "text",
-                    "text": (
-                        f"Page {page['index']}, close-up strip {position} of {len(strips)} "
-                        f"(right-hand part of the page, {strip['label']}, higher zoom):"
-                    ),
-                }
+                _text_part(
+                    f"Page {page['index']}, close-up strip {position} of {len(strips)} "
+                    f"(right-hand part of the page, {strip['label']}, higher zoom):"
+                )
             )
-            blocks.append(_image_block(strip["png"]))
+            blocks.append(_image_part(strip["png"]))
     text = "\n\n".join(
         part for part in (USER_INSTRUCTION, chunk_context(pages, total), context) if part
     )
-    blocks.append({"type": "text", "text": f"{text}\n\nFile: {filename}"})
+    blocks.append(_text_part(f"{text}\n\nFile: {filename}"))
     return blocks
 
 
@@ -1435,107 +1615,22 @@ def chunk_page_list(pages: list[dict[str, Any]], chunk_pages: int) -> list[list[
 
 
 def build_document_content(
-    pdf_b64: str,
+    pdf_bytes: bytes,
     filename: str,
     context: str = "",
 ) -> list[dict[str, Any]]:
-    """User content when pymupdf is unavailable: the PDF as a document block."""
+    """User content when pymupdf is unavailable: the PDF itself.
+
+    Only the Anthropic provider accepts this part. Gemini rasterises a PDF at
+    its own resolution and then reads every two-digit year one low, so it
+    refuses the part rather than returning a filing whose dates are a year out.
+    """
 
     text = f"{USER_INSTRUCTION}\n\n{context}".rstrip() + f"\n\nFile: {filename}"
-    return [
-        {
-            "type": "document",
-            "source": {
-                "type": "base64",
-                "media_type": "application/pdf",
-                "data": pdf_b64,
-            },
-        },
-        {"type": "text", "text": text},
-    ]
+    return [{"kind": "document", "pdf": pdf_bytes}, _text_part(text)]
 
 
 # -- Request ----------------------------------------------------------------
-
-
-def _request_kwargs(
-    content: list[dict[str, Any]],
-    *,
-    structured: bool,
-    with_output_config: bool = True,
-) -> dict[str, Any]:
-    """Build the Messages request.
-
-    ``structured`` picks schema-constrained text output over a single strict
-    tool. ``with_output_config`` is dropped only when the installed SDK does not
-    accept the parameter at all.
-    """
-
-    kwargs: dict[str, Any] = {
-        "model": resolve_model_id(),
-        "max_tokens": MAX_OUTPUT_TOKENS,
-        "system": [
-            {
-                "type": "text",
-                "text": SYSTEM_PROMPT,
-                "cache_control": {"type": "ephemeral"},
-            }
-        ],
-        "thinking": {"type": "adaptive"},
-        "messages": [{"role": "user", "content": content}],
-    }
-    effort = resolve_effort()
-    if structured:
-        kwargs["output_config"] = {
-            "effort": effort,
-            "format": {"type": "json_schema", "schema": PTR_VISION_SCHEMA},
-        }
-    else:
-        if with_output_config:
-            kwargs["output_config"] = {"effort": effort}
-        kwargs["tools"] = [
-            {
-                "name": VISION_TOOL_NAME,
-                "description": "Record every transaction row transcribed from the PTR pages.",
-                "strict": True,
-                "input_schema": PTR_VISION_SCHEMA,
-            }
-        ]
-    return kwargs
-
-
-def _invoke(client: Any, kwargs: dict[str, Any]) -> Any:
-    """Prefer streaming (multi-page PTR reads are slow) and fall back to create."""
-
-    stream = getattr(getattr(client, "messages", None), "stream", None)
-    if stream is not None:
-        with stream(**kwargs) as active:
-            return active.get_final_message()
-    return client.messages.create(**kwargs)
-
-
-def _payload_from_message(message: Any) -> dict[str, Any] | None:
-    """Read the JSON payload out of a structured-output or tool-use response."""
-
-    blocks = list(getattr(message, "content", None) or [])
-    for block in blocks:
-        if getattr(block, "type", None) == "tool_use":
-            candidate = getattr(block, "input", None)
-            if isinstance(candidate, dict):
-                return candidate
-    for block in blocks:
-        if getattr(block, "type", None) != "text":
-            continue
-        text = (getattr(block, "text", "") or "").strip()
-        if not text:
-            continue
-        try:
-            candidate = json.loads(text)
-        except json.JSONDecodeError:
-            continue
-        if isinstance(candidate, dict):
-            return candidate
-    return None
 
 
 def _coerce_transactions(raw: Any) -> list[dict[str, Any]]:
@@ -1568,12 +1663,13 @@ class _ReadState:
 
 
 def _read_once(
-    client: Any,
-    content: list[dict[str, Any]],
+    provider: Any,
+    parts: list[dict[str, Any]],
     state: _ReadState,
     *,
     label: str,
     filename: str,
+    model: str,
 ) -> dict[str, Any]:
     """One transcription request with the retry / downgrade ladder.
 
@@ -1582,18 +1678,23 @@ def _read_once(
     """
 
     attempts = 0
-    message: Any = None
+    response: dict[str, Any] | None = None
     last_error: Exception | None = None
 
     while attempts < 2:
         attempts += 1
-        kwargs = _request_kwargs(
-            content,
-            structured=state.structured,
-            with_output_config=state.with_output_config,
-        )
+        kwargs: dict[str, Any] = {
+            "model": model,
+            "system": SYSTEM_PROMPT,
+            "schema": PTR_VISION_SCHEMA,
+            "effort": resolve_effort(),
+            "max_tokens": MAX_OUTPUT_TOKENS,
+            "structured": state.structured,
+        }
+        if not state.with_output_config:
+            kwargs["with_output_config"] = False
         try:
-            message = _invoke(client, kwargs)
+            response = provider.read(parts, **kwargs)
             break
         except TypeError as error:
             # The installed SDK does not accept output_config at all -> drop it
@@ -1609,20 +1710,21 @@ def _read_once(
                 continue
             last_error = error
             break
-        except Exception as error:  # noqa: BLE001 - classified by _is_retryable
+        except Exception as error:  # noqa: BLE001 - classified by the provider
             last_error = error
-            if not state.downgraded and _rejected_structured_output(error):
-                # The API refused the json_schema format; fall back to the tool
-                # form once before giving up. Does not consume a retry.
+            if not state.downgraded and provider.rejected_structured_output(error):
+                # The API refused the schema-constrained format; fall back to
+                # the looser form once before giving up. Not a retry.
                 logger.warning(
-                    "ptr_vision: API rejected structured output (%s); retrying with strict tool use",
+                    "ptr_vision: %s rejected structured output (%s); retrying without the schema",
+                    provider.name,
                     error,
                 )
                 state.structured = False
                 state.downgraded = True
                 attempts -= 1
                 continue
-            if attempts >= 2 or not _is_retryable(error):
+            if attempts >= 2 or not provider.is_retryable(error):
                 break
             logger.warning(
                 "ptr_vision: retryable error on %s %s (%s); retrying once",
@@ -1643,31 +1745,25 @@ def _read_once(
         "stop_reason": None,
         "structured": state.structured,
     }
-    if message is None:
+    if response is None:
         logger.error("ptr_vision: %s failed for %s: %s", label, filename, last_error)
         outcome["reason"] = f"api error: {last_error}"
         return outcome
 
-    usage = _normalize_usage(getattr(message, "usage", None))
+    usage = response["usage"]
     outcome["usage"] = usage
-    outcome["cost_usd"] = estimate_cost_usd(usage)
-    stop_reason = getattr(message, "stop_reason", None)
+    outcome["cost_usd"] = estimate_cost_usd(usage, model)
+    stop_reason = response["stop_reason"]
     outcome["stop_reason"] = stop_reason
 
     if stop_reason == "refusal":
-        details = getattr(message, "stop_details", None)
-        category = (
-            details.get("category")
-            if isinstance(details, dict)
-            else getattr(details, "category", None)
-        )
-        outcome["reason"] = f"model refused (category={category})"
+        outcome["reason"] = f"model refused (category={response.get('detail')})"
         return outcome
     if stop_reason == "max_tokens":
         outcome["reason"] = "response truncated at max_tokens"
         return outcome
 
-    payload = _payload_from_message(message)
+    payload = response["payload"]
     if payload is None:
         outcome["reason"] = "no structured payload in response"
         return outcome
@@ -1806,14 +1902,30 @@ def _letter(row: dict[str, Any]) -> str | None:
     return text if text in AMOUNT_LETTERS else None
 
 
-def apply_amount_letter_check(rows: list[dict[str, Any]]) -> tuple[list[dict[str, Any]], int]:
-    """Null the amount on rows whose column letter and dollar band disagree.
+#: Every band the form actually prints. A reported band that is not one of
+#: these was mistyped, not read off a different column.
+_LADDER_BANDS: frozenset[tuple[int, int]] = frozenset(AMOUNT_LETTER_BANDS.values())
 
-    The prompt asks the model to count boxes from column A and to make the
-    band agree with the letter; when it did not, one of the two is a miscount
-    and neither can be trusted. The row is downgraded to ``partial`` and
-    flagged so :func:`merge_matched_rows` treats its amount as unconfirmed.
-    Returns ``(rows, conflicts)``.
+
+def apply_amount_letter_check(rows: list[dict[str, Any]]) -> tuple[list[dict[str, Any]], int]:
+    """Reconcile each row's amount column letter with its dollar band.
+
+    The prompt asks the model to count boxes from column A and to make the band
+    agree with the letter. Two different things can go wrong when it does not,
+    and they deserve different answers:
+
+    * **The band is not a band the form prints.** ``$1,501-$50,000`` is not on
+      the ladder; it is ``$15,001-$50,000`` with a digit dropped. (Measured:
+      ``gemini-3.5-flash`` did exactly this on all six rows of Lamborn
+      8220068.) The letter is the datum, the bounds beside it are printed on
+      the form, and the checkbox detector confirms the letter independently, so
+      the band is repaired from the letter and the row says so.
+    * **The band is a real band, but a different one.** Then the two readings
+      contradict each other, one of them is a miscount, and neither can be
+      trusted: the amount is nulled, the row downgraded to ``partial``, and
+      flagged so :func:`merge_matched_rows` treats its amount as unconfirmed.
+
+    Returns ``(rows, conflicts)``, counting only the second kind.
     """
 
     conflicts = 0
@@ -1822,17 +1934,28 @@ def apply_amount_letter_check(rows: list[dict[str, Any]]) -> tuple[list[dict[str
         band = AMOUNT_LETTER_BANDS.get(letter or "")
         if band is None:
             continue
-        if _comparable(row, "amount") != band:
-            conflicts += 1
-            row["amount_min"] = None
-            row["amount_max"] = None
-            row["_amount_letter_conflict"] = True
-            row["legibility"] = _downgrade(
-                _worst_legibility(row.get("legibility")), "partial"
+        reported = _comparable(row, "amount")
+        if reported == band:
+            continue
+        if reported not in _LADDER_BANDS:
+            row["amount_min"], row["amount_max"] = band
+            note = (
+                f"amount ${reported[0]:,}-${reported[1]:,} is not a band on the form; "
+                f"read from the ticked column {letter}"
             )
-            note = f"amount column letter {letter} does not match the reported band"
             existing = _merge_comment(row.get("comment"))
             row["comment"] = f"{existing}; {note}" if existing else note
+            continue
+        conflicts += 1
+        row["amount_min"] = None
+        row["amount_max"] = None
+        row["_amount_letter_conflict"] = True
+        row["legibility"] = _downgrade(
+            _worst_legibility(row.get("legibility")), "partial"
+        )
+        note = f"amount column letter {letter} does not match the reported band"
+        existing = _merge_comment(row.get("comment"))
+        row["comment"] = f"{existing}; {note}" if existing else note
     return rows, conflicts
 
 
@@ -2003,8 +2126,11 @@ def build_vision_metadata(report: dict[str, Any]) -> dict[str, Any]:
     orientation_model = report.get("orientation_model") or ORIENTATION_MODEL_ID
     orient_in, orient_out = pricing_for_model(orientation_model)
     metadata: dict[str, Any] = {
+        "provider": report.get("provider"),
         "model": model,
+        "modelB": report.get("model_b"),
         "orientationModel": orientation_model,
+        "orientationMode": report.get("orientation_mode"),
         "parserVersion": report.get("parser_version"),
         "effort": report.get("effort"),
         "at": report.get("at"),
@@ -2119,7 +2245,7 @@ def _page_range(pages: list[dict[str, Any]] | None) -> str:
 
 
 def _read_pages(
-    client: Any,
+    provider: Any,
     pages: list[dict[str, Any]] | None,
     state: _ReadState,
     *,
@@ -2127,6 +2253,7 @@ def _read_pages(
     filename: str,
     context: str,
     total_pages: int,
+    model: str,
     content: list[dict[str, Any]] | None = None,
     depth: int = 0,
 ) -> dict[str, Any]:
@@ -2142,11 +2269,18 @@ def _read_pages(
     if content is None:
         content = build_image_content(pages or [], filename, context, total_pages)
     page_range = _page_range(pages)
-    outcome = _read_once(client, content, state, label=f"{label} pages {page_range}", filename=filename)
+    outcome = _read_once(
+        provider,
+        content,
+        state,
+        label=f"{label} pages {page_range}",
+        filename=filename,
+        model=model,
+    )
     rows = _coerce_transactions((outcome["payload"] or {}).get("transactions"))
     call = _call_record(
         label,
-        resolve_model_id(),
+        model,
         outcome["usage"],
         outcome["cost_usd"],
         pages=page_range,
@@ -2195,13 +2329,14 @@ def _read_pages(
     }
     for half in (pages[:middle], pages[middle:]):
         sub = _read_pages(
-            client,
+            provider,
             half,
             state,
             label=label,
             filename=filename,
             context=context,
             total_pages=total_pages,
+            model=model,
             depth=depth + 1,
         )
         combined["calls"].extend(sub["calls"])
@@ -2252,12 +2387,13 @@ def extract_via_vision(
         logger.warning("ptr_vision: disabled by CAPITOL_PTR_VISION_DISABLED")
         return _skip("disabled by CAPITOL_PTR_VISION_DISABLED")
 
-    if not _has_credentials():
-        logger.warning("ptr_vision: no ANTHROPIC_API_KEY / ANTHROPIC_AUTH_TOKEN; skipping")
-        return _skip("anthropic credentials not configured")
+    provider = ptr_vision_provider.resolve_provider(anthropic_client_factory=_client_once)
+    if not provider.has_credentials():
+        logger.warning("ptr_vision: %s; skipping", provider.credentials_hint())
+        return _skip(provider.credentials_hint(), provider=provider)
 
     if not pdf_path.exists():
-        return _skip(f"pdf not found: {pdf_path}")
+        return _skip(f"pdf not found: {pdf_path}", provider=provider)
 
     pdf_bytes = pdf_path.read_bytes()
     pdf_sha256 = hashlib.sha256(pdf_bytes).hexdigest()
@@ -2267,7 +2403,9 @@ def extract_via_vision(
             "ptr_vision: %s is %d bytes (> %d)", pdf_path.name, size, MAX_VISION_PDF_BYTES
         )
         return _skip(
-            f"pdf too large: {size} bytes (limit {MAX_VISION_PDF_BYTES})", pdf_sha256=pdf_sha256
+            f"pdf too large: {size} bytes (limit {MAX_VISION_PDF_BYTES})",
+            provider=provider,
+            pdf_sha256=pdf_sha256,
         )
 
     page_count = count_pdf_pages(pdf_path)
@@ -2280,19 +2418,35 @@ def extract_via_vision(
         )
         return _skip(
             f"pdf too long: {page_count} pages (limit {MAX_VISION_PDF_PAGES})",
+            provider=provider,
             page_count=page_count,
             pdf_sha256=pdf_sha256,
         )
     if page_count is None:
         logger.debug("ptr_vision: no PDF reader available; skipping the page-count guardrail")
 
-    model = resolve_model_id()
+    model = provider.read_model
+    model_b = provider.read_model_b
+    orientation_mode = resolve_orientation_mode()
+    orientation_model = provider.orientation_model
+    # The rotation is decided by the free detector unless a model was asked
+    # for, so the orientation term of the estimate is usually a true zero.
+    orientation_cost = (
+        EST_ORIENTATION_COST_PER_PAGE_USD
+        if orientation_mode == "model" and any(pricing_for_model(orientation_model))
+        else 0.0
+    )
     chunk_pages = resolve_chunk_pages()
     ceiling = resolve_max_filing_cost_usd()
     estimate = 0.0
     if page_count:
         # Pre-flight, before any API call: no close-up strips are assumed yet.
-        estimate = estimate_filing_cost_usd(page_count, model=model, chunk_pages=chunk_pages)
+        estimate = estimate_filing_cost_usd(
+            page_count,
+            model=model,
+            chunk_pages=chunk_pages,
+            orientation_cost_per_page=orientation_cost,
+        )
         if estimate > ceiling:
             logger.warning(
                 "ptr_vision: %s refused: estimated $%.2f for %d pages > $%.2f ceiling",
@@ -2304,13 +2458,13 @@ def extract_via_vision(
             return _skip(
                 f"estimated cost ${estimate:.2f} for {page_count} pages exceeds the "
                 f"${ceiling:.2f} ceiling (CAPITOL_PTR_VISION_MAX_COST_USD)",
+                provider=provider,
                 page_count=page_count,
                 pdf_sha256=pdf_sha256,
                 cost_estimate_usd=estimate,
                 cost_ceiling_usd=ceiling,
             )
 
-    client = _client_once()
     context = filing_context(filing_year, filing_date)
     calls: list[dict[str, Any]] = []
 
@@ -2324,19 +2478,20 @@ def extract_via_vision(
     orientation: list[dict[str, Any]] | None = None
     chunks: list[list[dict[str, Any]] | None]
     document_content: list[dict[str, Any]] | None = None
-    prepared = prepare_page_images(pdf_path, client)
+    prepared = prepare_page_images(pdf_path, provider)
     if prepared is not None:
         pages, orientation, orient_usage, document_pages = prepared
-        orient_cost = estimate_cost_usd(orient_usage, ORIENTATION_MODEL_ID)
-        calls.append(
-            _call_record(
-                "orientation",
-                ORIENTATION_MODEL_ID,
-                orient_usage,
-                orient_cost,
-                pages=_page_range(pages),
+        if any(orient_usage.values()):
+            orient_cost = estimate_cost_usd(orient_usage, orientation_model)
+            calls.append(
+                _call_record(
+                    "orientation",
+                    orientation_model,
+                    orient_usage,
+                    orient_cost,
+                    pages=_page_range(pages),
+                )
             )
-        )
         page_count = document_pages or len(pages)
         strips = sum(len(page.get("crops") or []) for page in pages)
         estimate = estimate_filing_cost_usd(
@@ -2344,6 +2499,7 @@ def extract_via_vision(
             model=model,
             strips_per_page=strips / max(1, len(pages)),
             chunk_pages=chunk_pages,
+            orientation_cost_per_page=orientation_cost,
         )
         if estimate > ceiling:
             logger.warning(
@@ -2357,6 +2513,7 @@ def extract_via_vision(
             return _skip(
                 f"estimated cost ${estimate:.2f} for {len(pages)} pages with {strips} close-up "
                 f"strips exceeds the ${ceiling:.2f} ceiling (CAPITOL_PTR_VISION_MAX_COST_USD)",
+                provider=provider,
                 page_count=page_count,
                 pdf_sha256=pdf_sha256,
                 cost_estimate_usd=estimate,
@@ -2380,9 +2537,7 @@ def extract_via_vision(
             [(entry["rotation"], entry["method"]) for entry in orientation],
         )
     else:
-        # Base64 with no newlines, as the document content block requires.
-        pdf_b64 = base64.standard_b64encode(pdf_bytes).decode("ascii")
-        document_content = build_document_content(pdf_b64, pdf_path.name, context)
+        document_content = build_document_content(pdf_bytes, pdf_path.name, context)
         chunks = [None]
         logger.info("ptr_vision: %s -> sending the PDF as a document block", pdf_path.name)
 
@@ -2412,7 +2567,7 @@ def extract_via_vision(
         if chunk is None:
             read_kwargs["content"] = document_content
 
-        read_a = _read_pages(client, chunk, state, label="read A", **read_kwargs)
+        read_a = _read_pages(provider, chunk, state, label="read A", model=model, **read_kwargs)
         calls.extend(read_a["calls"])
         attempts += read_a["attempts"]
         stop_reason = read_a["stop_reason"]
@@ -2424,6 +2579,7 @@ def extract_via_vision(
                 reason = f"{reason} (pages {page_range})"
             return _skip(
                 reason,
+                provider=provider,
                 usage=_usage_so_far(),
                 cost_usd=_cost_so_far(),
                 stop_reason=stop_reason,
@@ -2438,7 +2594,7 @@ def extract_via_vision(
                 cost_ceiling_usd=ceiling,
             )
 
-        read_b = _read_pages(client, chunk, state, label="read B", **read_kwargs)
+        read_b = _read_pages(provider, chunk, state, label="read B", model=model_b, **read_kwargs)
         calls.extend(read_b["calls"])
         attempts += read_b["attempts"]
 
@@ -2503,6 +2659,7 @@ def extract_via_vision(
             return _skip(
                 f"cost ceiling exceeded mid-filing: ${spent:.2f} spent after pages {page_range} "
                 f"(ceiling ${ceiling:.2f} x {COST_OVERRUN_FACTOR})",
+                provider=provider,
                 usage=_usage_so_far(),
                 cost_usd=spent,
                 stop_reason=stop_reason,
@@ -2592,10 +2749,13 @@ def extract_via_vision(
         "ok": bool(transactions) or no_transactions,
         "skipped": False,
         "reason": reason,
+        "provider": provider.name,
         "model": model,
-        "orientation_model": ORIENTATION_MODEL_ID,
-        "parser_version": VISION_PARSER_VERSION,
+        "model_b": model_b,
+        "orientation_model": orientation_model,
+        "parser_version": vision_parser_version(provider.name),
         "effort": resolve_effort(),
+        "orientation_mode": orientation_mode,
         "at": _now_iso(),
         "pdf_sha256": pdf_sha256,
         "filer_name": _clean_optional_text(_first_header(payloads, "filer_name")),

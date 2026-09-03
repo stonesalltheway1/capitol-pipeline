@@ -181,6 +181,12 @@ def _enable(monkeypatch: pytest.MonkeyPatch) -> None:
         "CAPITOL_PTR_VISION_GRID_ZOOM",
     ):
         monkeypatch.delenv(name, raising=False)
+    # These tests are the Anthropic path's tests: they assert on the Messages
+    # request dict and on Claude's prices. The default provider is Gemini and
+    # the default orientation pick is the free detector; both are pinned here
+    # so the paid path stays covered.
+    monkeypatch.setenv("CAPITOL_PTR_VISION_PROVIDER", "anthropic")
+    monkeypatch.setenv("CAPITOL_PTR_VISION_ORIENTATION", "model")
     monkeypatch.setenv("ANTHROPIC_API_KEY", "sk-test-not-a-real-key")
     monkeypatch.setattr(ptr_vision, "RETRY_SLEEP_SECONDS", 0)
 
@@ -817,6 +823,29 @@ def test_letter_band_conflict_inside_a_read_nulls_the_amount() -> None:
     assert checked[1]["amount_min"] == 1001 and checked[1]["legibility"] == "clear"
     assert checked[2]["amount_min"] == 1000001  # K is a flag, not a band
     assert checked[3]["amount_min"] == 15001
+
+
+def test_a_band_the_form_does_not_print_is_repaired_from_the_ticked_column() -> None:
+    # Measured on Lamborn 8220068: gemini-3.5-flash reported the ticked column
+    # as B on all six rows and wrote the band as $1,501-$50,000, a digit short
+    # of the $15,001-$50,000 the form prints beside that box. There is no
+    # ambiguity to preserve there -- the bounds are printed on the ladder.
+    rows = [_row("Net App, Inc. stock", amount_column_letter="B", amount_min=1501, amount_max=50000)]
+    checked, conflicts = apply_amount_letter_check(rows)
+
+    assert conflicts == 0
+    assert (checked[0]["amount_min"], checked[0]["amount_max"]) == (15001, 50000)
+    assert checked[0]["legibility"] == "clear"
+    assert "not a band on the form" in checked[0]["comment"]
+    assert "ticked column B" in checked[0]["comment"]
+    assert "_amount_letter_conflict" not in checked[0]
+
+    # A band that IS on the ladder, but a different one, is still a real
+    # contradiction: one of the two readings is a miscount.
+    rows = [_row("Amazon", amount_column_letter="B", amount_min=1001, amount_max=15000)]
+    checked, conflicts = apply_amount_letter_check(rows)
+    assert conflicts == 1
+    assert checked[0]["amount_min"] is None
 
 
 def test_letter_disagreement_between_reads_nulls_the_amount_and_marks_partial() -> None:

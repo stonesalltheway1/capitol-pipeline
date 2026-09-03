@@ -5,6 +5,7 @@ from __future__ import annotations
 from datetime import date, datetime, timedelta, timezone
 import hashlib
 import json
+import logging
 from pathlib import Path
 from tempfile import TemporaryDirectory
 import time
@@ -57,6 +58,7 @@ from capitol_pipeline.exporters.neon import (
     fetch_search_chunk_embedding_backfill,
     fetch_house_stub_search_backfill,
     fetch_house_stub_queue,
+    fetch_house_stubs_awaiting_publication,
     fetch_pipeline_corpus_status,
     fetch_senate_trade_search_backfill,
     hybrid_search,
@@ -85,7 +87,13 @@ from capitol_pipeline.exporters.neon import (
     upsert_search_document,
     upsert_trade_rows_to_neon,
 )
-from capitol_pipeline.models.congress import FilingStub, HousePtrParseResult, MemberMatch, NormalizedTradeRow
+from capitol_pipeline.models.congress import (
+    FilingStub,
+    HousePtrParseResult,
+    HousePtrTransaction,
+    MemberMatch,
+    NormalizedTradeRow,
+)
 from capitol_pipeline.models.fara import (
     FaraDocumentRecord,
     FaraForeignPrincipalRecord,
@@ -106,7 +114,13 @@ from capitol_pipeline.models.usaspending import (
     UsaspendingRecipientRecord,
 )
 from capitol_pipeline.normalizers.crypto_assets import classify_crypto_asset
-from capitol_pipeline.parsers.house_ptr import VISION_BACKENDS, parse_house_ptr_pdf
+from capitol_pipeline.parsers.house_ptr import (
+    REPLAY_PARSER_VERSION,
+    VISION_BACKENDS,
+    build_trade_rows_from_house_ptr,
+    get_transaction_date_issue,
+    parse_house_ptr_pdf,
+)
 from capitol_pipeline.parsers.ptr_vision import is_vision_parser_version
 from capitol_pipeline.processors.chunking import build_search_chunks
 from capitol_pipeline.processors.embeddings import get_embedder
@@ -190,6 +204,8 @@ from capitol_pipeline.sources.usaspending import (
 )
 
 
+logger = logging.getLogger(__name__)
+
 T = TypeVar("T")
 
 
@@ -269,9 +285,11 @@ def build_retry_after_iso(error: Exception, attempts: int) -> str:
 
 
 VISION_BACKEND_HELP = (
-    "Claude vision transcription for scanned or handwritten PTRs. "
-    "'off' never calls the model; 'auto' calls it only when the text parser "
-    "scores under 0.5 or produced no OCR text; 'claude' always calls it. "
+    "Whether to read scanned or handwritten PTRs as page images. "
+    "'off' never calls a model; 'auto' calls one only when the text parser "
+    "scores under 0.5 or produced no OCR text; 'on' always calls one "
+    "('claude' and 'gemini' are accepted spellings of 'on'). Which vendor "
+    "answers is CAPITOL_PTR_VISION_PROVIDER (default gemini, free tier). "
     "Disable globally with CAPITOL_PTR_VISION_DISABLED=1."
 )
 
@@ -421,6 +439,7 @@ def persist_parsed_house_stub(
         stub,
         status=status,
         parser_confidence=parsed.parser_confidence,
+        parser_version=parsed.parser_version,
         parsed_transaction_count=len(parsed.transactions),
         extracted_trade_id=trade_summary["trade_ids"][0] if trade_summary.get("trade_ids") else None,
         last_error=house_stub_last_error(parsed),
@@ -434,6 +453,174 @@ def persist_parsed_house_stub(
         "stubStatus": status,
         "visionParse": parsed.vision_report,
     }
+
+
+#: What a replayed stub reports when the original transcription is unusable.
+REPLAY_SKIPPED = "skipped"
+
+
+def rebuild_parsed_house_stub(
+    row: dict[str, object],
+    *,
+    registry: MemberRegistry | None = None,
+) -> tuple[FilingStub, HousePtrParseResult | None, list[NormalizedTradeRow], str | None]:
+    """Rebuild a finished parse from a stub's stored transcription.
+
+    The rows in ``metadata.parsedTransactions`` were transcribed in an earlier
+    run; they never reached ``trades`` because the filer had no member record
+    at the time. Nothing here re-reads the PDF and nothing calls a model.
+
+    Returns ``(stub, parsed, trades, skip_reason)``. ``skip_reason`` is set,
+    and ``parsed`` is None, whenever the filing still cannot be published.
+    """
+
+    stub = build_stub_from_queue_row(row)
+    metadata = row.get("metadata") or {}
+    if not isinstance(metadata, dict):
+        return stub, None, [], "stub metadata is not an object"
+
+    if not stub.member.id and registry is not None:
+        resolved = registry.resolve_feed_member(
+            stub.first_name or "", stub.last_name or "", stub.member.state
+        )
+        if resolved is not None:
+            stub = stub.model_copy(update={"member": resolved})
+    if not stub.member.id:
+        return stub, None, [], "member still unresolved"
+
+    stored = metadata.get("parsedTransactions")
+    if not isinstance(stored, list) or not stored:
+        return stub, None, [], "no stored transcription"
+
+    transactions: list[HousePtrTransaction] = []
+    for entry in stored:
+        if not isinstance(entry, dict):
+            continue
+        try:
+            transactions.append(HousePtrTransaction(**entry))
+        except Exception as error:  # noqa: BLE001 - one bad row must not lose the filing
+            logger.warning(
+                "repersist: %s row %s unusable (%s)", stub.doc_id, entry.get("line_number"), error
+            )
+    if not transactions:
+        return stub, None, [], "stored transcription could not be read back"
+
+    valid = [
+        transaction
+        for transaction in transactions
+        if get_transaction_date_issue(transaction.transaction_date, stub.filing_date) is None
+    ]
+    if not valid:
+        return stub, None, [], "every stored row failed date validation"
+
+    vision = metadata.get("visionParse")
+    stored_version = str(metadata.get("parserVersion") or "").strip()
+    if not stored_version and isinstance(vision, dict):
+        stored_version = str(vision.get("parserVersion") or "").strip()
+    parser_version = stored_version or REPLAY_PARSER_VERSION
+    confidence = float(metadata.get("parserConfidence") or 0.0)
+
+    parsed = HousePtrParseResult(
+        doc_id=stub.doc_id,
+        member_name=str(metadata.get("memberName") or "").strip() or stub.member.name,
+        state=str(metadata.get("state") or "").strip() or stub.member.state,
+        parser_confidence=confidence,
+        parser_version=parser_version,
+        raw_text_preview=str(metadata.get("rawTextPreview") or "") or None,
+        transactions=valid,
+        vision_report=vision if isinstance(vision, dict) else None,
+        text_layer=metadata.get("textLayer") if isinstance(metadata.get("textLayer"), dict) else None,
+    )
+    provenance = (
+        f"House PTR {stub.doc_id}: transcribed at {round(confidence * 100)}% confidence "
+        f"[{parser_version}], published once the member record resolved"
+    )
+    trades = build_trade_rows_from_house_ptr(parsed, stub, provenance=provenance)
+    return stub, parsed, trades, None
+
+
+def repersist_house_stub_rows(
+    settings: Settings,
+    rows: list[dict[str, object]],
+    *,
+    registry: MemberRegistry | None = None,
+    min_confidence: float = 0.0,
+    dry_run: bool = False,
+) -> dict[str, object]:
+    """Publish stored transcriptions for a batch of stubs. No model, no PDF."""
+
+    summary: dict[str, object] = {
+        "candidates": len(rows),
+        "published": 0,
+        "skipped": 0,
+        "failed": 0,
+        "tradeRowsUpserted": 0,
+        "rowsDropped": 0,
+        "dryRun": dry_run,
+        "stubs": [],
+    }
+    for row in rows:
+        doc_id = str(row.get("doc_id") or "")
+        stub, parsed, trades, skip_reason = rebuild_parsed_house_stub(row, registry=registry)
+        stored_count = len(
+            [entry for entry in ((row.get("metadata") or {}).get("parsedTransactions") or []) if entry]  # type: ignore[union-attr]
+        )
+        if parsed is None:
+            summary["skipped"] = int(summary["skipped"]) + 1
+            summary["stubs"].append(  # type: ignore[union-attr]
+                {"docId": doc_id, "status": REPLAY_SKIPPED, "reason": skip_reason}
+            )
+            continue
+        if parsed.parser_confidence < min_confidence:
+            summary["skipped"] = int(summary["skipped"]) + 1
+            summary["stubs"].append(  # type: ignore[union-attr]
+                {
+                    "docId": doc_id,
+                    "status": REPLAY_SKIPPED,
+                    "reason": (
+                        f"parser confidence {parsed.parser_confidence:.2f} below "
+                        f"{min_confidence:.2f}"
+                    ),
+                }
+            )
+            continue
+
+        dropped = stored_count - len(parsed.transactions)
+        summary["rowsDropped"] = int(summary["rowsDropped"]) + max(0, dropped)
+        entry: dict[str, object] = {
+            "docId": doc_id,
+            "memberId": stub.member.id,
+            "memberName": stub.member.name,
+            "parserVersion": parsed.parser_version,
+            "parserConfidence": parsed.parser_confidence,
+            "rows": len(trades),
+            "rowsDropped": max(0, dropped),
+        }
+        if dry_run:
+            entry["status"] = "would publish"
+            entry["stubStatus"] = resolve_house_stub_status(stub, parsed, trades)
+            summary["published"] = int(summary["published"]) + 1
+            summary["tradeRowsUpserted"] = int(summary["tradeRowsUpserted"]) + len(trades)
+            summary["stubs"].append(entry)  # type: ignore[union-attr]
+            continue
+        try:
+            result = persist_parsed_house_stub(settings, stub, parsed, trades)
+        except Exception as error:  # pragma: no cover - depends on the live database
+            logger.exception("repersist: %s failed: %s", doc_id, error)
+            summary["failed"] = int(summary["failed"]) + 1
+            entry["status"] = "failed"
+            entry["error"] = str(error)[:500]
+            summary["stubs"].append(entry)  # type: ignore[union-attr]
+            continue
+        upserted = int((result.get("trades") or {}).get("upserted", 0))  # type: ignore[union-attr]
+        summary["published"] = int(summary["published"]) + 1
+        summary["tradeRowsUpserted"] = int(summary["tradeRowsUpserted"]) + upserted
+        entry["status"] = "published"
+        entry["stubStatus"] = result.get("stubStatus")
+        entry["rows"] = upserted
+        entry["withheld"] = int((result.get("trades") or {}).get("withheld", 0))  # type: ignore[union-attr]
+        summary["stubs"].append(entry)  # type: ignore[union-attr]
+    return summary
 
 
 def build_stub_from_queue_row(row: dict[str, object]) -> FilingStub:
@@ -3045,6 +3232,74 @@ def process_house_review_command(
         vision_backend=vision_backend,
     )
     summary["mode"] = "needs_review"
+    click.echo(json.dumps(summary, indent=2))
+
+
+@cli.command("repersist-house-stubs")
+@click.option(
+    "--limit",
+    type=int,
+    default=25,
+    show_default=True,
+    help="Filings per run. The command is restartable: publishing a filing takes it out of the queue.",
+)
+@click.option(
+    "--doc-id",
+    "doc_ids",
+    multiple=True,
+    help="Only these filings (repeatable). Overrides the status filter.",
+)
+@click.option(
+    "--include-vision/--text-only",
+    default=False,
+    show_default=True,
+    help=(
+        "Vision transcriptions are withheld from trades on purpose while they "
+        "wait for a human. --include-vision publishes them anyway; only use it "
+        "on a filing you have read."
+    ),
+)
+@click.option(
+    "--min-confidence",
+    type=float,
+    default=0.0,
+    show_default=True,
+    help="Skip a filing whose stored parser confidence is below this.",
+)
+@click.option("--dry-run/--apply", default=False, show_default=True)
+@click.option("--export-registry/--no-export-registry", default=True, show_default=True)
+def repersist_house_stubs_command(
+    limit: int,
+    doc_ids: tuple[str, ...],
+    include_vision: bool,
+    min_confidence: float,
+    dry_run: bool,
+    export_registry: bool,
+) -> None:
+    """Publish House filings whose rows were parsed before their member resolved.
+
+    When a PTR is parsed for a filer with no member record, the transcription
+    is kept on the stub and nothing is written to trades. Loading the historical
+    members afterwards resolves the filer, but nothing re-runs -- so finished,
+    correct rows sit in the review queue indefinitely. This republishes them
+    from what is already stored: no PDF is downloaded and no model is called.
+    """
+
+    settings = Settings()
+    registry = load_registry_if_available(settings, export_cache=export_registry)
+    rows = fetch_house_stubs_awaiting_publication(
+        settings,
+        limit=limit,
+        doc_ids=[doc_id.strip() for doc_id in doc_ids if doc_id.strip()] or None,
+        include_vision=include_vision,
+    )
+    summary = repersist_house_stub_rows(
+        settings,
+        rows,
+        registry=registry,
+        min_confidence=min_confidence,
+        dry_run=dry_run,
+    )
     click.echo(json.dumps(summary, indent=2))
 
 

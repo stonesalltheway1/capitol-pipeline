@@ -11,8 +11,9 @@ CapitolExposed's Neon database. The production path should be:
 
 - `DATABASE_URL`
 - `OPENAI_API_KEY`
-- `ANTHROPIC_API_KEY` (only for the House PTR vision review path; without it the
-  vision step skips instead of failing)
+- `GEMINI_API_KEY` (the House PTR vision review path's default provider, free
+  tier; without it the vision step skips instead of failing)
+- `ANTHROPIC_API_KEY` (only when `CAPITOL_PTR_VISION_PROVIDER=anthropic`)
 
 ## Scheduled workflows
 
@@ -66,62 +67,130 @@ Offshore corpus needs a fresh rebuild.
 - Offshore match refresh weekly
 - Offshore full raw ingest only when the upstream ICIJ archive changes
 
-## House PTR review queue (Claude vision)
+## House PTR review queue (scanned and handwritten filings)
 
-Roughly 210 House PTRs are stuck in `house_filing_stubs.status = 'needs_review'`
-because they are scanned or handwritten. OCR produces junk, the regex parser
-scores 0.0, and re-running OCR with a different backend does not help. Those
-filings are readable by a vision model, so `process-house-review` can hand the
-PDF straight to Claude.
+Roughly 220 House PTRs sit in `house_filing_stubs.status = 'needs_review'`
+because they are scanned or handwritten. OCR on the PDF as filed produces junk,
+the regex parser scores 0.0, and re-running OCR with a different backend does
+not help. Two things fix that, and neither of them costs anything.
 
-Drain the queue in small, capped batches:
+### 1. Publish what is already transcribed
+
+Before reading anything, drain the filings that were already read. A PTR parsed
+for a filer with no member record keeps its rows in
+`metadata.parsedTransactions` and writes nothing to `trades`; loading the
+historical members afterwards resolves the filer, but nothing re-runs. As of
+2026-09-03 that was 105 filings holding 738 finished rows.
+
+```bash
+python -u -m capitol_pipeline repersist-house-stubs --limit 25 --dry-run
+python -u -m capitol_pipeline repersist-house-stubs --limit 25 --apply
+```
+
+No PDF is downloaded and no model is called. The command is restartable:
+publishing a filing gives it trade rows, which takes it out of the queue. It
+skips the vision transcriptions that are deliberately withheld pending review
+unless you pass `--include-vision`, and `--min-confidence` holds back anything
+the original parser was unsure of. Rows whose parser version was never recorded
+are published as `house-ptr-text-replay-v1` rather than guessing at `regex-v1`,
+and each row's comment says it was published once the member record resolved.
+
+### 2. Read the pages
 
 ```bash
 python -u -m capitol_pipeline process-house-review \
   --limit 5 \
-  --ocr-backend pymupdf \
+  --ocr-backend auto \
   --vision-backend auto \
   --with-search-index \
   --no-embeddings
 ```
 
-`--ocr-backend` still selects the OCR chain and `--vision-backend` is a separate
-flag for the Claude transcription path:
+`--ocr-backend` selects the OCR chain and `--vision-backend` decides *whether*
+the pages are read as images:
 
-- `off` — never call the model (the default everywhere except this command).
-- `auto` — call it only when the text parser scored under 0.5 or the OCR text
+- `off` — never call a model (the default everywhere except this command).
+- `auto` — call one only when the text parser scored under 0.5 or the OCR text
   was empty. The default for `process-house-review`.
-- `claude` — always call it for the filing. Use it to spot-check one document
-  with `parse-house-ptr --vision-backend claude`.
+- `on` — always call one for the filing (`claude` and `gemini` are accepted
+  spellings, so the box's `HOUSE_REVIEW_VISION_BACKEND` keeps working). Use it
+  to spot-check one document with `parse-house-ptr --vision-backend on`.
 
-`--ocr-backend pymupdf` is the cheap choice here: on a scan the OCR pass has
-nothing to find, so there is no point paying for `docling`. Keep
-`--ocr-backend docling` when you want one more genuine OCR attempt first.
+*Who* answers is `CAPITOL_PTR_VISION_PROVIDER`, and it is a separate decision:
 
-Required environment on the box:
+| | |
+|---|---|
+| `gemini` (default) | Google Generative Language, free tier. Read A is `gemini-3.8-flash`, read B `gemini-3.5-flash`. Needs `GEMINI_API_KEY` (or `GOOGLE_API_KEY`). |
+| `anthropic` | The original paid path, `claude-opus-5`. Needs `ANTHROPIC_API_KEY`. |
 
-- `ANTHROPIC_API_KEY` (or `ANTHROPIC_AUTH_TOKEN`). Without it the vision path
-  skips with a reason instead of failing the run.
-- `CAPITOL_PTR_VISION_MODEL` — optional read-model override; defaults to
-  `claude-opus-5`. Orientation detection always uses `claude-haiku-4-5`.
-- `CAPITOL_PTR_VISION_DISABLED=1` — kill switch. Set it and every filing is
-  skipped with `reason: disabled by CAPITOL_PTR_VISION_DISABLED` and stays in
-  the queue. Use this first if spend or output quality looks wrong; you do not
-  need to redeploy.
+Neither falls back to the other: a missing key skips the filing with a reason
+and leaves it in the queue.
 
+Two things about the free path that were measured, not assumed:
+
+- **Read A and read B are two different model versions on purpose.** Two
+  samples of one model agree with themselves. On Wied 9115665 one version read
+  Purchase / $1,001-$15,000 and the other Sale / $15,001-$50,000, and the
+  second was right; the disagreement is what makes the filing get looked at.
+- **Free-tier input may be used to improve Google's models.** Everything sent
+  is a published federal disclosure, which is why that trade is acceptable. It
+  is a stated decision.
+
+`--ocr-backend auto` is the right choice for a scan: the pages are rendered
+upright before OCR runs, which is what turns a sideways scan from noise into
+text (87 of 108 House scans are stored rotated 270 degrees). `--ocr-backend
+pymupdf` reads only an existing text layer, so on an image-only filing it does
+nothing at all — use it only when you deliberately want no OCR.
+
+### Orientation costs nothing
+
+Every page is analysed at 0, 90, 180 and 270 degrees by the checkbox detector
+and scored on the form's own asymmetries: a complete A-K ladder, the header
+printed above the rows, the ladder at the right margin, and the wide K column
+on the right. The filing as a whole then settles pages that are close calls,
+because a scan goes through the feeder once. A page with no ladder at any
+rotation follows the rest of the filing when the quarter turn agrees, and
+otherwise falls back to "a portrait page is a sideways landscape form".
+
+`CAPITOL_PTR_VISION_ORIENTATION` picks the strategy: `grid` (default, free),
+`model` (the old paid pick, two calls a page), `heuristic` (page shape only).
+`orientation[].method` on the stub records which one decided each page.
+
+### Environment
+
+- `GEMINI_API_KEY` / `GOOGLE_API_KEY` — the free provider's credentials.
+- `ANTHROPIC_API_KEY` (or `ANTHROPIC_AUTH_TOKEN`) — only for
+  `CAPITOL_PTR_VISION_PROVIDER=anthropic`.
+- `CAPITOL_PTR_VISION_PROVIDER` — `gemini` (default) or `anthropic`.
+- `CAPITOL_PTR_VISION_MODEL` / `CAPITOL_PTR_VISION_MODEL_B` — read A and read B
+  model overrides. Do not set either to `gemini-2.5-flash`: it is retired for
+  new API keys and 404s.
+- `CAPITOL_PTR_VISION_GEMINI_RPM` — requests per minute per model, default 10.
+  Google no longer publishes the free-tier limit; check it in AI Studio before
+  sizing a batch. A 429 backs off (honouring the API's own `retryDelay`) and
+  retries up to `CAPITOL_PTR_VISION_GEMINI_MAX_ATTEMPTS` (default 4).
+- `CAPITOL_PTR_VISION_DISABLED=1` — kill switch. Every filing is skipped with
+  `reason: disabled by CAPITOL_PTR_VISION_DISABLED` and stays in the queue. Use
+  this first if output quality looks wrong; you do not need to redeploy.
 - `CAPITOL_PTR_VISION_EFFORT` — `low`..`max`, default `medium`; use `high` for a
-  queue of handwritten forms.
+  queue of handwritten forms. On Gemini it maps to `thinkingLevel`.
 - `CAPITOL_PTR_VISION_CHUNK_PAGES` — pages per read request, default 4.
 - `CAPITOL_PTR_VISION_MAX_COST_USD` — per-filing ceiling on the pre-flight
-  estimate (pages x two reads x per-page rate + orientation), default 25 so a
-  60-page filing fits at the measured ~$0.40 a page (medium effort, strips on;
-  `CAPITOL_PTR_VISION_EFFORT=low` is the cost lever). A refused filing records `estimated cost $X ... exceeds
-  the $Y ceiling` in `visionParse.reason` with `costEstimateUsd` /
-  `costCeilingUsd`; a filing that overruns 1.5x the ceiling mid-way is
-  abandoned with what it spent recorded.
+  estimate, default 25. Every Gemini rate is zero, so on the free provider the
+  ceiling never bites and the long typed attachments the paid path had to
+  refuse go through. On `anthropic` it still holds: a 60-page filing fits at
+  the measured ~$0.40 a page (medium effort, strips on;
+  `CAPITOL_PTR_VISION_EFFORT=low` is the cost lever). A refused filing records
+  `estimated cost $X ... exceeds the $Y ceiling` in `visionParse.reason` with
+  `costEstimateUsd` / `costCeilingUsd`; a filing that overruns 1.5x the ceiling
+  mid-way is abandoned with what it spent recorded.
 - `CAPITOL_PTR_VISION_GRID_ZOOM` — close-up strip zoom (default 2, 0 disables).
 - `CAPITOL_PTR_VISION_PAGE_RANGE` — debug only, e.g. `11-13`: read just those
   pages of a filing at their normal page labels. Never set it on the timer.
+- `CAPITOL_PTR_UPRIGHT_OCR=0` — hand OCR the PDF as filed instead of the
+  upright render. Only for comparing the two.
+
+### What the detector adds
 
 The checkbox detector (`parsers/ptr_grid.py`) runs on every rendered page
 without a model call and cross-checks each row's amount column; its verdicts
@@ -132,18 +201,16 @@ ambiguous cell nulls that row's amount and sends the filing to review. A
 vision filing in `needs_review` publishes nothing to `trades`
 (`visionParse.withheldTrades` says how many rows are waiting); once a human
 resolves it, `process-house-review --doc-id <id>` re-runs that stub alone and,
-if the PDF is unchanged and the previous read is under 30 days old, reuses the
-transcription for free.
+if the PDF is unchanged, the previous read is under 30 days old and the same
+provider would answer today, reuses the transcription for free.
 
-Guardrails, in order: the env kill switch, missing credentials, PDFs over 20 MB,
-PDFs over 60 pages, the cost ceiling, one filing per call, one retry on 429/5xx
-per read (plus one halved retry when a read truncates at `max_tokens`), and
-`--limit` as the hard per-run cap. Skipped filings keep `needs_review` and
-record why. A filing the model reads as "nothing to report" (both reads, zero
-rows, `no_transactions_stated`) ends `parsed` with zero rows and
-`visionParse.noTransactions: true`; a stub bounced for another reason (an
-unresolved member) is re-processed for free while its PDF hash and
-`visionParse.at` are within 30 days.
+Guardrails, in order: the env kill switch, missing credentials for the
+configured provider, PDFs over 20 MB, PDFs over 60 pages, the cost ceiling, one
+filing per call, one retry per read (plus one halved retry when a read
+truncates at `max_tokens`), and `--limit` as the hard per-run cap. Skipped
+filings keep `needs_review` and record why. A filing both reads agree states
+"nothing to report" ends `parsed` with zero rows and
+`visionParse.noTransactions: true`.
 
 ### Reading the summary JSON
 
@@ -154,10 +221,11 @@ unresolved member) is re-processed for free while its PDF hash and
 - `visionRowsRecovered` — transactions transcribed
 - `visionCostUsd` — estimated spend for the run
 
-Per filing, `processed[].parserVersion` is `claude-vision-v2` (older rows carry
-`claude-sonnet-5-vision-v1`; anything starting `claude-` and containing
-`vision` is the vision path) when the rows came from vision rather than the
-regex or Haiku text paths, and `processed[].visionParse` carries the row count,
+Per filing, `processed[].parserVersion` names the reader: `gemini-vision-v2` on
+the free provider, `claude-vision-v2` on the paid one (older rows carry
+`claude-sonnet-5-vision-v1`; anything starting `claude-` or `gemini-` and
+containing `vision` is the vision path) when the rows came from vision rather
+than the regex or Haiku text paths, and `processed[].visionParse` carries the row count,
 legibility counts, cost, and skip reason. The full `metadata.visionParse` record
 also has `orientation` (rotation and method per page), `readAgreement`
 (`rowsA`, `rowsB`, `matched`, `fieldDisagreements`), and `calls` (usage and cost
@@ -166,152 +234,13 @@ per orientation call and per read).
 ### Where cost is recorded
 
 Cost is estimated in the pipeline, not read back from a bill. Every attempt
-writes `house_filing_stubs.metadata.visionParse` with token usage
-(`inputTokens`, `cacheReadTokens`, `cacheWriteTokens`, `outputTokens`), the
-`costUsd` estimate, and the `pricing` block the estimate used, so an old row
-still explains itself if rates change. Claude Opus 5 is $5 / $25 per MTok and
-Claude Haiku 4.5 (orientation only) $1 / $5; cache reads bill at 0.1x input and
-cache writes at 1.25x input. Every filing costs two Opus reads plus one or two
-Haiku calls per page, and `usage` / `costUsd` are the sum across all of them.
-The ~2,000-token system prompt is sent with `cache_control: ephemeral`, so after
-the first read of a run it should show up as `cacheReadTokens`, not
-`inputTokens`.
+writes `house_filing_stubs.metadata.visionParse` with the provider, both read
+models, token usage (`inputTokens`, `cacheReadTokens`, `cacheWriteTokens`,
+`outputTokens`), the `costUsd` estimate, and the `pricing` block the estimate
+used, so an old row still explains itself if rates change.
 
-Query the running total:
-
-```sql
-SELECT count(*) AS filings,
-       round(sum((metadata->'visionParse'->>'costUsd')::numeric), 4) AS usd
-FROM house_filing_stubs
-WHERE metadata->'visionParse' IS NOT NULL;
-```
-
-### When a filing stays in needs_review
-
-The model rates each row `clear`, `partial`, or `illegible`. More than half the
-rows `illegible` keeps the stub `needs_review` with the transcription attached
-under `metadata.parsedTransactions` for a human to check; anything better marks
-it `parsed`. A stub whose member never resolved can never be marked `parsed`
-regardless of legibility — fix the member registry first.
-
-## Senate trades
-
-Senate PTRs come from the official disclosure site, `https://efdsearch.senate.gov`.
-The Quiver subscription lapsed (403 on every call) and the senate-stock-watcher
-aggregate feed has been frozen since 2020, so `--provider efd` is the live path
-and `--provider auto` falls back to it whenever `QUIVER_API_TOKEN` is unset.
-
-On the box this runs as a systemd timer every 30 minutes:
-
-```bash
-python -u -m capitol_pipeline senate-ingest \
-  --provider efd \
-  --with-search-index \
-  --no-embeddings
-```
-
-The window is chosen from the database, not the clock: it starts
-`CAPITOL_SENATE_EFD_LOOKBACK_DAYS` (14) before the newest `disclosure_date`
-already stored for any Senate source, floored at
-`CAPITOL_SENATE_EFD_FLOOR_DAYS` (60) days ago so a scheduled run never sweeps
-the whole archive. Override it with `--since YYYY-MM-DD`. Each run opens at most
-`--max-reports` reports (200 by default) and waits ≥1 s between requests.
-
-First backfill after deploying the scraper — one wider pass, then let the timer
-take over:
-
-```bash
-python -u -m capitol_pipeline senate-ingest \
-  --provider efd \
-  --since 2026-01-01 \
-  --max-reports 400 \
-  --with-search-index \
-  --no-embeddings
-```
-
-Reading the summary JSON:
-
-- `reportsListed` — PTRs matched in the submitted-date window
-- `electronicParsed` — HTML filings whose transaction table was read
-- `paperDeferred` / `paperDeferredReports` — scanned filings recorded as
-  `needs_review` with their page-image URLs. The OCR chain only accepts PDFs, so
-  these are never parsed automatically; they are a manual follow-up.
-- `tradesInserted` / `skipped` — rows written versus already present, unresolved,
-  or filed before `--start-date`
-- `errors` — per-report failures. A single bad report never aborts the run.
-
-Inspect without writing anything:
-
-```bash
-python -u -m capitol_pipeline senate-feed --provider efd --limit 5 --with-transactions
-```
-
-### One-off: collapse the duplicated Quiver rows
-
-The canonical Senate trade id used to hash `asset_description` and `source_url`,
-which the Quiver live and bulk feeds word differently, so the same trade was
-written twice (~2,686 rows). The id now hashes only member, asset, action,
-transaction date, amount bounds and owner, so new ingests collide correctly.
-Clean up the existing rows once, after deploying:
-
-```bash
-python -u -m capitol_pipeline dedupe-senate-trades --dry-run   # counts and sample groups
-python -u -m capitol_pipeline dedupe-senate-trades --apply     # one transaction
-```
-
-`scripts/dedupe_senate_trades.sql` does the same through `psql` and rolls back
-by default. Always read the dry run first; the apply path is transactional, so a
-foreign-key conflict rolls the whole sweep back rather than half-deleting.
-
-The TypeScript mirror of the id, `lib/trade-integrity.ts` in the site repo, must
-be updated to match or the site and the pipeline will disagree about trade ids.
-
-## Manual recovery commands
-
-```bash
-python -u -m capitol_pipeline corpus-status
-python -u -m capitol_pipeline house-ingest --year 2026 --batch-size 25 --max-batches 6
-python -u -m capitol_pipeline process-house-review --limit 5 --ocr-backend pymupdf --vision-backend auto
-python -u -m capitol_pipeline senate-ingest --provider efd --with-search-index --no-embeddings
-python -u -m capitol_pipeline dedupe-senate-trades --dry-run
-python -u -m capitol_pipeline ingest-fara --mode bulk --skip-existing --with-match-index
-python -u -m capitol_pipeline index-site-editorial --only-missing
-python -u -m capitol_pipeline index-site-core --only-missing
-python -u -m capitol_pipeline embed-search-corpus --batch-size 100 --max-batches 30
-```
-
-## Full backfill commands
-
-```bash
-python -u -m capitol_pipeline ingest-offshore-leaks --with-match-index
-python -u -m capitol_pipeline ingest-fara --mode bulk --with-match-index
-python -u -m capitol_pipeline index-house-search-backfill --only-missing
-python -u -m capitol_pipeline index-site-editorial --reindex-all
-python -u -m capitol_pipeline index-site-core --reindex-all
-python -u -m capitol_pipeline ingest-offshore-leaks --skip-nodes --skip-relationships --with-match-index
-python -u -m capitol_pipeline embed-search-corpus --batch-size 100 --max-batches 0
-```
-
-## Notes
-
-- If `corpus-status` shows embedded chunks stalling while documents continue to
-  rise, check `OPENAI_API_KEY` first.
-- If `house_filing_stubs` stalls in `pending_extraction`, run the filings workflow
-  manually and inspect the summary JSON for deferred or failed documents.
-- If Senate trades stop moving while House continues, run
-  `senate-ingest --provider efd` manually and inspect `reportsListed`,
-  `electronicParsed` and `errors`. `reportsListed: 0` with a sensible
-  `windowStartDate` is a real result: Senate PTRs arrive in bursts.
-- If every eFD request fails, check the prohibition-agreement handshake first.
-  The scraper raises `SenateEfdError` when `POST /search/home/` stops setting a
-  session cookie, which is what happens if the site changes that form.
-- If the House Clerk feed references a PDF before it is published, the stub is
-  deferred and retried later. That is expected behavior.
-- If `process-house-review` reports `visionCalls: 0` while filings stay in the
-  queue, read `metadata.visionParse.reason` on one of them. The usual causes are
-  the `CAPITOL_PTR_VISION_DISABLED` kill switch, a missing `ANTHROPIC_API_KEY`,
-  or a filing over the 25-page / 20 MB guardrail.
-- If `visionCostUsd` climbs faster than expected, check that
-  `visionParse.usage.cacheReadTokens` is non-zero after the first filing in a
-  run. Zero cache reads across a batch means the cached system prefix is being
-  invalidated and every filing is paying full input price.
+On the free provider every rate is 0.0 and `costUsd` is a true zero rather than
+an estimate nobody paid. On `anthropic`, Claude Opus 5 is $5 / $25 per MTok and
+Claude Haiku 4.5 (orientation only, and only when
+`CAPITOL_PTR_VISION_ORIENTATION=model`) $1 / $5; cache reads bill at 0.1x input
+and cache writes at 1.25x input.

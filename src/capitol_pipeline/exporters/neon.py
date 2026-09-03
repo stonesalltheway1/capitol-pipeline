@@ -923,6 +923,23 @@ def ensure_congress_schema(settings: Settings) -> dict[str, object]:
     }
 
 
+#: ``house_filing_stubs.metadata`` is an object on every row but one: doc
+#: 20033889 was written as a one-element array by an early poller, and ``||``
+#: on an array target appends rather than merges, so every later write would
+#: keep it an array and every ``metadata->>'...'`` read on it returns NULL.
+#: This unwraps that shape on the next write instead of dropping it.
+HOUSE_STUB_METADATA_OBJECT = """
+        CASE
+            WHEN jsonb_typeof(house_filing_stubs.metadata) = 'object'
+                THEN house_filing_stubs.metadata
+            WHEN jsonb_typeof(house_filing_stubs.metadata) = 'array'
+                 AND jsonb_typeof(house_filing_stubs.metadata -> 0) = 'object'
+                THEN house_filing_stubs.metadata -> 0
+            ELSE '{}'::jsonb
+        END
+"""
+
+
 def sync_house_stubs_to_neon(
     settings: Settings,
     stubs: list[FilingStub],
@@ -964,10 +981,21 @@ def sync_house_stubs_to_neon(
                     filing_year = EXCLUDED.filing_year,
                     source = EXCLUDED.source,
                     source_url = EXCLUDED.source_url,
-                    metadata = COALESCE(house_filing_stubs.metadata, '{}'::jsonb) || EXCLUDED.metadata,
+                    metadata = """
+                + HOUSE_STUB_METADATA_OBJECT
+                + """ || EXCLUDED.metadata,
                     last_seen_at = NOW(),
+                    -- The feed sync refreshes source_url, metadata and
+                    -- last_seen_at. It is not a triage decision: a filing a
+                    -- human or the review command has already put in
+                    -- needs_review stays there. Before this, the 15-minute
+                    -- house-refresh reset every current-year review item to
+                    -- pending_extraction, so the same PDFs were downloaded and
+                    -- re-parsed forever (doc 9115726 reached 397 attempts) and
+                    -- the review queue drained itself.
                     status = CASE
-                        WHEN house_filing_stubs.status IN ('extracting', 'parsed') THEN house_filing_stubs.status
+                        WHEN house_filing_stubs.status IN ('extracting', 'parsed', 'needs_review')
+                            THEN house_filing_stubs.status
                         ELSE EXCLUDED.status
                     END
                 """,
@@ -1328,13 +1356,22 @@ def fetch_house_stub_queue(
     doc_filter = "AND doc_id = ANY(%s)" if doc_ids else ""
     params: list[object] = [list(doc_ids)] if doc_ids else []
     if only_needs_review:
+        # A filing that was read and then withheld for review carries no
+        # lastError (house_stub_last_error returns None as soon as any row was
+        # parsed), so matching on lastError alone loses it the moment anything
+        # flips it to pending_extraction: doc 9116141 sat on 134 transcribed
+        # rows that no command could reach. Anything that has been read at all
+        # belongs in the review queue.
         status_clause = """
             (
                 status = 'needs_review'
                 OR (
                     status = 'pending_extraction'
-                    AND COALESCE(metadata->>'lastError', '') ILIKE
-                        'PTR text extracted but transactions need manual review%%'
+                    AND (
+                        COALESCE(metadata->>'lastError', '') ILIKE
+                            'PTR text extracted but transactions need manual review%%'
+                        OR (jsonb_typeof(metadata) = 'object' AND metadata ? 'visionParse')
+                    )
                 )
             )
         """
@@ -1373,6 +1410,57 @@ def fetch_house_stub_queue(
                         ELSE 3
                     END,
                     detected_at DESC
+                LIMIT %s
+                """,
+                (*params, max(1, limit)),
+            )
+            return list(cursor.fetchall())
+
+
+def fetch_house_stubs_awaiting_publication(
+    settings: Settings,
+    *,
+    limit: int = 25,
+    doc_ids: list[str] | None = None,
+    include_vision: bool = False,
+) -> list[dict[str, object]]:
+    """House stubs holding a finished transcription that never reached ``trades``.
+
+    A filing whose member did not resolve at parse time is left in
+    ``needs_review`` with its rows in ``metadata.parsedTransactions`` and
+    nothing in ``trades`` -- and when ``members_historical`` resolves that
+    member afterwards, nothing re-runs. This finds those filings: rows stored,
+    no trade written, and (unless ``include_vision``) not one of the vision
+    transcriptions that are deliberately held back for human review.
+
+    Restartable by construction: publishing a stub gives it trade rows, which
+    takes it out of this result.
+    """
+
+    filters = [
+        "jsonb_typeof(s.metadata) = 'object'",
+        "jsonb_typeof(s.metadata -> 'parsedTransactions') = 'array'",
+        "jsonb_array_length(s.metadata -> 'parsedTransactions') > 0",
+        "NOT EXISTS (SELECT 1 FROM trades t WHERE t.id LIKE 'tr-house-' || s.doc_id || '-%%')",
+    ]
+    params: list[object] = []
+    if doc_ids:
+        filters.append("s.doc_id = ANY(%s)")
+        params.append(list(doc_ids))
+    else:
+        filters.append("s.status <> 'parsed'")
+    if not include_vision:
+        filters.append("NOT (s.metadata ? 'visionParse')")
+
+    with neon_connection(settings) as connection:
+        with connection.cursor() as cursor:
+            cursor.execute(
+                f"""
+                SELECT s.doc_id, s.filing_year, s.source, s.source_url, s.status,
+                       s.extracted_trade_id, s.metadata, s.detected_at, s.last_seen_at
+                FROM house_filing_stubs s
+                WHERE {" AND ".join(filters)}
+                ORDER BY s.filing_year DESC, s.doc_id
                 LIMIT %s
                 """,
                 (*params, max(1, limit)),
@@ -3762,7 +3850,9 @@ def update_house_stub_state(
                 UPDATE house_filing_stubs
                 SET status = %s,
                     extracted_trade_id = %s,
-                    metadata = COALESCE(metadata, '{}'::jsonb) || %s
+                    metadata = """
+                + HOUSE_STUB_METADATA_OBJECT
+                + """ || %s
                 WHERE doc_id = %s
                 """,
                 (
@@ -3782,6 +3872,7 @@ def mark_house_stub_processed(
     status: str,
     parser_confidence: float,
     parsed_transaction_count: int,
+    parser_version: str | None = None,
     extracted_trade_id: str | None = None,
     last_error: str | None = None,
     raw_text_preview: str | None = None,
@@ -3794,6 +3885,10 @@ def mark_house_stub_processed(
     metadata.update(
         {
             "parserConfidence": parser_confidence,
+            # Which parser produced the stored transcription. Without it, a
+            # later replay of these rows cannot say truthfully where they
+            # came from.
+            "parserVersion": parser_version,
             "parsedAt": datetime.now(timezone.utc).isoformat(),
             "parsedTransactionCount": parsed_transaction_count,
             "lastError": last_error,

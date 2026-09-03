@@ -215,10 +215,9 @@ def test_auto_sends_an_unsegmentable_typed_pdf_to_review_not_ocr(
     assert parsed.text_layer["ocr"]["status"] == "skipped"
 
 
-def test_auto_ocrs_an_image_only_pdf_under_the_cap(
-    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
-) -> None:
-    _no_haiku(monkeypatch)
+def _capture_chain(monkeypatch: pytest.MonkeyPatch) -> list[tuple[Path, float]]:
+    """Replace the OCR chain with a recorder that returns a typed PTR text."""
+
     calls: list[tuple[Path, float]] = []
 
     def _fake_chain(
@@ -232,18 +231,71 @@ def test_auto_ocrs_an_image_only_pdf_under_the_cap(
         }
 
     monkeypatch.setattr(house_ptr, "_run_ocr_chain_capped", _fake_chain)
+    return calls
+
+
+def test_auto_ocrs_an_image_only_pdf_upright_under_the_cap(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    pytest.importorskip("fitz")
+    _no_haiku(monkeypatch)
+    calls = _capture_chain(monkeypatch)
     pdf = _image_only_pdf(tmp_path)
     settings = Settings(ptr_ocr_time_cap_seconds=123)
     parsed, rows = house_ptr.parse_house_ptr_pdf(
         pdf, stub=_stub(), settings=settings, backend="auto", vision_backend="off"
     )
-    # A scan still gets OCR'd and its text still parses, exactly as before.
-    assert calls == [(pdf, 123)]
+    # A scan still gets OCR'd and its text still parses, but what OCR is shown
+    # is the upright render rather than the PDF as filed.
+    assert len(calls) == 1
+    ocr_path, cap = calls[0]
+    assert cap == 123
+    assert ocr_path != pdf
+    assert ocr_path.name.endswith("-upright.pdf")
     assert [row.ticker for row in rows] == ["CVX", "JPM"]
     assert parsed.review_reason is None
     assert parsed.text_layer is not None
     assert parsed.text_layer["hasTextLayer"] is False
     assert parsed.text_layer["ocr"]["status"] == "finished"
+    upright = parsed.text_layer["ocr"]["upright"]
+    assert upright["applied"] is True
+    assert upright["pages"] == 1
+    assert upright["dpi"] == 200
+
+
+def test_auto_falls_back_to_the_filed_pdf_when_it_cannot_be_rendered_upright(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    _no_haiku(monkeypatch)
+    calls = _capture_chain(monkeypatch)
+    monkeypatch.setattr(house_ptr, "build_upright_pdf", lambda *_args, **_kwargs: None)
+    pdf = _image_only_pdf(tmp_path)
+    settings = Settings(ptr_ocr_time_cap_seconds=123)
+    parsed, _rows = house_ptr.parse_house_ptr_pdf(
+        pdf, stub=_stub(), settings=settings, backend="auto", vision_backend="off"
+    )
+    assert calls == [(pdf, 123)]
+    assert parsed.text_layer is not None
+    assert parsed.text_layer["ocr"]["upright"] == {
+        "applied": False,
+        "reason": "could not render upright",
+    }
+
+
+def test_upright_render_can_be_switched_off(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    _no_haiku(monkeypatch)
+    monkeypatch.setenv("CAPITOL_PTR_UPRIGHT_OCR", "0")
+    calls = _capture_chain(monkeypatch)
+    pdf = _image_only_pdf(tmp_path)
+    settings = Settings(ptr_ocr_time_cap_seconds=123)
+    parsed, _rows = house_ptr.parse_house_ptr_pdf(
+        pdf, stub=_stub(), settings=settings, backend="auto", vision_backend="off"
+    )
+    assert calls == [(pdf, 123)]
+    assert parsed.text_layer is not None
+    assert "upright" not in parsed.text_layer["ocr"]
 
 
 def test_auto_reports_a_capped_ocr_run_as_the_review_reason(

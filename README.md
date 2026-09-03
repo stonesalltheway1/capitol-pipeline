@@ -15,7 +15,8 @@ PTR filings and asset normalization.
 - Official Senate eFD (efdsearch.senate.gov) scraper for Periodic Transaction Reports
 - Senate watcher and Quiver source adapters (both now legacy)
 - House PTR parser for text and PDF-backed filings
-- Claude vision transcription for scanned and handwritten PTRs the OCR chain cannot read
+- Vision transcription for scanned and handwritten PTRs the OCR chain cannot read,
+  read twice and reconciled, on Gemini's free tier by default and Claude on request
 - CapitolExposed-compatible member registry resolution
 - Crypto asset classifier for direct coins, ETFs and trusts, and adjacent equities
 - Bridge helpers that emit shapes compatible with CapitolExposed database tables

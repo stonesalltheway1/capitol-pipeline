@@ -290,6 +290,10 @@ def find_horizontal_rules(dark: Any, ladder: list[int], y0: int, y1: int) -> lis
 
     np = _np()
     y0 = max(0, y0)
+    # The caller pads the ladder's extent by a few pixels to catch the rules
+    # that bound it; on a page whose ladder runs to the bottom edge that pad
+    # walks off the array, and the slice comes back short of ``votes``.
+    y1 = min(int(y1), int(dark.shape[0]) - 1)
     if y1 <= y0:
         return []
     columns = [(ladder[index], ladder[index + 1]) for index in range(len(ladder) - 1)]
@@ -411,6 +415,73 @@ def analyze_amount_grid(gray: Any) -> dict[str, Any] | None:
         "headerEnd": int(header_end),
         "captionEnd": int(caption_end),
     }
+
+
+#: Weights for :func:`orientation_score`. The four terms are independent
+#: pieces of evidence that a rendered page is the right way up, and they are
+#: summed rather than multiplied so one missing signal cannot veto the rest.
+ORIENTATION_WEIGHT_LADDER = 2.0
+ORIENTATION_WEIGHT_HEADER = 1.5
+ORIENTATION_WEIGHT_MARGIN = 1.0
+ORIENTATION_WEIGHT_WIDE_K = 0.5
+ORIENTATION_WEIGHT_ROWS = 0.5
+#: The K column has to be this much wider than the ladder's other end before
+#: its width counts as evidence either way.
+ORIENTATION_WIDE_K_RATIO = 1.15
+#: Row bands at which the "this page carries rows" term saturates.
+ORIENTATION_ROWS_FULL = 8
+
+
+def orientation_score(analysis: dict[str, Any] | None) -> float:
+    """How strongly a page analysis says the page is upright. 0 when it does not.
+
+    :func:`analyze_amount_grid` finds a ladder on a page that is upside down
+    almost as readily as on one that is upright -- a ruled brokerage grid is
+    a ruled brokerage grid either way up -- so the half turn has to be settled
+    by asymmetries in the form itself:
+
+    * **the ladder is complete.** Eleven columns is A-K; a partial run is
+      more often a lucky match on some other ruling.
+    * **the header prints above the rows.** ``headerEnd`` only moves off
+      ``y0`` when the letters row and the dollar ranges were found in the top
+      half of the ladder. Upside down they are in the bottom half and this
+      term is zero. This is the single strongest signal.
+    * **the ladder runs to the right margin.** The amount columns are the
+      last thing on an upright House PTR line.
+    * **K is the wide column, and it is on the right.** The spouse/dependent
+      flag column is wider than the bands beside it; upside down the wide
+      column lands at the ladder's left end.
+    * **the page carries row bands at all.**
+
+    Returns a number in ``0..5.5``; callers compare it across the four
+    rotations rather than against a threshold.
+    """
+
+    if not isinstance(analysis, dict):
+        return 0.0
+    columns = analysis.get("columns") or []
+    width = int(analysis.get("width") or 0)
+    if not columns or width <= 0:
+        return 0.0
+
+    score = ORIENTATION_WEIGHT_LADDER * min(1.0, len(columns) / float(MAX_LADDER_RULES - 1))
+
+    if int(analysis.get("headerEnd") or 0) > int(analysis.get("y0") or 0):
+        score += ORIENTATION_WEIGHT_HEADER
+
+    right_edge = float(columns[-1][1]) / float(width)
+    score += ORIENTATION_WEIGHT_MARGIN * max(0.0, min(1.0, right_edge))
+
+    first_width = float(columns[0][1] - columns[0][0])
+    last_width = float(columns[-1][1] - columns[-1][0])
+    if first_width > 0 and last_width > first_width * ORIENTATION_WIDE_K_RATIO:
+        score += ORIENTATION_WEIGHT_WIDE_K
+    elif last_width > 0 and first_width > last_width * ORIENTATION_WIDE_K_RATIO:
+        score -= ORIENTATION_WEIGHT_WIDE_K
+
+    bands = analysis.get("bands") or []
+    score += ORIENTATION_WEIGHT_ROWS * min(1.0, len(bands) / float(ORIENTATION_ROWS_FULL))
+    return round(score, 4)
 
 
 def cell_ink_density(cell: Any) -> float:
