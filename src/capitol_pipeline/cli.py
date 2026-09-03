@@ -129,7 +129,7 @@ from capitol_pipeline.processors.headshots import (
     run_headshot_verification,
     upsert_headshot_verifications,
 )
-from capitol_pipeline.processors.ocr import OcrProcessor
+from capitol_pipeline.processors.ocr import OcrProcessor, fix_font_mojibake
 from capitol_pipeline.registries.members import MemberRegistry, load_member_registry_from_json
 from capitol_pipeline.sources.congress_gov import (
     CongressGovApiClient,
@@ -496,6 +496,20 @@ def rebuild_parsed_house_stub(
     for entry in stored:
         if not isinstance(entry, dict):
             continue
+        # Some House PTRs embed a subset font whose lowercase glyphs extract as
+        # IPA characters, and transcriptions stored before the text layer was
+        # run through fix_font_mojibake carry them: "Filing Status: New" comes
+        # back as an unreadable run. Reversing a known character shift is not
+        # a rewrite of the record.
+        entry = {
+            **entry,
+            "asset_description": fix_font_mojibake(str(entry.get("asset_description") or "")),
+            "comment": (
+                fix_font_mojibake(str(entry["comment"]))
+                if isinstance(entry.get("comment"), str)
+                else entry.get("comment")
+            ),
+        }
         try:
             transactions.append(HousePtrTransaction(**entry))
         except Exception as error:  # noqa: BLE001 - one bad row must not lose the filing

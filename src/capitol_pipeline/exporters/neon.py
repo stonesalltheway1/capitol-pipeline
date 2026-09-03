@@ -1441,14 +1441,19 @@ def fetch_house_stubs_awaiting_publication(
         "jsonb_typeof(s.metadata) = 'object'",
         "jsonb_typeof(s.metadata -> 'parsedTransactions') = 'array'",
         "jsonb_array_length(s.metadata -> 'parsedTransactions') > 0",
-        "NOT EXISTS (SELECT 1 FROM trades t WHERE t.id LIKE 'tr-house-' || s.doc_id || '-%%')",
     ]
     params: list[object] = []
     if doc_ids:
+        # Naming filings is a deliberate act: run exactly those, whatever
+        # state they are in. That is also how a published filing is corrected,
+        # since the trade ids are stable and the upsert overwrites.
         filters.append("s.doc_id = ANY(%s)")
         params.append(list(doc_ids))
     else:
         filters.append("s.status <> 'parsed'")
+        filters.append(
+            "NOT EXISTS (SELECT 1 FROM trades t WHERE t.id LIKE 'tr-house-' || s.doc_id || '-%%')"
+        )
     if not include_vision:
         filters.append("NOT (s.metadata ? 'visionParse')")
 

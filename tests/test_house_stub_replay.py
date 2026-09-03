@@ -158,6 +158,25 @@ def test_a_row_dated_after_the_filing_is_dropped() -> None:
     assert reason == "every stored row failed date validation"
 
 
+def test_a_subset_font_run_is_repaired_before_publication() -> None:
+    # Some House PTRs embed a subset font whose lowercase glyphs extract 0x222
+    # code points high, as IPA characters. Transcriptions stored before the
+    # text layer was run through fix_font_mojibake carry them, and 234 of the
+    # rows waiting to be published did.
+    shifted = "".join(
+        chr(ord(char) + 0x222) if char.islower() else char
+        for char in "Filing Status: New Paychex, Inc."
+    )
+    assert shifted != "Filing Status: New Paychex, Inc."
+    row = dict(MANNING_ROW, asset_description=shifted, comment=shifted)
+    _stub, parsed, trades, reason = cli.rebuild_parsed_house_stub(_row(parsedTransactions=[row]))
+
+    assert reason is None and parsed is not None
+    assert parsed.transactions[0].asset_description == "Filing Status: New Paychex, Inc."
+    assert trades[0].asset_description == "Filing Status: New Paychex, Inc."
+    assert trades[0].comment.startswith("Filing Status: New Paychex, Inc.")
+
+
 def test_a_stub_with_no_stored_rows_is_skipped() -> None:
     _stub, parsed, _trades, reason = cli.rebuild_parsed_house_stub(_row(parsedTransactions=[]))
     assert parsed is None
@@ -268,7 +287,8 @@ def test_the_queue_query_excludes_vision_and_published_filings(
     )
     sql, params = executed[0]
     assert "visionParse" not in sql
-    # Naming a filing overrides the status filter: a re-run of one doc is a
-    # deliberate act.
+    # Naming a filing runs exactly that filing, whatever state it is in: it is
+    # how an already-published filing gets corrected.
     assert "s.status <> 'parsed'" not in sql
+    assert "NOT EXISTS" not in sql
     assert params == (["20024231"], 2)
