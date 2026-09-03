@@ -933,7 +933,7 @@ def _skip(reason: str, *, provider: Any = None, **extra: Any) -> dict[str, Any]:
         "provider": provider_name,
         "model": getattr(provider, "read_model", None) or resolve_model_id(),
         "model_b": getattr(provider, "read_model_b", None),
-        "orientation_model": getattr(provider, "orientation_model", None) or ORIENTATION_MODEL_ID,
+        "orientation_model": getattr(provider, "orientation_model", None),
         "parser_version": vision_parser_version(provider_name),
         "filer_name": None,
         "filing_date": None,
@@ -2123,8 +2123,11 @@ def build_vision_metadata(report: dict[str, Any]) -> dict[str, Any]:
     usage = report.get("usage") or {}
     model = report.get("model")
     price_in, price_out = pricing_for_model(model)
-    orientation_model = report.get("orientation_model") or ORIENTATION_MODEL_ID
-    orient_in, orient_out = pricing_for_model(orientation_model)
+    # None whenever no model was asked about orientation, which is the
+    # default: naming one there would put a model in the record that never
+    # saw the page.
+    orientation_model = report.get("orientation_model")
+    orient_in, orient_out = pricing_for_model(orientation_model) if orientation_model else (0.0, 0.0)
     metadata: dict[str, Any] = {
         "provider": report.get("provider"),
         "model": model,
@@ -2428,7 +2431,7 @@ def extract_via_vision(
     model = provider.read_model
     model_b = provider.read_model_b
     orientation_mode = resolve_orientation_mode()
-    orientation_model = provider.orientation_model
+    orientation_model = provider.orientation_model if orientation_mode == "model" else None
     # The rotation is decided by the free detector unless a model was asked
     # for, so the orientation term of the estimate is usually a true zero.
     orientation_cost = (
