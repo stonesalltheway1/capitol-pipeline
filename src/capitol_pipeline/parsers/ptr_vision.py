@@ -50,9 +50,9 @@ A filing whose reads both return zero rows and both report that the form
 states there is nothing to report is a terminal ``no_transactions`` result,
 not a review item.
 
-This module is a peer of :mod:`capitol_pipeline.parsers.ptr_llm_fallback`
-(the Haiku text fallback, still used when the OCR text layer is decent), not a
-replacement.
+This module is the only model-facing reader in the House PTR path. There is
+no text-model fallback beside it: the one that existed invented filings and
+was removed, call sites and all.
 
 Guardrails
 ----------

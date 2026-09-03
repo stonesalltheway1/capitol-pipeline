@@ -3890,10 +3890,6 @@ def mark_house_stub_processed(
     metadata.update(
         {
             "parserConfidence": parser_confidence,
-            # Which parser produced the stored transcription. Without it, a
-            # later replay of these rows cannot say truthfully where they
-            # came from.
-            "parserVersion": parser_version,
             "parsedAt": datetime.now(timezone.utc).isoformat(),
             "parsedTransactionCount": parsed_transaction_count,
             "lastError": last_error,
@@ -3905,8 +3901,16 @@ def mark_house_stub_processed(
     # been re-processed 173 times since; writing an empty list here would have
     # thrown that transcription away on any one of them. The count above still
     # reports what this run found.
+    #
+    # parserVersion names the parser that produced the stored transcription,
+    # so it moves only when the transcription does. Writing it unconditionally
+    # is what relabelled 9116141's Gemini rows as regex-v1 -- and the label is
+    # what the publish gate reads.
     if parsed_transactions:
         metadata["parsedTransactions"] = parsed_transactions
+        metadata["parserVersion"] = parser_version
+    elif not metadata.get("parserVersion"):
+        metadata["parserVersion"] = parser_version
     if metadata_extra:
         metadata.update(metadata_extra)
 

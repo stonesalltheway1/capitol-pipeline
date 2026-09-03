@@ -265,10 +265,10 @@ def test_a_low_confidence_filing_can_be_held_back(exporter: _Calls) -> None:
     assert exporter.upserts == []
 
 
-def test_a_withheld_vision_transcription_still_publishes_nothing(exporter: _Calls) -> None:
-    # --include-vision can put one in the batch; the withholding rule in
-    # persist_parsed_house_stub is what keeps it out of trades, and it still
-    # applies here.
+def test_a_settled_row_from_a_filing_in_review_publishes(exporter: _Calls) -> None:
+    # --include-vision can put one in the batch. Withholding is per row now,
+    # so a row carrying a date, a type and an amount band publishes even while
+    # the filing keeps its place in the review queue.
     row = _row(
         parserVersion="claude-vision-v2",
         visionParse={"ok": True, "needsReview": True, "parserVersion": "claude-vision-v2"},
@@ -276,10 +276,44 @@ def test_a_withheld_vision_transcription_still_publishes_nothing(exporter: _Call
     summary = cli.repersist_house_stub_rows(Settings(), [row])
 
     assert summary["published"] == 1
+    assert summary["tradeRowsUpserted"] == 1
+    assert summary["stubs"][0]["stubStatus"] == "needs_review"
+    assert len(exporter.upserts[0]) == 1
+
+
+def test_an_unsettled_row_from_a_filing_in_review_is_held_back(exporter: _Calls) -> None:
+    # The same filing, with the amount band the two reads could not settle.
+    row = _row(
+        parsedTransactions=[dict(MANNING_ROW, amount_min=0, amount_max=0)],
+        parserVersion="claude-vision-v2",
+        visionParse={"ok": True, "needsReview": True, "parserVersion": "claude-vision-v2"},
+    )
+    summary = cli.repersist_house_stub_rows(Settings(), [row])
+
     assert summary["tradeRowsUpserted"] == 0
     assert summary["stubs"][0]["stubStatus"] == "needs_review"
     assert summary["stubs"][0]["withheld"] == 1
     assert exporter.upserts == []
+
+
+def test_the_replay_names_the_parser_that_made_the_transcription(exporter: _Calls) -> None:
+    """Not the one the stub happens to be labelled with.
+
+    Every re-processing of a stub rewrote ``metadata.parserVersion``, so doc
+    9116141 carried a Gemini transcription labelled ``regex-v1``. Rows read
+    off page images were then published as text-parser output.
+    """
+
+    row = _row(
+        parserVersion="regex-v1",
+        visionParse={"ok": True, "needsReview": True, "parserVersion": "gemini-vision-v2"},
+    )
+    _stub, parsed, trades, skip = cli.rebuild_parsed_house_stub(row)
+
+    assert skip is None
+    assert parsed is not None
+    assert parsed.parser_version == "gemini-vision-v2"
+    assert [trade.parser_version for trade in trades] == ["gemini-vision-v2"]
 
 
 def test_an_empty_run_never_erases_a_stored_transcription(

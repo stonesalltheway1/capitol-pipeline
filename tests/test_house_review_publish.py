@@ -1,9 +1,10 @@
 """Publishing rules for House PTR results.
 
-A vision-parsed filing publishes trade rows only once it resolves to
-``parsed``; while it is ``needs_review`` the rows stay in the stub metadata.
-The text path keeps publishing as before. The database is never touched: the
-exporter entry points are patched on the CLI module.
+A filing read off page images publishes row by row while it is
+``needs_review``: a row carrying a date, a type and an amount band goes to
+``trades``, and a row missing any of the three stays in the stub metadata for
+a reviewer. The text path keeps publishing as before. The database is never
+touched: the exporter entry points are patched on the CLI module.
 """
 
 from __future__ import annotations
@@ -14,7 +15,13 @@ import pytest
 
 from capitol_pipeline import cli
 from capitol_pipeline.config import Settings
-from capitol_pipeline.models.congress import FilingStub, HousePtrParseResult, HousePtrTransaction, MemberMatch
+from capitol_pipeline.models.congress import (
+    FilingStub,
+    HousePtrParseResult,
+    HousePtrTransaction,
+    MemberMatch,
+    NormalizedTradeRow,
+)
 
 
 def _stub(member_id: str | None = "m-K000389") -> FilingStub:
@@ -37,6 +44,32 @@ def _transaction() -> HousePtrTransaction:
         transaction_date="2023-03-10",
         amount_min=1001,
         amount_max=15000,
+        owner="spouse",
+    )
+
+
+def _trade(
+    *,
+    line: int = 1,
+    transaction_date: str | None = "2023-03-10",
+    amount_min: int = 1001,
+    amount_max: int = 15000,
+) -> NormalizedTradeRow:
+    """One built trade row, settled unless a field is knocked out."""
+
+    return NormalizedTradeRow(
+        member=MemberMatch(
+            id="m-K000389", name="Ro Khanna", slug="ro-khanna", party="D", state="CA", district="17"
+        ),
+        source="house-clerk",
+        disclosure_kind="house-ptr",
+        source_id=f"tr-house-8219444-{line}",
+        asset_description="Lear Corporation",
+        asset_type="Asset",
+        transaction_type="purchase",
+        transaction_date=transaction_date,
+        amount_min=amount_min,
+        amount_max=amount_max,
         owner="spouse",
     )
 
@@ -64,27 +97,98 @@ def exporter(monkeypatch: pytest.MonkeyPatch) -> _Calls:
     return calls
 
 
-def test_vision_result_in_review_publishes_no_trades(exporter: _Calls) -> None:
+def test_a_scan_in_review_publishes_the_rows_that_are_settled(exporter: _Calls) -> None:
+    """One disputed row must not hold back the rows nothing disputes.
+
+    On doc 9116141 the old rule did exactly that: 26 rows whose Type column
+    the two reads read one column apart held back 108 rows both reads and the
+    checkbox detector agreed on.
+    """
+
     parsed = HousePtrParseResult(
         doc_id="8219444",
         parser_confidence=0.85,
         parser_version="claude-vision-v2",
         transactions=[_transaction()],
-        vision_report={"ok": True, "needsReview": True, "needsReviewReasons": ["reads disagree on amount"]},
+        vision_report={
+            "ok": True,
+            "needsReview": True,
+            "needsReviewReasons": ["reads disagree on amount"],
+            "rowsDroppedForType": 3,
+        },
     )
-    trades = [object(), object()]
+    trades = [
+        _trade(line=1),
+        _trade(line=2, amount_min=0, amount_max=0),
+        _trade(line=3, transaction_date=None),
+    ]
 
-    summary = cli.persist_parsed_house_stub(Settings(), _stub(), parsed, trades)  # type: ignore[arg-type]
+    summary = cli.persist_parsed_house_stub(Settings(), _stub(), parsed, trades)
 
     assert summary["stubStatus"] == "needs_review"
-    assert exporter.upserts == []  # nothing reached trades
-    assert summary["trades"] == {"upserted": 0, "trade_ids": [], "withheld": 2}
+    assert [row.source_id for row in exporter.upserts[0]] == ["tr-house-8219444-1"]
+    assert summary["trades"]["upserted"] == 1
+    assert summary["trades"]["withheld"] == 2
     mark = exporter.marks[0]
     assert mark["status"] == "needs_review"
-    assert mark["extracted_trade_id"] is None
-    # The transcription stays on the stub for the reviewer.
+    # The whole transcription stays on the stub for the reviewer.
     assert mark["parsed_transactions"][0]["asset_description"] == "Lear Corporation"
-    assert mark["metadata_extra"]["visionParse"]["withheldTrades"] == 2
+    vision = mark["metadata_extra"]["visionParse"]
+    assert vision["publishedTrades"] == 1
+    assert vision["withheldTrades"] == 2
+    # Rows the reads disagreed on the type of never reached trade building,
+    # so the reader-facing total has to carry them too.
+    assert vision["rowsWithheldTotal"] == 5
+    assert vision["withheldReasons"] == {
+        "no amount band": 1,
+        "no transaction date": 1,
+        "reads disagree on transaction type": 3,
+    }
+
+
+def test_a_scan_in_review_withholds_every_unsettled_row(exporter: _Calls) -> None:
+    parsed = HousePtrParseResult(
+        doc_id="8219444",
+        parser_confidence=0.85,
+        parser_version="claude-vision-v2",
+        transactions=[_transaction()],
+        vision_report={"ok": True, "needsReview": True, "needsReviewReasons": ["majority illegible"]},
+    )
+    trades = [_trade(line=1, amount_min=0, amount_max=0), _trade(line=2, transaction_date=None)]
+
+    summary = cli.persist_parsed_house_stub(Settings(), _stub(), parsed, trades)
+
+    assert exporter.upserts == []  # nothing reached trades
+    assert summary["trades"] == {"upserted": 0, "trade_ids": [], "withheld": 2}
+    assert exporter.marks[0]["extracted_trade_id"] is None
+
+
+def test_a_relabelled_transcription_is_still_treated_as_a_scan(exporter: _Calls) -> None:
+    """The publish gate must not key on a label any run can overwrite.
+
+    doc 9116141 carried a Gemini transcription stamped ``regex-v1`` because
+    every re-processing rewrote ``metadata.parserVersion``. Keyed on that
+    label, the gate let 107 rows read off page images publish as text-parser
+    output while the stub sat in review.
+    """
+
+    parsed = HousePtrParseResult(
+        doc_id="9116141",
+        parser_confidence=0.0,
+        parser_version="regex-v1",
+        transactions=[_transaction()],
+        vision_report={
+            "ok": True,
+            "needsReview": True,
+            "needsReviewReasons": ["reads disagree on transaction_type"],
+        },
+    )
+    trades = [_trade(line=1), _trade(line=2, amount_min=0, amount_max=0)]
+
+    summary = cli.persist_parsed_house_stub(Settings(), _stub(), parsed, trades)
+
+    assert summary["trades"]["withheld"] == 1
+    assert [row.source_id for row in exporter.upserts[0]] == ["tr-house-8219444-1"]
 
 
 def test_vision_result_that_parses_publishes(exporter: _Calls) -> None:
@@ -114,7 +218,9 @@ def test_vision_result_with_unresolved_member_is_withheld(exporter: _Calls) -> N
         transactions=[_transaction()],
         vision_report={"ok": True, "needsReview": False},
     )
-    summary = cli.persist_parsed_house_stub(Settings(), _stub(member_id=None), parsed, [object()])  # type: ignore[arg-type]
+    summary = cli.persist_parsed_house_stub(
+        Settings(), _stub(member_id=None), parsed, [_trade(line=1, amount_min=0, amount_max=0)]
+    )
     assert summary["stubStatus"] == "needs_review"
     assert exporter.upserts == []
     assert summary["trades"]["withheld"] == 1
@@ -128,7 +234,7 @@ def test_text_path_publishes_even_in_review(exporter: _Calls) -> None:
         parser_version="regex-v1",
         transactions=[_transaction()],
     )
-    trades = [object()]
+    trades = [_trade(line=1)]
 
     summary = cli.persist_parsed_house_stub(Settings(), _stub(), parsed, trades)  # type: ignore[arg-type]
 

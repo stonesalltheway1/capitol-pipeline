@@ -1607,14 +1607,6 @@ def test_vision_owner_and_partial_sale_mapping(
 # ---------------------------------------------------------------------------
 
 
-def test_ocr_text_is_decent_rejects_scanner_junk() -> None:
-    junk = "| 9 984 F 1 | Sale | 1 | " * 40
-    assert house_ptr.ocr_text_is_decent(junk) is False
-    assert house_ptr.ocr_text_is_decent("") is False
-    assert house_ptr.ocr_text_is_decent(None) is False
-    assert house_ptr.ocr_text_is_decent(CHEVRON_TEXT * 6) is True
-
-
 def test_parse_house_ptr_pdf_calls_vision_when_the_text_path_is_weak(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
@@ -1638,11 +1630,6 @@ def test_parse_house_ptr_pdf_calls_vision_when_the_text_path_is_weak(
             return _Result()
 
     monkeypatch.setattr(house_ptr, "OcrProcessor", _JunkProcessor)
-    monkeypatch.setattr(
-        house_ptr,
-        "extract_via_haiku",
-        lambda *_a, **_k: pytest.fail("Haiku text fallback must not run on junk OCR text"),
-    )
     _, calls = _install_fake_client(monkeypatch, _payload(CHEVRON_VISION_ROW))
 
     parsed, rows = house_ptr.parse_house_ptr_pdf(
@@ -1712,11 +1699,6 @@ def test_parse_house_ptr_pdf_records_a_skipped_vision_attempt(
             return _Result()
 
     monkeypatch.setattr(house_ptr, "OcrProcessor", _EmptyProcessor)
-    monkeypatch.setattr(
-        house_ptr,
-        "extract_via_haiku",
-        lambda *_a, **_k: {"transactions": [], "parser_notes": "", "usage": {}, "confidence": 0.0},
-    )
     _, calls = _install_fake_client(monkeypatch, _payload(CHEVRON_VISION_ROW))
 
     parsed, rows = house_ptr.parse_house_ptr_pdf(

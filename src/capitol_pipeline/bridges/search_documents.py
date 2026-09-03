@@ -66,6 +66,37 @@ def ensure_list_of_dicts(value: Any) -> list[dict[str, Any]]:
     return []
 
 
+def house_ptr_search_body(parsed: HousePtrParseResult) -> str:
+    """The text a House PTR is indexed on.
+
+    A typed filing has its own text layer and that is what goes in. A scan has
+    none, and since OCR came out of the scanned path there is nothing to fall
+    back on -- nor was the old fallback worth having: on doc 9116141 docling
+    returned 43,820 characters reading ``| SP | LLM FAMILY INVESTMENTS LP |``
+    replicated across all sixteen columns, with no dates and no amounts.
+    The transcribed rows are better text than that by a wide margin: they are
+    the asset names, dates and bands a reader would search for.
+    """
+
+    preview = (parsed.raw_text_preview or "").strip()
+    if preview:
+        return preview
+    lines: list[str] = []
+    for transaction in parsed.transactions:
+        parts = [transaction.asset_description]
+        if transaction.ticker:
+            parts.append(f"({transaction.ticker})")
+        parts.append(transaction.transaction_type)
+        if transaction.transaction_date:
+            parts.append(transaction.transaction_date)
+        if transaction.amount_min and transaction.amount_max:
+            parts.append(f"${transaction.amount_min:,} - ${transaction.amount_max:,}")
+        if transaction.owner and transaction.owner != "self":
+            parts.append(transaction.owner)
+        lines.append(" ".join(part for part in parts if part))
+    return "\n".join(lines)
+
+
 def build_house_ptr_search_document(
     stub: FilingStub,
     parsed: HousePtrParseResult,
@@ -73,6 +104,7 @@ def build_house_ptr_search_document(
 ) -> SearchDocumentRecord:
     """Build a searchable document record from a parsed House PTR."""
 
+    body = house_ptr_search_body(parsed)
     tickers = sorted({trade.ticker for trade in trades if trade.ticker})
     tags = ["house-ptr", "stock-act", "congressional-trades"]
     if tickers:
@@ -96,13 +128,13 @@ def build_house_ptr_search_document(
         tags=tags,
         pdfUrl=stub.source_url,
         sourceUrl=stub.source_url,
-        ocrText=parsed.raw_text_preview or "",
+        ocrText=body,
         verificationStatus="verified" if parsed.transactions else "unverified",
     )
 
     return build_search_document(
         document,
-        content=parsed.raw_text_preview or "",
+        content=body,
         metadata={
             "docId": stub.doc_id,
             "filingYear": stub.filing_year,

@@ -520,7 +520,7 @@ def test_no_transactions_is_terminal_when_both_reads_state_it(
     assert resolve_house_stub_status(stub, parsed, trades) == "needs_review"
 
 
-def test_no_transactions_result_skips_the_haiku_text_fallback(
+def test_no_transactions_result_publishes_no_rows(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
     _enable(monkeypatch)
@@ -541,11 +541,6 @@ def test_no_transactions_result_skips_the_haiku_text_fallback(
             return _Result()
 
     monkeypatch.setattr(house_ptr, "OcrProcessor", _JunkProcessor)
-    monkeypatch.setattr(
-        house_ptr,
-        "extract_via_haiku",
-        lambda *_a, **_k: pytest.fail("Haiku text fallback must not run after a no-transactions read"),
-    )
 
     parsed, rows = house_ptr.parse_house_ptr_pdf(pdf, stub=_stub(), backend="pymupdf", vision_backend="auto")
 

@@ -18,7 +18,6 @@ from capitol_pipeline.models.congress import (
     NormalizedTradeRow,
 )
 from capitol_pipeline.normalizers.crypto_assets import classify_crypto_asset
-from capitol_pipeline.parsers.ptr_llm_fallback import extract_via_haiku
 from capitol_pipeline.parsers.ptr_upright import build_upright_pdf, upright_ocr_enabled
 from capitol_pipeline.parsers.ptr_vision import (
     VISION_PARSER_VERSION,
@@ -34,7 +33,6 @@ from capitol_pipeline.processors.ocr import fix_font_mojibake, OcrProcessor
 logger = logging.getLogger(__name__)
 
 REGEX_PARSER_VERSION = "regex-v1"
-LLM_PARSER_VERSION = "haiku-4.5-fallback-v1"
 
 #: Rows published from a stub's stored transcription in a later run, where the
 #: original parse predates :func:`mark_house_stub_processed` recording which
@@ -54,20 +52,6 @@ VISION_FORCE_BACKENDS: frozenset[str] = frozenset({"on", "claude", "gemini"})
 #: Text-parser confidence below which ``auto`` hands the PDF to the vision model.
 VISION_CONFIDENCE_FLOOR = 0.5
 
-#: Below this much readable OCR text the text layer is treated as junk and the
-#: Haiku text fallback is skipped in favour of reading the pages as images.
-MIN_DECENT_OCR_CHARS = 400
-MIN_DECENT_OCR_WORDS = 40
-MIN_DECENT_OCR_ALPHA_RATIO = 0.55
-
-_LLM_OWNER_MAP: dict[str, str] = {
-    "self": "self",
-    "spouse": "spouse",
-    "joint": "joint",
-    "dependent": "child",
-    "trust": "self",
-    "unknown": "self",
-}
 
 _VISION_OWNER_MAP: dict[str, str] = {
     "self": "self",
@@ -799,7 +783,7 @@ def parse_house_ptr_text(
     return parsed, build_trade_rows_from_house_ptr(parsed, stub)
 
 
-def _llm_amount_bounds(raw_min: object, raw_max: object) -> tuple[int, int]:
+def _amount_bounds(raw_min: object, raw_max: object) -> tuple[int, int]:
     try:
         amount_min = int(raw_min or 0)
     except (TypeError, ValueError):
@@ -815,129 +799,6 @@ def _llm_amount_bounds(raw_min: object, raw_max: object) -> tuple[int, int]:
     if amount_min > amount_max and amount_max > 0:
         amount_min, amount_max = amount_max, amount_min
     return amount_min, amount_max
-
-
-def _llm_transaction_type(raw: object) -> str:
-    value = str(raw or "").strip().lower()
-    if value in {"sale", "s"}:
-        return "sale"
-    if value in {"exchange", "e"}:
-        return "exchange"
-    return "purchase"
-
-
-def _llm_owner(raw: object) -> str:
-    value = str(raw or "").strip().lower()
-    return _LLM_OWNER_MAP.get(value, "self")
-
-
-def _llm_to_transactions(payload: list[dict]) -> list[HousePtrTransaction]:
-    out: list[HousePtrTransaction] = []
-    for index, raw_row in enumerate(payload, start=1):
-        if not isinstance(raw_row, dict):
-            continue
-        description = (raw_row.get("asset_description") or "").strip()
-        if not description:
-            continue
-        amount_min, amount_max = _llm_amount_bounds(raw_row.get("amount_min"), raw_row.get("amount_max"))
-        ticker = raw_row.get("ticker")
-        ticker = ticker.strip().upper() if isinstance(ticker, str) and ticker.strip() else None
-        out.append(
-            HousePtrTransaction(
-                line_number=index,
-                asset_description=description,
-                ticker=ticker,
-                asset_type=(raw_row.get("asset_type") or "Asset").strip() or "Asset",
-                transaction_type=_llm_transaction_type(raw_row.get("transaction_type")),  # type: ignore[arg-type]
-                transaction_date=normalize_date(raw_row.get("transaction_date")),
-                notification_date=normalize_date(raw_row.get("notification_date")),
-                amount_min=amount_min,
-                amount_max=amount_max,
-                owner=_llm_owner(raw_row.get("owner")),  # type: ignore[arg-type]
-            )
-        )
-    return out
-
-
-def _run_llm_fallback(
-    pdf_path: Path,
-    stub: FilingStub,
-    text_preview: str,
-) -> tuple[HousePtrParseResult, list[NormalizedTradeRow]] | None:
-    """Invoke Haiku 4.5 fallback; return (parsed, rows) or None if nothing extracted."""
-
-    try:
-        llm_result = extract_via_haiku(pdf_path)
-    except Exception as exc:
-        logger.exception("house_ptr fallback: extract_via_haiku raised: %s", exc)
-        return None
-
-    raw_transactions = llm_result.get("transactions") or []
-    if not raw_transactions:
-        logger.info(
-            "house_ptr fallback: no rows recovered for %s (notes=%r usage=%s)",
-            pdf_path.name,
-            (llm_result.get("parser_notes") or "")[:120],
-            llm_result.get("usage"),
-        )
-        return None
-
-    transactions = _llm_to_transactions(raw_transactions)
-    transactions = dedupe_transactions(stub, transactions)
-    valid_transactions = [
-        transaction
-        for transaction in transactions
-        if get_transaction_date_issue(transaction.transaction_date, stub.filing_date) is None
-    ]
-    if not valid_transactions:
-        logger.info("house_ptr fallback: all LLM rows filtered as invalid for %s", pdf_path.name)
-        return None
-
-    confidence = float(llm_result.get("confidence") or 0.0)
-    usage = llm_result.get("usage") or {}
-    logger.info(
-        "house_ptr fallback: Haiku recovered %d rows for %s "
-        "(parser_version=%s parser_confidence=%.2f usage=input=%s cached=%s output=%s notes=%r)",
-        len(valid_transactions),
-        pdf_path.name,
-        LLM_PARSER_VERSION,
-        confidence,
-        usage.get("input"),
-        usage.get("cached_input"),
-        usage.get("output"),
-        (llm_result.get("parser_notes") or "")[:120],
-    )
-
-    parsed = HousePtrParseResult(
-        doc_id=stub.doc_id,
-        member_name=parse_header_name(text_preview) or stub.member.name,
-        state=parse_header_state(text_preview) or stub.member.state,
-        parser_confidence=confidence,
-        parser_version=LLM_PARSER_VERSION,
-        raw_text_preview=text_preview[:1200],
-        transactions=valid_transactions,
-    )
-    return parsed, build_trade_rows_from_house_ptr(parsed, stub)
-
-
-def ocr_text_is_decent(text: str | None) -> bool:
-    """Return whether an OCR text layer is worth handing to the text fallback.
-
-    Scanned PTRs come back as fragments like ``| 9 984 F 1 | Sale | 1 |``: long
-    enough to look like output, useless to a text model. Those go straight to
-    the vision path instead.
-    """
-
-    stripped = (text or "").strip()
-    if len(stripped) < MIN_DECENT_OCR_CHARS:
-        return False
-    meaningful = [char for char in stripped if not char.isspace()]
-    if not meaningful:
-        return False
-    alpha_ratio = sum(1 for char in meaningful if char.isalpha()) / len(meaningful)
-    if alpha_ratio < MIN_DECENT_OCR_ALPHA_RATIO:
-        return False
-    return len(re.findall(r"[A-Za-z]{3,}", stripped)) >= MIN_DECENT_OCR_WORDS
 
 
 def _vision_owner(raw: object) -> str:
@@ -965,7 +826,7 @@ def _vision_to_transactions(payload: list[dict]) -> list[HousePtrTransaction]:
         )
         if not description:
             continue
-        amount_min, amount_max = _llm_amount_bounds(
+        amount_min, amount_max = _amount_bounds(
             raw_row.get("amount_min"), raw_row.get("amount_max")
         )
         comment = raw_row.get("comment")
@@ -1491,6 +1352,10 @@ def describe_review_reason(
     if not ocr_report:
         return f"{base}; no OCR ran"
     status = ocr_report.get("status")
+    if status == "skipped":
+        # OCR is out of the scanned path on purpose. Say so, rather than let
+        # the reason read as though a reader was tried and came back empty.
+        return f"{base}; OCR is not run on scans and the vision path produced no rows"
     if status == "timeout":
         return f"{base}; OCR exceeded the {ocr_report.get('capSeconds')}s cap"
     if status == "crashed":
@@ -1522,12 +1387,21 @@ def parse_house_ptr_pdf(
     settings = settings or Settings()
     backend_value = backend if isinstance(backend, str) else backend.value
 
-    # Decide from the PDF itself whether OCR has anything to add. A typed
-    # PDF is parsed from its own text layer and never enters the OCR chain
-    # (surya/docling + torch), however the segmenter fares on it. Only an
-    # image-only scan is OCR'd, and only under a wall-clock cap. Explicit
-    # backends bypass the OCR gate (the caller asked for that backend) but
-    # the probe still runs so the Haiku gate below knows a scan is a scan.
+    # Decide from the PDF itself which reader the filing needs. A typed PDF is
+    # parsed from its own text layer. An image-only scan goes to the vision
+    # path, which reads the rendered pages directly.
+    #
+    # On ``auto`` a scan no longer enters the OCR chain (docling/EasyOCR +
+    # torch), because measurement said it earns nothing there: its text is not
+    # an input to the vision prompt, not a cross-check on the vision result,
+    # and not the source of this probe, and it has never produced a single
+    # transaction row from an image-only filing. What it did produce was load:
+    # one review run burned 3 h 16 min of CPU in 29 minutes of wall clock,
+    # about 6.8 of 24 cores, beside the Postgres three sites share, and 7 of
+    # its 12 filings hit the 240-second cap and returned zero characters.
+    #
+    # An explicit ``--ocr-backend`` still runs it, so the chain is one flag
+    # away when a filing genuinely needs it.
     probe = probe_text_layer(pdf_path)
     auto_backend = backend_value == OcrBackend.AUTO.value
     ocr_report: dict[str, object] | None = None
@@ -1535,9 +1409,15 @@ def parse_house_ptr_pdf(
         text = probe.text
         ocr_report = {"status": "skipped", "reason": "text layer present"}
     elif auto_backend and probe is not None:
-        # An image-only scan: OCR the upright copy, not the PDF as filed. Most
-        # House scans are stored rotated 270 degrees and every OCR backend
-        # reads a sideways page as noise.
+        text = ""
+        ocr_report = {
+            "status": "skipped",
+            "reason": "image-only scan; the vision path reads the pages directly",
+        }
+    elif probe is not None and not probe.has_text_layer:
+        # The caller asked for OCR on a scan by name. Read the upright copy,
+        # not the PDF as filed: most House scans are stored rotated 270
+        # degrees and every backend reads a sideways page as noise.
         text, ocr_report = _ocr_image_only_pdf(pdf_path, settings, backend)
     else:
         processor = OcrProcessor(settings, backend=backend)
@@ -1545,10 +1425,6 @@ def parse_house_ptr_pdf(
         text = result.document.ocrText if result.document and result.document.ocrText else ""
         if probe is not None:
             ocr_report = {"status": "explicit", "backend": backend_value, "chars": len(text)}
-    # An image-only PDF has nothing a text model could read: the Haiku
-    # whole-PDF fallback is reserved for readable text the segmenter could
-    # not split, and scans go to vision or review instead.
-    image_only = probe is not None and not probe.has_text_layer
     parsed, rows = parse_house_ptr_text(text, stub)
     text_layer_report: dict[str, object] | None = (
         {**probe.to_dict(), "ocr": ocr_report} if probe is not None else None
@@ -1563,7 +1439,6 @@ def parse_house_ptr_pdf(
     vision_enabled = force_vision or mode == "auto"
 
     text_has_content = bool((text or "").strip())
-    decent_text = ocr_text_is_decent(text)
     weak_text_parse = (
         not parsed.transactions
         or not text_has_content
@@ -1573,22 +1448,15 @@ def parse_house_ptr_pdf(
     if not weak_text_parse and not force_vision:
         return parsed, rows
 
-    # The Haiku text fallback still owns the case the regex missed but the text
-    # layer is genuinely readable. Skip it when the caller forced vision, and
-    # never send it a scan: since the pages are rendered upright before OCR,
-    # a photocopy's OCR text can now clear ocr_text_is_decent, and this path
-    # would then start paying a text model to read a page the vision path (or
-    # a human) should be reading as an image.
-    if not parsed.transactions and decent_text and not force_vision and not image_only:
-        logger.debug(
-            "house_ptr: regex found 0 rows despite %d chars of usable text for %s; "
-            "invoking the Haiku text fallback",
-            len(text),
-            pdf_path.name,
-        )
-        fallback = _run_llm_fallback(pdf_path, stub, normalize_text(text))
-        if fallback is not None:
-            return _with_text_layer(fallback, text_layer_report)
+    # There is deliberately no text-model fallback here. A whole-PDF text model
+    # was tried and it invented filings: 1,876 rows across 112 documents,
+    # complete with plausible tickers for companies that do not exist, attributed
+    # to named members out of disclosures they had filed correctly and on time.
+    # It stamped parser_confidence 1.000 on 710 of them, so the confidence gate
+    # never held them, and they were published for months. A filing the regex
+    # cannot segment goes to the vision path, which reads the page image twice
+    # and is checked against the form's own ink, or it goes to review for a
+    # person. It does not go to a model that is free to guess.
 
     if vision_enabled:
         logger.debug(
@@ -1604,18 +1472,8 @@ def parse_house_ptr_pdf(
         # Record the attempt even though it produced nothing usable.
         parsed = parsed.model_copy(update={"vision_report": vision_metadata})
 
-    # Vision is off, unavailable, or empty-handed: fall back to Haiku on the
-    # raw text exactly as this parser did before the vision path existed,
-    # unless the PDF is image-only, in which case there is no text to read.
-    if not parsed.transactions and not decent_text and not image_only:
-        logger.debug(
-            "house_ptr: no usable OCR text for %s; invoking the Haiku text fallback",
-            pdf_path.name,
-        )
-        fallback = _run_llm_fallback(pdf_path, stub, normalize_text(text))
-        if fallback is not None:
-            return _with_text_layer(fallback, text_layer_report)
-
+    # Vision is off, unavailable, or empty-handed. The filing goes to review
+    # with a reason a person can act on. Nothing guesses at what is on it.
     if not parsed.transactions:
         parsed = parsed.model_copy(
             update={"review_reason": describe_review_reason(probe, ocr_report, text)}

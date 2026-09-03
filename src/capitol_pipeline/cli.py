@@ -420,6 +420,53 @@ def build_house_stub_metadata_extra(parsed: HousePtrParseResult) -> dict[str, ob
     return extra or None
 
 
+def is_scanned_read(parsed: HousePtrParseResult) -> bool:
+    """Whether these rows were read off a page image rather than a text layer.
+
+    ``parser_version`` is the label, and it is mutable: every re-processing of
+    a stub rewrote it, so doc 9116141 ended up carrying a Gemini transcription
+    stamped ``regex-v1``. The ``visionParse`` block on the result is the thing
+    that cannot be faked -- it exists only because a vision read produced it.
+    """
+
+    if isinstance(parsed.vision_report, dict) and parsed.vision_report.get("ok"):
+        return True
+    return is_vision_parser_version(parsed.parser_version)
+
+
+def split_scanned_trades(
+    trades: list[NormalizedTradeRow],
+) -> tuple[list[NormalizedTradeRow], list[tuple[NormalizedTradeRow, str]]]:
+    """Split a scanned filing's rows into what publishes and what is held back.
+
+    Withholding used to be per *filing*: one unresolved row held the whole
+    document. On doc 9116141 that meant 26 rows whose Type column the two
+    reads read one column apart -- real disagreement, and exactly what two
+    reads are for -- holding back 108 rows that both reads and the numpy
+    checkbox detector agreed on. Across the eight filings transcribed on
+    2026-09-03 it withheld about 2,596 rows nothing disputed.
+
+    A row publishes when it carries a transaction date, a transaction type and
+    an amount band. Short of that it stays on the stub, because a trade with
+    no amount is a blank on the page and a trade with no date cannot be timed
+    against a vote or a deadline. The filing keeps its place in the review
+    queue either way, and the site says how many of its rows are missing.
+    """
+
+    publishable: list[NormalizedTradeRow] = []
+    withheld: list[tuple[NormalizedTradeRow, str]] = []
+    for trade in trades:
+        if not trade.transaction_date:
+            withheld.append((trade, "no transaction date"))
+        elif not trade.transaction_type:
+            withheld.append((trade, "no transaction type"))
+        elif not trade.amount_min or not trade.amount_max:
+            withheld.append((trade, "no amount band"))
+        else:
+            publishable.append(trade)
+    return publishable, withheld
+
+
 def persist_parsed_house_stub(
     settings: Settings,
     stub: FilingStub,
@@ -428,20 +475,39 @@ def persist_parsed_house_stub(
 ) -> dict[str, object]:
     """Write a parsed House PTR result back into CapitolExposed.
 
-    A vision-parsed filing (``parser_version`` starting ``claude-``) publishes
-    trade rows only when it resolves to ``parsed``; while it is
-    ``needs_review`` the transcription stays in the stub metadata
-    (``parsedTransactions`` and ``visionParse.rows``) and nothing reaches
-    ``trades``. The text path is unchanged.
+    A filing read off page images publishes row by row while it is
+    ``needs_review``: a row two reads and the checkbox detector agree on goes
+    to ``trades``, and a row missing a date, a type or an amount band stays in
+    the stub metadata (``parsedTransactions`` and ``visionParse``). The counts
+    are recorded on the stub so the site can say what is being held back. The
+    text path is unchanged.
     """
 
     sync_house_stubs_to_neon(settings, [stub])
     status = resolve_house_stub_status(stub, parsed, trades)
-    withheld = bool(trades) and is_vision_parser_version(parsed.parser_version) and status != "parsed"
-    if withheld:
-        trade_summary: dict[str, object] = {"upserted": 0, "trade_ids": [], "withheld": len(trades)}
+    scanned_under_review = bool(trades) and is_scanned_read(parsed) and status != "parsed"
+    if scanned_under_review:
+        publishable, withheld = split_scanned_trades(trades)
+        trade_summary = (
+            upsert_trade_rows_to_neon(settings, publishable)
+            if publishable
+            else {"upserted": 0, "trade_ids": []}
+        )
+        trade_summary["withheld"] = len(withheld)
         if isinstance(parsed.vision_report, dict):
-            parsed.vision_report["withheldTrades"] = len(trades)
+            reasons: dict[str, int] = {}
+            for _trade, reason in withheld:
+                reasons[reason] = reasons.get(reason, 0) + 1
+            # Rows the reads disagreed on the type of never reach trade
+            # building at all (rowsDroppedForType, set by the vision parser),
+            # so the total a reader is missing is both counts together.
+            dropped_for_type = int(parsed.vision_report.get("rowsDroppedForType") or 0)
+            if dropped_for_type:
+                reasons["reads disagree on transaction type"] = dropped_for_type
+            parsed.vision_report["withheldTrades"] = len(withheld)
+            parsed.vision_report["publishedTrades"] = len(publishable)
+            parsed.vision_report["rowsWithheldTotal"] = len(withheld) + dropped_for_type
+            parsed.vision_report["withheldReasons"] = reasons
     else:
         trade_summary = upsert_trade_rows_to_neon(settings, trades)
     metadata_extra = build_house_stub_metadata_extra(parsed)
@@ -566,10 +632,17 @@ def rebuild_parsed_house_stub(
         return stub, None, [], "every stored row failed date validation"
 
     vision = metadata.get("visionParse")
-    stored_version = str(metadata.get("parserVersion") or "").strip()
-    if not stored_version and isinstance(vision, dict):
-        stored_version = str(vision.get("parserVersion") or "").strip()
-    parser_version = stored_version or REPLAY_PARSER_VERSION
+    # The parser that produced the stored rows is the one named on the
+    # transcription, not the one named on the stub. metadata.parserVersion is
+    # rewritten by every run that touches the stub, and doc 9116141 was
+    # re-processed 173 times: its Gemini transcription ended up labelled
+    # regex-v1, which is how 107 rows read off page images came to be
+    # published as text-parser output while the stub sat in review.
+    vision_version = (
+        str(vision.get("parserVersion") or "").strip() if isinstance(vision, dict) else ""
+    )
+    stub_version = str(metadata.get("parserVersion") or "").strip()
+    parser_version = vision_version or stub_version or REPLAY_PARSER_VERSION
     confidence = float(metadata.get("parserConfidence") or 0.0)
 
     parsed = HousePtrParseResult(
