@@ -1317,9 +1317,16 @@ def fetch_house_stub_queue(
     limit: int = 10,
     include_needs_review: bool = False,
     only_needs_review: bool = False,
+    doc_ids: list[str] | None = None,
 ) -> list[dict[str, object]]:
-    """Load queued House filing stubs that are ready for extraction or retry."""
+    """Load queued House filing stubs that are ready for extraction or retry.
 
+    ``doc_ids`` narrows the queue to those filings (the status and retry
+    clauses still apply), for targeted re-runs.
+    """
+
+    doc_filter = "AND doc_id = ANY(%s)" if doc_ids else ""
+    params: list[object] = [list(doc_ids)] if doc_ids else []
     if only_needs_review:
         status_clause = """
             (
@@ -1356,6 +1363,7 @@ def fetch_house_stub_queue(
                         status <> 'pending_extraction'
                         OR COALESCE(metadata->>'lastError', '') NOT ILIKE 'PTR PDF fetch failed with 404%%'
                   )
+                  {doc_filter}
                 ORDER BY
                     CASE
                         WHEN status = 'pending_extraction'
@@ -1367,7 +1375,7 @@ def fetch_house_stub_queue(
                     detected_at DESC
                 LIMIT %s
                 """,
-                (max(1, limit),),
+                (*params, max(1, limit)),
             )
             return list(cursor.fetchall())
 

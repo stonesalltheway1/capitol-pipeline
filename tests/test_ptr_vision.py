@@ -659,8 +659,8 @@ def test_image_request_shape_with_a_real_pdf(monkeypatch: pytest.MonkeyPatch, tm
 
     # Portrait pages are the typed form: no close-up strips.
     assert result["orientation"] == [
-        {"page": 1, "rotation": 0, "method": "model-confirmed", "width": sizes[0][0], "height": sizes[0][1], "strips": 0},
-        {"page": 2, "rotation": 0, "method": "model-confirmed", "width": sizes[1][0], "height": sizes[1][1], "strips": 0},
+        {"page": 1, "rotation": 0, "method": "model-confirmed", "width": sizes[0][0], "height": sizes[0][1], "strips": 0, "gridColumns": 0},
+        {"page": 2, "rotation": 0, "method": "model-confirmed", "width": sizes[1][0], "height": sizes[1][1], "strips": 0, "gridColumns": 0},
     ]
     assert result["chunks"] == [
         {
@@ -755,7 +755,7 @@ def test_portrait_page_uses_the_heuristic_when_haiku_is_down(
     width, height = _png_size(image["source"]["data"])
     assert width > height
     assert result["orientation"] == [
-        {"page": 1, "rotation": 90, "method": "heuristic", "width": width, "height": height, "strips": 2}
+        {"page": 1, "rotation": 90, "method": "heuristic", "width": width, "height": height, "strips": 2, "gridColumns": 0}
     ]
     assert result["ok"] is True
 

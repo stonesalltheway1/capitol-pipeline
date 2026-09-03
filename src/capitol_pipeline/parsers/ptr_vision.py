@@ -20,6 +20,10 @@ How a filing is read (v2)
    the right-hand 58% of the page rendered at twice the zoom, so the amount
    ladder's tick boxes are unambiguous; the model reports the column letter
    (A-K) and the band must agree with it.
+3b. A classical checkbox detector (:mod:`capitol_pipeline.parsers.ptr_grid`)
+   reads the same upright page without a model: it finds the ladder's column
+   rules and the ticked cell per row, and its letter must agree with the
+   model's or the amount is nulled and the filing reviewed.
 4. Pages are grouped into chunks of :func:`resolve_chunk_pages` (default 4)
    and each chunk is sent to the read model (``claude-opus-5`` by default)
    **twice**, as two independent requests, asking for the transaction grid
@@ -68,6 +72,8 @@ import time
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
+
+from capitol_pipeline.parsers import ptr_grid
 
 logger = logging.getLogger(__name__)
 
@@ -360,8 +366,16 @@ TRANSACTION_ITEM_SCHEMA: dict[str, Any] = {
                 "the row could barely be made out at all."
             ),
         },
+        "page_number": {
+            "type": ["integer", "null"],
+            "description": (
+                "The N from the 'Page N of M' label shown above the image this row "
+                "was read from. Null only when the row cannot be placed on a page."
+            ),
+        },
     },
     "required": [
+        "page_number",
         "owner",
         "asset_description",
         "ticker",
@@ -555,7 +569,7 @@ Some filings state in the grid, or in place of it, that there is nothing to repo
 
 ## Long filings
 
-Long filings are sent in groups of pages. When you are told you are looking at pages 6 to 10 of 23, transcribe only the rows on those pages, do not invent the header from memory (report null for filer_name and filing_date unless they are on the pages you can see), and keep the rows in the printed order of those pages.
+Long filings are sent in groups of pages. When you are told you are looking at pages 6 to 10 of 23, transcribe only the rows on those pages, do not invent the header from memory (report null for filer_name and filing_date unless they are on the pages you can see), and keep the rows in the printed order of those pages. Every image is preceded by a "Page N of M:" label: report that N as `page_number` on each row so the rows can be checked against the page they came from.
 
 Dates are printed on the form as MM/DD/YYYY, and handwritten as M/D/YY more often than not. Convert every date to YYYY-MM-DD. Two-digit years belong to the reporting period; use the calendar year in the header, or the filing date you are told, to resolve them. The Transaction Date is when the trade happened; the Notification Date is when the filer learned of it, and for a self-directed account the two are often identical. The two dates sit in two separate columns: never read the notification column and report it as the transaction date, and never copy one column into the other. The Notification Date is frequently blank on handwritten forms - report null, not a copy of the transaction date. No date on the form can be later than the date the report was filed. If a date is smudged, cropped, or overwritten so that you cannot read it, report null and mark the row's legibility accordingly. A date you cannot read is never worth guessing: a wrong date silently corrupts the disclosure timeline that this data feeds.
 
@@ -676,6 +690,29 @@ def resolve_grid_zoom() -> float:
     """Close-up zoom relative to the full page; 0 disables the strips."""
 
     return _env_number("CAPITOL_PTR_VISION_GRID_ZOOM", DEFAULT_GRID_CROP_ZOOM, low=0.0, high=4.0)
+
+
+def resolve_page_range() -> tuple[int, int] | None:
+    """Debug knob: ``CAPITOL_PTR_VISION_PAGE_RANGE=11-13`` (or ``12``) reads only those pages.
+
+    Page numbers are 1-based and keep their filing-wide labels, so a targeted
+    run of a long filing costs only the pages named. Unset in production.
+    """
+
+    raw = os.environ.get("CAPITOL_PTR_VISION_PAGE_RANGE", "").strip()
+    if not raw:
+        return None
+    try:
+        if "-" in raw:
+            first, last = (int(part) for part in raw.split("-", 1))
+        else:
+            first = last = int(raw)
+    except ValueError:
+        logger.warning("ptr_vision: ignoring malformed CAPITOL_PTR_VISION_PAGE_RANGE=%r", raw)
+        return None
+    if first < 1 or last < first:
+        return None
+    return first, last
 
 
 def vision_disabled() -> bool:
@@ -1100,8 +1137,9 @@ def prepare_page_images(
 ) -> tuple[list[dict[str, Any]], list[dict[str, Any]], dict[str, int]] | None:
     """Render every page upright.
 
-    Returns ``(pages, orientation, usage)`` or None when pymupdf is unavailable
-    or cannot open the file. Each page is ``{"index", "png", "width", "height",
+    Returns ``(pages, orientation, usage, total_pages)`` or None when pymupdf
+    is unavailable or cannot open the file. ``total_pages`` is the filing's
+    page count even when a page range limited what was rendered. Each page is ``{"index", "png", "width", "height",
     "crops"}`` (``crops`` holds the close-up strips of a landscape page) and
     each orientation entry ``{"page", "rotation", "method", "width", "height",
     "strips"}``. ``usage`` is the orientation model's summed token usage.
@@ -1120,9 +1158,23 @@ def prepare_page_images(
     orientation: list[dict[str, Any]] = []
     usage = dict(_EMPTY_USAGE)
     grid_zoom = resolve_grid_zoom()
+    page_range = resolve_page_range()
+    total_pages = 0
     try:
         with document:
-            for position in range(int(document.page_count)):
+            total_pages = int(document.page_count)
+            positions = range(int(document.page_count))
+            if page_range is not None:
+                first, last = page_range
+                positions = range(max(0, first - 1), min(int(document.page_count), last))
+                logger.warning(
+                    "ptr_vision: CAPITOL_PTR_VISION_PAGE_RANGE=%s-%s: reading %d of %d pages",
+                    first,
+                    last,
+                    len(positions),
+                    int(document.page_count),
+                )
+            for position in positions:
                 page = document[position]
                 base_rotation = int(getattr(page, "rotation", 0) or 0)
                 rect = page.rect
@@ -1140,6 +1192,25 @@ def prepare_page_images(
                     client, _render, width=int(natural_width), height=int(natural_height)
                 )
                 usage = sum_usage(usage, call_usage)
+                # The orientation model tells portrait from landscape reliably
+                # but confuses upright with upside down on typed tables. The
+                # amount ladder sits at the right edge only when the page is
+                # upright, so if the detector finds it only after a half turn,
+                # take the half turn.
+                page.set_rotation((base_rotation + rotation) % 360)
+                grid = _analyze_page_grid(page, module)
+                if grid is None:
+                    flipped = (rotation + 180) % 360
+                    page.set_rotation((base_rotation + flipped) % 360)
+                    flipped_grid = _analyze_page_grid(page, module)
+                    if flipped_grid is not None:
+                        logger.info(
+                            "ptr_vision: page %d: ladder found only after a half turn (%d -> %d)",
+                            position + 1,
+                            rotation,
+                            flipped,
+                        )
+                        rotation, grid, method = flipped, flipped_grid, f"{method}+grid-flip"
                 png, width, height = _render_page(page, module, base_rotation, rotation)
                 crops: list[dict[str, Any]] = []
                 if width > height and grid_zoom > 0:
@@ -1152,6 +1223,7 @@ def prepare_page_images(
                         "width": width,
                         "height": height,
                         "crops": crops,
+                        "grid": grid,
                     }
                 )
                 orientation.append(
@@ -1162,6 +1234,7 @@ def prepare_page_images(
                         "width": width,
                         "height": height,
                         "strips": len(crops),
+                        "gridColumns": len(grid["columns"]) if grid else 0,
                     }
                 )
     except Exception as error:  # noqa: BLE001 - fall back to the document block
@@ -1169,7 +1242,123 @@ def prepare_page_images(
         return None
     if not pages:
         return None
-    return pages, orientation, usage
+    return pages, orientation, usage, total_pages
+
+
+def _analyze_page_grid(page: Any, module: Any) -> dict[str, Any] | None:
+    """Run the checkbox detector's grid analysis on an already-rotated page.
+
+    Renders a gray pixmap at the page zoom (the same geometry the model sees)
+    and hands it to :func:`capitol_pipeline.parsers.ptr_grid.analyze_amount_grid`.
+    Never raises: the detector is an extra signal, not a dependency.
+    """
+
+    try:
+        zoom = _page_zoom(page.rect)
+        pixmap = page.get_pixmap(
+            matrix=module.Matrix(zoom, zoom), alpha=False, colorspace=module.csGRAY
+        )
+        gray = ptr_grid.gray_from_pixmap(pixmap.samples, int(pixmap.width), int(pixmap.height), int(pixmap.n))
+        return ptr_grid.analyze_amount_grid(gray)
+    except Exception as error:  # noqa: BLE001 - detector failures must not fail the read
+        logger.warning("ptr_vision: grid analysis failed (%s: %s)", type(error).__name__, error)
+        return None
+
+
+def _letter_from_band(row: dict[str, Any]) -> str | None:
+    """The ladder letter implied by a row's amount band, when it is one."""
+
+    band = _comparable(row, "amount")
+    for letter, candidate in AMOUNT_LETTER_BANDS.items():
+        if candidate == band:
+            return letter
+    return None
+
+
+def _null_amount(row: dict[str, Any], note: str) -> None:
+    row["amount_min"] = None
+    row["amount_max"] = None
+    row["amount_column_letter"] = None
+    row["legibility"] = _downgrade(_worst_legibility(row.get("legibility")), "partial")
+    existing = _merge_comment(row.get("comment"))
+    row["comment"] = f"{existing}; {note}" if existing else note
+
+
+def apply_checkbox_detector(
+    rows: list[dict[str, Any]],
+    pages: list[dict[str, Any]] | None,
+) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+    """Check each page's rows against the classical checkbox detector.
+
+    Rows are grouped by ``page_number`` and, in merged order, aligned top to
+    bottom with the ticks the detector found on that page (rows only one read
+    saw are left out of the alignment: they are already illegible). Per row:
+    the detector's letter agreeing with the model's confirms the band; a
+    disagreement or an ambiguous cell nulls the amount and marks the row
+    ``partial``. Returns ``(rows, page_summaries)``.
+    """
+
+    summaries: list[dict[str, Any]] = []
+    if not pages:
+        return rows, summaries
+    by_page = {int(page["index"]): page for page in pages}
+    for row in rows:
+        row.setdefault("detectorLetter", None)
+        row.setdefault("detectorStatus", "unchecked")
+    for index, page in sorted(by_page.items()):
+        page_rows = [row for row in rows if _page_of(row) == index]
+        aligned_rows = [row for row in page_rows if not row.get("_unmatched")]
+        result = ptr_grid.detect_page(page.get("grid"), len(aligned_rows))
+        summary: dict[str, Any] = {
+            "page": index,
+            "status": result["status"],
+            "columns": result["columns"],
+            "bands": result["bands"],
+            "candidates": result["candidates"],
+            "rows": len(page_rows),
+            "rowsAligned": 0,
+            "agreed": 0,
+            "disagreed": 0,
+            "ambiguous": 0,
+        }
+        if result["status"] != "ok":
+            for row in page_rows:
+                row["detectorStatus"] = result["status"]
+            summaries.append(summary)
+            continue
+        summary["rowsAligned"] = len(aligned_rows)
+        for row, found in zip(aligned_rows, result["letters"]):
+            row["detectorLetter"] = found["letter"]
+            model_letter = _letter(row) or _letter_from_band(row)
+            if found["kind"] == "ambiguous":
+                row["detectorStatus"] = "ambiguous"
+                summary["ambiguous"] += 1
+                _null_amount(row, "checkbox detector could not tell which amount box is ticked")
+            elif model_letter is None:
+                row["detectorStatus"] = "unchecked"
+            elif found["letter"] == model_letter:
+                row["detectorStatus"] = "agree"
+                summary["agreed"] += 1
+            else:
+                row["detectorStatus"] = "disagree"
+                summary["disagreed"] += 1
+                _null_amount(
+                    row,
+                    f"checkbox detector reads column {found['letter']} but the model reported {model_letter}",
+                )
+        for row in page_rows:
+            if row.get("_unmatched"):
+                row["detectorStatus"] = "unaligned"
+        summaries.append(summary)
+    return rows, summaries
+
+
+def _page_of(row: dict[str, Any]) -> int | None:
+    value = row.get("page_number")
+    try:
+        return int(value) if value is not None else None
+    except (TypeError, ValueError):
+        return None
 
 
 def filing_context(filing_year: int | None, filing_date: str | None) -> str:
@@ -1662,6 +1851,8 @@ def merge_matched_rows(row_a: dict[str, Any], row_b: dict[str, Any]) -> tuple[di
 
     merged: dict[str, Any] = dict(row_a)
     merged.pop("_amount_letter_conflict", None)
+    if merged.get("page_number") is None:
+        merged["page_number"] = row_b.get("page_number")
     disagreements: list[str] = []
 
     desc_a = str(row_a.get("asset_description") or "").strip()
@@ -1726,6 +1917,7 @@ def _unmatched(row: dict[str, Any], label: str) -> dict[str, Any]:
     copy = dict(row)
     copy.pop("_amount_letter_conflict", None)
     copy["legibility"] = "illegible"
+    copy["_unmatched"] = True
     note = f"seen by only one of two reads ({label})"
     existing = _merge_comment(copy.get("comment"))
     copy["comment"] = f"{existing}; {note}" if existing else note
@@ -1838,6 +2030,8 @@ def build_vision_metadata(report: dict[str, Any]) -> dict[str, Any]:
         "orientation": report.get("orientation"),
         "readAgreement": report.get("read_agreement"),
         "amountLetterConflicts": int(report.get("amount_letter_conflicts") or 0),
+        "detector": report.get("detector"),
+        "rows": _row_summaries(list(report.get("transactions") or []), limit=MAX_ROW_SUMMARIES_IN_METADATA),
         "calls": report.get("calls") or [],
         "usage": {
             "inputTokens": int(usage.get("input") or 0),
@@ -1866,6 +2060,9 @@ def build_vision_metadata(report: dict[str, Any]) -> dict[str, Any]:
 
 #: Row summaries kept per call record; the rest is counted, not stored.
 MAX_ROW_SUMMARIES_PER_CALL = 60
+#: Merged-row summaries kept on ``visionParse.rows`` (the transcription a
+#: reviewer sees while the filing is held back from ``trades``).
+MAX_ROW_SUMMARIES_IN_METADATA = 500
 
 
 def _call_record(label: str, model: str, usage: dict[str, int], cost: float, **extra: Any) -> dict[str, Any]:
@@ -1890,7 +2087,7 @@ def row_summary(row: dict[str, Any]) -> str:
     letter = _letter(row)
     if letter:
         amount = f"{amount} ({letter})"
-    parts = (
+    parts = [
         str(row.get("asset_description") or "").strip(),
         str(row.get("transaction_type") or "?"),
         str(row.get("transaction_date") or "?"),
@@ -1898,14 +2095,19 @@ def row_summary(row: dict[str, Any]) -> str:
         amount,
         str(row.get("owner") or "-"),
         str(row.get("legibility") or "?"),
-    )
+    ]
+    if row.get("page_number") is not None:
+        parts.insert(0, f"p{row['page_number']}")
+    status = row.get("detectorStatus")
+    if status and status != "unchecked":
+        parts.append(f"det:{row.get('detectorLetter') or '-'}/{status}")
     return " | ".join(parts)
 
 
-def _row_summaries(rows: list[dict[str, Any]]) -> list[str]:
-    summaries = [row_summary(row) for row in rows[:MAX_ROW_SUMMARIES_PER_CALL]]
-    if len(rows) > MAX_ROW_SUMMARIES_PER_CALL:
-        summaries.append(f"... {len(rows) - MAX_ROW_SUMMARIES_PER_CALL} more row(s)")
+def _row_summaries(rows: list[dict[str, Any]], limit: int = MAX_ROW_SUMMARIES_PER_CALL) -> list[str]:
+    summaries = [row_summary(row) for row in rows[:limit]]
+    if len(rows) > limit:
+        summaries.append(f"... {len(rows) - limit} more row(s)")
     return summaries
 
 
@@ -2124,7 +2326,7 @@ def extract_via_vision(
     document_content: list[dict[str, Any]] | None = None
     prepared = prepare_page_images(pdf_path, client)
     if prepared is not None:
-        pages, orientation, orient_usage = prepared
+        pages, orientation, orient_usage, document_pages = prepared
         orient_cost = estimate_cost_usd(orient_usage, ORIENTATION_MODEL_ID)
         calls.append(
             _call_record(
@@ -2135,8 +2337,7 @@ def extract_via_vision(
                 pages=_page_range(pages),
             )
         )
-        if page_count is None or page_count != len(pages):
-            page_count = len(pages)
+        page_count = document_pages or len(pages)
         strips = sum(len(page.get("crops") or []) for page in pages)
         estimate = estimate_filing_cost_usd(
             len(pages),
@@ -2199,6 +2400,7 @@ def extract_via_vision(
     read_b_failures: list[str] = []
     no_transactions_chunks = 0
     stop_reason: Any = None
+    detector_pages: list[dict[str, Any]] = []
 
     for chunk_index, chunk in enumerate(chunks, start=1):
         page_range = _page_range(chunk)
@@ -2252,6 +2454,8 @@ def extract_via_vision(
             letter_conflicts_total += conflicts_b
             payloads.extend(read_b["payloads"])
             merged, agreement = reconcile_reads(rows_a, rows_b)
+            merged, page_summaries = apply_checkbox_detector(merged, chunk)
+            detector_pages.extend(page_summaries)
             if not rows_a and not rows_b and any(read_a["flags"]) and any(read_b["flags"]):
                 no_transactions_chunks += 1
         else:
@@ -2346,6 +2550,28 @@ def extract_via_vision(
     letter_issues = letter_conflicts_total + int(disagreement_totals.get("amount_column_letter") or 0)
     if letter_issues:
         review_reasons.append("amount nulled after column-letter conflict")
+    detector_summary = {
+        "pages": detector_pages,
+        "rowsAligned": sum(int(page["rowsAligned"]) for page in detector_pages),
+        "agreed": sum(int(page["agreed"]) for page in detector_pages),
+        "disagreed": sum(int(page["disagreed"]) for page in detector_pages),
+        "ambiguous": sum(int(page["ambiguous"]) for page in detector_pages),
+        "unalignedPages": [
+            int(page["page"]) for page in detector_pages if page["status"] == "unaligned" and page["rows"]
+        ],
+    }
+    if detector_summary["disagreed"]:
+        review_reasons.append(f"checkbox detector disagreed on {detector_summary['disagreed']} row(s)")
+    if detector_summary["ambiguous"]:
+        review_reasons.append(f"checkbox detector ambiguous on {detector_summary['ambiguous']} row(s)")
+    if detector_summary["unalignedPages"]:
+        review_reasons.append(
+            "checkbox detector could not align rows on page(s) "
+            + ", ".join(str(page) for page in detector_summary["unalignedPages"])
+        )
+    for row in transactions:
+        row.pop("_unmatched", None)
+        row.pop("_amount_letter_conflict", None)
     needs_review = bool(review_reasons)
 
     notes = [_clean_optional_text(payload.get("notes")) for payload in payloads]
@@ -2395,6 +2621,7 @@ def extract_via_vision(
         "chunk_pages": chunk_pages,
         "example_row_scrubs": scrubs_total,
         "amount_letter_conflicts": letter_conflicts_total,
+        "detector": detector_summary,
         "calls": calls,
     }
 

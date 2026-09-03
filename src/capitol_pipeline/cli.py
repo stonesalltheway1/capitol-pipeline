@@ -397,11 +397,24 @@ def persist_parsed_house_stub(
     parsed: HousePtrParseResult,
     trades: list[NormalizedTradeRow],
 ) -> dict[str, object]:
-    """Write a parsed House PTR result back into CapitolExposed."""
+    """Write a parsed House PTR result back into CapitolExposed.
+
+    A vision-parsed filing (``parser_version`` starting ``claude-``) publishes
+    trade rows only when it resolves to ``parsed``; while it is
+    ``needs_review`` the transcription stays in the stub metadata
+    (``parsedTransactions`` and ``visionParse.rows``) and nothing reaches
+    ``trades``. The text path is unchanged.
+    """
 
     sync_house_stubs_to_neon(settings, [stub])
-    trade_summary = upsert_trade_rows_to_neon(settings, trades)
     status = resolve_house_stub_status(stub, parsed, trades)
+    withheld = bool(trades) and is_vision_parser_version(parsed.parser_version) and status != "parsed"
+    if withheld:
+        trade_summary: dict[str, object] = {"upserted": 0, "trade_ids": [], "withheld": len(trades)}
+        if isinstance(parsed.vision_report, dict):
+            parsed.vision_report["withheldTrades"] = len(trades)
+    else:
+        trade_summary = upsert_trade_rows_to_neon(settings, trades)
     metadata_extra = build_house_stub_metadata_extra(parsed)
     mark_house_stub_processed(
         settings,
@@ -652,6 +665,7 @@ def process_house_queue_rows(
                 "docId": stub.doc_id,
                 "status": status,
                 "tradeRows": trade_rows,
+                "tradesWithheld": int((upsert_summary.get("trades") or {}).get("withheld", 0)),  # type: ignore[union-attr]
                 "parserVersion": parsed.parser_version,
             }
             if vision_report:
@@ -2995,6 +3009,12 @@ def process_house_backlog_command(
     show_default=True,
     help=VISION_BACKEND_HELP,
 )
+@click.option(
+    "--doc-id",
+    "doc_ids",
+    multiple=True,
+    help="Only these filings (repeatable); the queue's status rules and --limit still apply.",
+)
 def process_house_review_command(
     limit: int,
     export_registry: bool,
@@ -3003,6 +3023,7 @@ def process_house_review_command(
     review_retry_hours: int,
     ocr_backend: str,
     vision_backend: str,
+    doc_ids: tuple[str, ...],
 ) -> None:
     """Reprocess the House PTR review queue with an alternate OCR backend."""
 
@@ -3012,6 +3033,7 @@ def process_house_review_command(
         settings,
         limit=limit,
         only_needs_review=True,
+        doc_ids=[doc_id.strip() for doc_id in doc_ids if doc_id.strip()] or None,
     )
     summary = process_house_queue_rows(
         settings,

@@ -257,6 +257,24 @@ reads both return zero rows and both report `no_transactions_stated` ends
 re-processed within 30 days with an unchanged PDF (`visionParse.pdfSha256`)
 reuses its previous transcription instead of paying for a new read.
 
+Because two reads of the same model share blind spots (both put every tick on
+one Khanna page a column too far left), a classical checkbox detector
+(`parsers/ptr_grid.py`, numpy over the rendered page, no model) finds the
+amount ladder's column rules and the ticked cell in each row and names the
+column A-K. Rows carry `page_number`, so each page's rows are aligned top to
+bottom with the detected ticks (the paper form's pre-printed example row is
+dropped); a detector letter that agrees confirms the band, a disagreement or
+an ambiguous cell nulls the amount, marks the row `partial` and routes the
+filing to review. Per-row `detectorLetter`/`detectorStatus` and a per-page
+`visionParse.detector` block (`columns`, `rowsAligned`, `agreed`, `disagreed`,
+`ambiguous`, `status`) record the outcome.
+
+A vision-parsed filing publishes trade rows only when it resolves to `parsed`;
+while it is `needs_review` the transcription stays on the stub
+(`parsedTransactions`, `visionParse.rows`) and nothing is written to `trades`
+(`visionParse.withheldTrades`). The text path is unchanged.
+`process-house-review --doc-id <id>` (repeatable) targets specific stubs.
+
 Vision rows are normalized through exactly the same helpers as text rows
 (`clean_asset_description`, `infer_asset_type`, `normalize_date`, the crypto
 classifier, member resolution from the stub), so they land with the same
@@ -276,6 +294,8 @@ Settings:
   ceiling while running is abandoned.
 - `CAPITOL_PTR_VISION_GRID_ZOOM` — close-up strip zoom relative to the page
   (default 2; 0 disables the strips).
+- `CAPITOL_PTR_VISION_PAGE_RANGE` — debug only: `11-13` reads just those pages
+  of a filing (labels keep the filing-wide numbering). Unset in production.
 - `ANTHROPIC_API_KEY` (or `ANTHROPIC_AUTH_TOKEN`) — required; without it the
   path skips rather than failing the run.
 

@@ -120,6 +120,20 @@ Required environment on the box:
   `costCeilingUsd`; a filing that overruns 1.5x the ceiling mid-way is
   abandoned with what it spent recorded.
 - `CAPITOL_PTR_VISION_GRID_ZOOM` — close-up strip zoom (default 2, 0 disables).
+- `CAPITOL_PTR_VISION_PAGE_RANGE` — debug only, e.g. `11-13`: read just those
+  pages of a filing at their normal page labels. Never set it on the timer.
+
+The checkbox detector (`parsers/ptr_grid.py`) runs on every rendered page
+without a model call and cross-checks each row's amount column; its verdicts
+are in `visionParse.detector` (per page: `status` one of `ok`, `no-grid`,
+`no-rows`, `unaligned`; counts of `agreed`, `disagreed`, `ambiguous`) and per
+row in `visionParse.rows` (`det:<letter>/<status>`). A disagreement or an
+ambiguous cell nulls that row's amount and sends the filing to review. A
+vision filing in `needs_review` publishes nothing to `trades`
+(`visionParse.withheldTrades` says how many rows are waiting); once a human
+resolves it, `process-house-review --doc-id <id>` re-runs that stub alone and,
+if the PDF is unchanged and the previous read is under 30 days old, reuses the
+transcription for free.
 
 Guardrails, in order: the env kill switch, missing credentials, PDFs over 20 MB,
 PDFs over 60 pages, the cost ceiling, one filing per call, one retry on 429/5xx

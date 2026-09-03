@@ -894,3 +894,148 @@ def test_sale_and_partial_sale_readings_agree_and_keep_the_partial() -> None:
     rows, agreement = reconcile_reads([_row("x", transaction_type="purchase")], [_row("x", transaction_type="sale")])
     assert agreement["fieldDisagreements"] == {"transaction_type": 1}
     assert rows[0]["transaction_type"] is None
+
+
+# ---------------------------------------------------------------------------
+# Checkbox detector hook
+# ---------------------------------------------------------------------------
+
+
+def _grid_with(marks: dict[int, int], rows: int = 6):
+    from capitol_pipeline.parsers.ptr_grid import analyze_amount_grid, draw_synthetic_grid
+
+    analysis = analyze_amount_grid(draw_synthetic_grid(marks=marks, rows=rows))
+    assert analysis is not None
+    return analysis
+
+
+def test_detector_confirms_and_contradicts_the_model_letter() -> None:
+    from capitol_pipeline.parsers.ptr_vision import apply_checkbox_detector
+
+    # Page 1: ticks in C, B, B (indices 2, 1, 1). The model agrees on the first
+    # two and says A for the third.
+    pages = [{"index": 1, "grid": _grid_with({0: 2, 1: 1, 2: 1})}]
+    rows = [
+        _row("Johnson", page_number=1, amount_column_letter="C", amount_min=50001, amount_max=100000),
+        _row("Amgen", page_number=1, amount_column_letter="B", amount_min=15001, amount_max=50000),
+        _row("Apple", page_number=1, amount_column_letter="A", amount_min=1001, amount_max=15000),
+    ]
+    rows, summaries = apply_checkbox_detector(rows, pages)
+
+    assert [row["detectorLetter"] for row in rows] == ["C", "B", "B"]
+    assert [row["detectorStatus"] for row in rows] == ["agree", "agree", "disagree"]
+    assert rows[0]["amount_min"] == 50001 and rows[0]["legibility"] == "clear"
+    assert rows[2]["amount_min"] is None and rows[2]["amount_max"] is None
+    assert rows[2]["amount_column_letter"] is None
+    assert rows[2]["legibility"] == "partial"
+    assert "checkbox detector reads column B" in rows[2]["comment"]
+    assert summaries == [
+        {
+            "page": 1,
+            "status": "ok",
+            "columns": 11,
+            "bands": summaries[0]["bands"],
+            "candidates": 3,
+            "rows": 3,
+            "rowsAligned": 3,
+            "agreed": 2,
+            "disagreed": 1,
+            "ambiguous": 0,
+        }
+    ]
+
+
+def test_detector_uses_the_band_when_the_model_gave_no_letter() -> None:
+    from capitol_pipeline.parsers.ptr_vision import apply_checkbox_detector
+
+    pages = [{"index": 3, "grid": _grid_with({0: 0})}]
+    rows = [_row("Ford", page_number=3, amount_column_letter=None, amount_min=15001, amount_max=50000)]
+    rows, summaries = apply_checkbox_detector(rows, pages)
+    assert rows[0]["detectorLetter"] == "A"
+    assert rows[0]["detectorStatus"] == "disagree"  # band says B, tick is in A
+    assert rows[0]["amount_min"] is None
+    assert summaries[0]["disagreed"] == 1
+
+
+def test_detector_ambiguity_nulls_and_misalignment_is_recorded() -> None:
+    from capitol_pipeline.parsers.ptr_vision import apply_checkbox_detector
+
+    # An ambiguous tick (two adjacent boxes) on page 1; a row count mismatch on page 2.
+    from capitol_pipeline.parsers.ptr_grid import analyze_amount_grid, draw_synthetic_grid
+
+    ambiguous = analyze_amount_grid(draw_synthetic_grid(marks={}, rows=5, ambiguous_rows=(0,)))
+    pages = [{"index": 1, "grid": ambiguous}, {"index": 2, "grid": _grid_with({0: 1, 1: 1})}, {"index": 3, "grid": None}]
+    rows = [
+        _row("Amazon", page_number=1, amount_column_letter="D", amount_min=100001, amount_max=250000),
+        _row("Lear", page_number=2, amount_column_letter="B", amount_min=15001, amount_max=50000),
+        _row("Pepsi", page_number=2, amount_column_letter="B", amount_min=15001, amount_max=50000),
+        _row("Extra", page_number=2, amount_column_letter="B", amount_min=15001, amount_max=50000),
+        _row("Typed", page_number=3, amount_column_letter=None, amount_min=1001, amount_max=15000),
+        _row("Lost", page_number=None),
+    ]
+    rows, summaries = apply_checkbox_detector(rows, pages)
+
+    assert rows[0]["detectorStatus"] == "ambiguous" and rows[0]["amount_min"] is None
+    assert rows[0]["legibility"] == "partial"
+    assert [row["detectorStatus"] for row in rows[1:4]] == ["unaligned"] * 3
+    assert rows[1]["amount_min"] == 15001  # untouched when unaligned
+    assert rows[4]["detectorStatus"] == "no-grid" and rows[4]["amount_min"] == 1001
+    assert rows[5]["detectorStatus"] == "unchecked"
+    by_page = {summary["page"]: summary for summary in summaries}
+    assert by_page[1]["ambiguous"] == 1
+    assert by_page[2]["status"] == "unaligned" and by_page[2]["rows"] == 3
+    assert by_page[3]["status"] == "no-grid"
+
+
+def test_detector_verdicts_reach_the_result_and_review_reasons(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    _enable(monkeypatch)
+    pdf = _write_real_pdf(tmp_path, pages=1, portrait=False)
+    monkeypatch.setattr(ptr_vision, "_analyze_page_grid", lambda _page, _module: _grid_with({0: 1, 1: 0}))
+    read = _payload(
+        _row("Ford", page_number=1, amount_column_letter="B", amount_min=15001, amount_max=50000),
+        _row("Amazon", page_number=1, amount_column_letter="B", amount_min=15001, amount_max=50000),
+    )
+    _install(monkeypatch, read)
+
+    result = extract_via_vision(pdf)
+
+    rows = result["transactions"]
+    assert rows[0]["detectorStatus"] == "agree" and rows[0]["amount_min"] == 15001
+    assert rows[1]["detectorStatus"] == "disagree" and rows[1]["amount_min"] is None
+    assert rows[1]["detectorLetter"] == "A"
+    assert result["detector"]["agreed"] == 1 and result["detector"]["disagreed"] == 1
+    assert result["detector"]["pages"][0]["page"] == 1
+    assert "checkbox detector disagreed on 1 row(s)" in result["needs_review_reasons"]
+    assert result["needs_review"] is True
+    assert result["orientation"][0]["gridColumns"] == 11
+    metadata = build_vision_metadata(result)
+    assert metadata["detector"]["disagreed"] == 1
+    assert any("det:A/disagree" in line for line in metadata["rows"])
+    assert "_unmatched" not in rows[0] and "_amount_letter_conflict" not in rows[0]
+
+
+def test_page_number_is_in_the_schema_and_prompt() -> None:
+    from capitol_pipeline.parsers.ptr_vision import PTR_VISION_SCHEMA, SYSTEM_PROMPT
+
+    item = PTR_VISION_SCHEMA["properties"]["transactions"]["items"]
+    assert "page_number" in item["properties"] and "page_number" in item["required"]
+    assert "page_number" in SYSTEM_PROMPT
+
+
+def test_page_range_knob_reads_only_those_pages(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    _enable(monkeypatch)
+    monkeypatch.setenv("CAPITOL_PTR_VISION_PAGE_RANGE", "3-4")
+    pdf = _write_real_pdf(tmp_path, pages=6)
+    fake = _install(monkeypatch, _payload(_row("x", page_number=3)))
+
+    result = extract_via_vision(pdf)
+
+    content = fake.reads[0]["messages"][0]["content"]
+    assert content[0]["text"] == "Page 3 of 6:"
+    assert [block["type"] for block in content].count("image") == 2
+    assert [entry["page"] for entry in result["orientation"]] == [3, 4]
+    assert "pages 3 to 4" in _user_text(fake.reads[0])
+    monkeypatch.setenv("CAPITOL_PTR_VISION_PAGE_RANGE", "nonsense")
+    assert ptr_vision.resolve_page_range() is None
