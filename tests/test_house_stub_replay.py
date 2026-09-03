@@ -282,6 +282,35 @@ def test_a_withheld_vision_transcription_still_publishes_nothing(exporter: _Call
     assert exporter.upserts == []
 
 
+def test_an_empty_run_never_erases_a_stored_transcription(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from capitol_pipeline.exporters import neon
+
+    written: list[dict[str, Any]] = []
+
+    def _update(_settings: Settings, **kwargs: Any) -> None:
+        written.append(kwargs["metadata_updates"])
+
+    monkeypatch.setattr(neon, "update_house_stub_state", _update)
+    stub = cli.build_stub_from_queue_row(_row())
+
+    neon.mark_house_stub_processed(
+        Settings(), stub, status="needs_review", parser_confidence=0.0,
+        parsed_transaction_count=0, parsed_transactions=[],
+    )
+    # Nothing was found this run, and the count says so -- but the rows read
+    # on an earlier run are left where they are.
+    assert written[0]["parsedTransactionCount"] == 0
+    assert "parsedTransactions" not in written[0]
+
+    neon.mark_house_stub_processed(
+        Settings(), stub, status="parsed", parser_confidence=0.9,
+        parsed_transaction_count=1, parsed_transactions=[{"line_number": 1}],
+    )
+    assert written[1]["parsedTransactions"] == [{"line_number": 1}]
+
+
 def test_the_queue_query_excludes_vision_and_published_filings(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

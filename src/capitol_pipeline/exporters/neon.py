@@ -3898,9 +3898,15 @@ def mark_house_stub_processed(
             "parsedTransactionCount": parsed_transaction_count,
             "lastError": last_error,
             "rawTextPreview": raw_text_preview,
-            "parsedTransactions": parsed_transactions or [],
         }
     )
+    # A run that found nothing is not evidence that an earlier run was wrong.
+    # Doc 9116141 holds 134 rows read once and withheld for review, and it has
+    # been re-processed 173 times since; writing an empty list here would have
+    # thrown that transcription away on any one of them. The count above still
+    # reports what this run found.
+    if parsed_transactions:
+        metadata["parsedTransactions"] = parsed_transactions
     if metadata_extra:
         metadata.update(metadata_extra)
 
