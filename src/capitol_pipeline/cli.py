@@ -122,6 +122,7 @@ from capitol_pipeline.parsers.house_ptr import (
     cleaning_gutted_description,
     get_transaction_date_issue,
     parse_house_ptr_pdf,
+    strip_form_annotation,
 )
 from capitol_pipeline.parsers.ptr_vision import is_vision_parser_version
 from capitol_pipeline.processors.chunking import build_search_chunks
@@ -475,11 +476,16 @@ def _replay_asset_description(row: dict[str, object]) -> str:
     raw = fix_font_mojibake(str(row.get("asset_description") or "")).strip()
     if not raw:
         return raw
+    # The annotation is form furniture, not part of the name, so it comes off
+    # before the "did cleaning eat this?" test -- otherwise removing it from a
+    # short name ("Filing Status: New Visa Inc.") looks like the cleaner
+    # eating half the row.
+    core = strip_form_annotation(raw) or raw
     ticker = row.get("ticker")
     ticker = ticker.strip().upper() if isinstance(ticker, str) and ticker.strip() else None
     cleaned = clean_asset_description(raw, ticker).strip()
-    if not cleaned or cleaning_gutted_description(cleaned, raw):
-        return raw
+    if not cleaned or cleaning_gutted_description(cleaned, core):
+        return core
     return cleaned
 
 

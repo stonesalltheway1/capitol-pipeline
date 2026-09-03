@@ -282,6 +282,20 @@ def infer_asset_type(raw: str | None) -> str:
     return "Asset"
 
 
+#: The form's per-row filing-status annotation, printed above the asset and
+#: routinely swept into it by the text layer. The leading "F" is optional
+#: because some subset fonts drop it.
+FORM_ANNOTATION_PREFIX = re.compile(
+    r"^\s*F?iling Status:\s*(?:New|Amended)\b\s*", re.IGNORECASE
+)
+
+
+def strip_form_annotation(description: str) -> str:
+    """Remove a leading "Filing Status: New" annotation from an asset name."""
+
+    return FORM_ANNOTATION_PREFIX.sub("", description or "").strip()
+
+
 def cleaning_gutted_description(cleaned: str, raw: str) -> bool:
     """Whether :func:`clean_asset_description` ate most of a transcription.
 

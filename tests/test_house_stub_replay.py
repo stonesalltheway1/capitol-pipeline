@@ -172,8 +172,9 @@ def test_a_subset_font_run_is_repaired_before_publication() -> None:
     _stub, parsed, trades, reason = cli.rebuild_parsed_house_stub(_row(parsedTransactions=[row]))
 
     assert reason is None and parsed is not None
-    assert parsed.transactions[0].asset_description == "Filing Status: New Paychex, Inc."
-    assert trades[0].asset_description == "Filing Status: New Paychex, Inc."
+    # Decoded, and then the annotation the decode revealed is peeled off too.
+    assert parsed.transactions[0].asset_description == "Paychex, Inc."
+    assert trades[0].asset_description == "Paychex, Inc."
     assert trades[0].comment.startswith("Filing Status: New Paychex, Inc.")
 
 
@@ -187,6 +188,24 @@ def test_an_annotation_glued_to_the_asset_name_is_stripped() -> None:
 
     assert reason is None and parsed is not None
     assert parsed.transactions[0].asset_description == "Amazon.com, Inc. - Common Stock"
+
+    # A short name is the case that matters: stripping the annotation removes
+    # more than half the row, which the "did cleaning eat this?" guard would
+    # otherwise read as the cleaner running away with it.
+    short = dict(MANNING_ROW, asset_description="iling Status: New Visa Inc.")
+    _stub, parsed, _trades, _reason = cli.rebuild_parsed_house_stub(
+        _row(parsedTransactions=[short])
+    )
+    assert parsed is not None
+    assert parsed.transactions[0].asset_description == "Visa Inc."
+
+    # An issuer whose name merely starts with those words is left alone.
+    literal = dict(MANNING_ROW, asset_description="Filing Status Corp")
+    _stub, parsed, _trades, _reason = cli.rebuild_parsed_house_stub(
+        _row(parsedTransactions=[literal])
+    )
+    assert parsed is not None
+    assert parsed.transactions[0].asset_description == "Filing Status Corp"
 
 
 def test_a_transcription_the_cleaner_would_gut_is_kept() -> None:
