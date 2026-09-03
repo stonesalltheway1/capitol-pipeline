@@ -282,6 +282,21 @@ def infer_asset_type(raw: str | None) -> str:
     return "Asset"
 
 
+def cleaning_gutted_description(cleaned: str, raw: str) -> bool:
+    """Whether :func:`clean_asset_description` ate most of a transcription.
+
+    The cleaner was written for the text layer, where a run of three or more
+    digits is a brokerage account number to strip. Handwritten municipal bonds
+    carry series numbers and coupons in the name -- "MINNESOTA ST BD GRP 160
+    5%" came back as "5%" -- so a caller that has the original transcription
+    should keep it when this returns True.
+    """
+
+    raw_alnum = sum(1 for char in raw if char.isalnum())
+    cleaned_alnum = sum(1 for char in cleaned if char.isalnum())
+    return raw_alnum >= 6 and cleaned_alnum * 2 < raw_alnum
+
+
 def clean_asset_description(raw: str, ticker: str | None) -> str:
     raw = fix_font_mojibake(raw)
     cleaned = squeeze_spaces(
@@ -1129,17 +1144,7 @@ def _run_vision_parse(
         )
         return None, metadata
 
-    # clean_asset_description() was written for the text layer, where a run of
-    # three or more digits is a brokerage account number to strip. Handwritten
-    # municipal bonds carry series numbers and coupons in the name ("MINNESOTA
-    # ST BD GRP 160 5%" came back as "5%"), so when cleaning ate most of the
-    # model's transcription, keep the transcription. line_number is the 1-based
-    # index into raw_transactions.
-    def _gutted(cleaned: str, raw: str) -> bool:
-        raw_alnum = sum(1 for char in raw if char.isalnum())
-        cleaned_alnum = sum(1 for char in cleaned if char.isalnum())
-        return raw_alnum >= 6 and cleaned_alnum * 2 < raw_alnum
-
+    # line_number is the 1-based index into raw_transactions.
     converted = _vision_to_transactions(raw_transactions)
     restored: list[HousePtrTransaction] = []
     restored_count = 0
@@ -1150,7 +1155,9 @@ def _run_vision_parse(
             raw_description = re.sub(
                 rf"\s*\(\s*{re.escape(transaction.ticker)}\s*\)\s*$", "", raw_description, flags=re.I
             ).strip()
-        if raw_description and _gutted(transaction.asset_description, raw_description):
+        if raw_description and cleaning_gutted_description(
+            transaction.asset_description, raw_description
+        ):
             transaction = transaction.model_copy(update={"asset_description": raw_description})
             restored_count += 1
         restored.append(transaction)

@@ -118,6 +118,8 @@ from capitol_pipeline.parsers.house_ptr import (
     REPLAY_PARSER_VERSION,
     VISION_BACKENDS,
     build_trade_rows_from_house_ptr,
+    clean_asset_description,
+    cleaning_gutted_description,
     get_transaction_date_issue,
     parse_house_ptr_pdf,
 )
@@ -459,6 +461,28 @@ def persist_parsed_house_stub(
 REPLAY_SKIPPED = "skipped"
 
 
+def _replay_asset_description(row: dict[str, object]) -> str:
+    """The asset name a stored row should be published under.
+
+    Transcriptions stored months ago were cleaned by whatever the cleaner did
+    then, and rows still carry the artefacts it has since learned to strip --
+    a "Filing Status: New" annotation glued to the front of the asset, and the
+    subset-font shift the text layer now reverses. Both are removed here,
+    unless cleaning eats most of the name, in which case the transcription is
+    the better record.
+    """
+
+    raw = fix_font_mojibake(str(row.get("asset_description") or "")).strip()
+    if not raw:
+        return raw
+    ticker = row.get("ticker")
+    ticker = ticker.strip().upper() if isinstance(ticker, str) and ticker.strip() else None
+    cleaned = clean_asset_description(raw, ticker).strip()
+    if not cleaned or cleaning_gutted_description(cleaned, raw):
+        return raw
+    return cleaned
+
+
 def rebuild_parsed_house_stub(
     row: dict[str, object],
     *,
@@ -503,7 +527,7 @@ def rebuild_parsed_house_stub(
         # a rewrite of the record.
         entry = {
             **entry,
-            "asset_description": fix_font_mojibake(str(entry.get("asset_description") or "")),
+            "asset_description": _replay_asset_description(entry),
             "comment": (
                 fix_font_mojibake(str(entry["comment"]))
                 if isinstance(entry.get("comment"), str)

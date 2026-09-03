@@ -177,6 +177,28 @@ def test_a_subset_font_run_is_repaired_before_publication() -> None:
     assert trades[0].comment.startswith("Filing Status: New Paychex, Inc.")
 
 
+def test_an_annotation_glued_to_the_asset_name_is_stripped() -> None:
+    # The text parser has since learned to peel the form's "Filing Status:"
+    # annotation off the front of the asset, but transcriptions stored before
+    # that still carry it: 225 of the rows waiting to be published read
+    # "iling Status: New Amazon.com, Inc. - Common Stock".
+    row = dict(MANNING_ROW, asset_description="Filing Status: New Amazon.com, Inc. - Common Stock")
+    _stub, parsed, _trades, reason = cli.rebuild_parsed_house_stub(_row(parsedTransactions=[row]))
+
+    assert reason is None and parsed is not None
+    assert parsed.transactions[0].asset_description == "Amazon.com, Inc. - Common Stock"
+
+
+def test_a_transcription_the_cleaner_would_gut_is_kept() -> None:
+    # The cleaner strips a run of three or more digits as a brokerage account
+    # number, which eats a municipal bond's series and coupon.
+    row = dict(MANNING_ROW, asset_description="MINNESOTA ST BD GRP 160 5%")
+    _stub, parsed, _trades, _reason = cli.rebuild_parsed_house_stub(_row(parsedTransactions=[row]))
+
+    assert parsed is not None
+    assert parsed.transactions[0].asset_description == "MINNESOTA ST BD GRP 160 5%"
+
+
 def test_a_stub_with_no_stored_rows_is_skipped() -> None:
     _stub, parsed, _trades, reason = cli.rebuild_parsed_house_stub(_row(parsedTransactions=[]))
     assert parsed is None
