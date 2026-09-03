@@ -122,6 +122,58 @@ MARK_BASELINE_OFFSET = 0.004
 MARK_DOMINANCE = 0.6
 #: A band with this many inked cells is header text, not a row.
 TEXT_BAND_CELLS = 5
+#: A candidate band shorter than this fraction of the median candidate height
+#: is stray ink -- a rule the mask missed, the tail of a neighbouring row --
+#: and not a row. See :func:`align_rows` for what it costs to keep one.
+RUNT_BAND_RATIO = 0.5
+
+# -- The Type block ---------------------------------------------------------
+#
+# The amount ladder has this independent check; the Type column had none, and
+# that is where the damage was. On docs 8221322 and 8221358 both Gemini reads
+# took the Type column one column to the left and agreed with each other, so
+# ``merge_matched_rows`` waved it through: 623 of Ro Khanna's published
+# transactions said purchase or exchange where the form ticks Sale, and not one
+# went the other way. Two reads by two versions of one model family are not two
+# independent reads. This is.
+#
+# It does not have to be a general Type detector, and deliberately is not. On
+# BOTH layouts that reach this path the first tick column is Purchase and the
+# second is Sale, and Purchase-against-Sale is the whole failure:
+#
+#   brokerage grid (Khanna)  Purchase | Sale | Exchange | Capital Gains
+#                            Exceed $200 | Partial Transaction
+#   House form (McCaul)      PURCHASE | SALE | EXCHANGE
+#
+# So no layout detection is needed. Note the House form has three type columns,
+# not the four ("Purchase / Sale / Partial Sale / Exchange") the older notes
+# claim -- read off 9116141 page 2 at the render zoom.
+#
+# Finding them takes no new geometry either. Left of the ladder, the asset-name
+# column is far the widest thing on the page, and the tick block starts at its
+# right edge. Measured on the fixtures at the zoom the detector actually gets:
+#
+#   page            asset col   next two columns   ladder pitch
+#   8221322 p2        166           44, 26              52
+#   8221322 p19       244           42, 26              50
+#   8221358 p20       256           45, 27              52
+#   8221358 p32       254           46, 27              52
+#   8221360 p2        178           48, 44              55
+#   8221359 p2        651           34, 33              32
+#   8221326 p1        645           36, 32              32
+#   9116141 p2        668           35, 34              33
+#
+#: The widest column left of the ladder must beat the runner-up by this much
+#: before it is taken for the asset-name column. The tightest fixture is
+#: 8221360 p2 at 178 against 114 (1.56); a brokerage grid runs to 7.2.
+ASSET_COLUMN_DOMINANCE = 1.25
+#: A tick column's width, as a fraction of the ladder's own pitch. The fixtures
+#: span 0.50 to 1.13, so this is a guard band rather than a fit: it exists to
+#: reject a page whose widest gap was not the asset column at all.
+TYPE_COLUMN_MIN_PITCH_RATIO = 0.35
+TYPE_COLUMN_MAX_PITCH_RATIO = 2.0
+#: Names of the two columns read, in page order.
+TYPE_COLUMN_NAMES = ("purchase", "sale")
 
 
 def _np() -> Any:
@@ -241,6 +293,27 @@ def find_ladder(rule_xs: list[int]) -> list[int] | None:
     sits at the page's right edge), then the longest; more than
     :data:`MAX_LADDER_RULES` keeps the rightmost; a wider column just past the
     run is appended as K.
+
+    KNOWN LIMITATION, measured 2026-09-03 and not fixed here. The run's
+    leftmost column is taken for A. When rules at the left of the block are too
+    faint to find, the ladder is anchored on the wrong column and every letter
+    is shifted, silently. On the 2023 handwritten paper forms, where the same
+    blank produces an eleven-column ladder on four filings, it produces eight
+    columns on three others -- 8219420, 8219455 and 8220037 -- anchored three
+    columns right, so a tick in D reads as A. Checked against two independent
+    blind transcriptions of 122 pages, this is the only remaining disagreement
+    the detector has with the forms: 1,633 amount letters right out of 1,634,
+    and the one wrong is 8219455 page 1.
+
+    It fails safe as things stand. A shifted letter contradicts the model's,
+    :func:`capitol_pipeline.parsers.ptr_vision.apply_checkbox_detector` nulls
+    the amount, and a row with no amount band is withheld -- so the cost is a
+    withheld row, not a wrong one. The residual risk is a shifted ladder that
+    happens to agree with an already-wrong model letter.
+
+    The fix needs the block's true left edge rather than the run's, and the
+    fixtures for it are those three pages against 8219414, 8219415, 8219436 and
+    8220431, which are the same blank read correctly.
     """
 
     np = _np()
@@ -276,6 +349,38 @@ def find_ladder(rule_xs: list[int]) -> list[int] | None:
         if following and following[0] - best[-1] <= TRAILING_COLUMN_MAX_PITCHES * pitch:
             best = best + [following[0]]
     return best
+
+
+def find_type_columns(
+    rule_xs: list[int], ladder_x0: int, ladder_pitch: float
+) -> list[tuple[int, int]] | None:
+    """The Purchase and Sale tick columns, from the rules left of the ladder.
+
+    The tick block begins at the right edge of the widest column left of the
+    ladder, which on both layouts is the asset-name column, and its first two
+    columns are Purchase and Sale. Returns ``[(x0, x1), (x0, x1)]``, or None
+    when the page does not show that shape -- a missing rule, a page that is
+    not a transaction grid, an asset column that did not stand out. None means
+    "this page says nothing about the type", never "no tick".
+    """
+
+    left = sorted(x for x in rule_xs if x < ladder_x0 - 2)
+    if len(left) < 4 or ladder_pitch <= 0:
+        return None
+    gaps = [(left[i + 1] - left[i], i) for i in range(len(left) - 1)]
+    widest, at = max(gaps)
+    runner_up = max((g for g, i in gaps if i != at), default=0)
+    if runner_up and widest < runner_up * ASSET_COLUMN_DOMINANCE:
+        return None
+    # Two tick columns need three rules from the asset column's right edge.
+    if at + 3 >= len(left):
+        return None
+    columns = [(left[at + 1 + k], left[at + 2 + k]) for k in range(2)]
+    lo = TYPE_COLUMN_MIN_PITCH_RATIO * ladder_pitch
+    hi = TYPE_COLUMN_MAX_PITCH_RATIO * ladder_pitch
+    if not all(lo <= (x1 - x0) <= hi for x0, x1 in columns):
+        return None
+    return columns
 
 
 def find_horizontal_rules(dark: Any, ladder: list[int], y0: int, y1: int) -> list[int]:
@@ -362,6 +467,25 @@ def analyze_amount_grid(gray: Any) -> dict[str, Any] | None:
         interior[lo:hi, :] = False
     if interior.size == 0:
         return None
+    # The Purchase and Sale columns, measured at the very same row bands. The
+    # rows are already solved by the ladder: a row aligned there is aligned in
+    # the tick block for free, which is why this costs one extra rule sweep and
+    # nothing else. The first sweep starts at SEARCH_X_FRACTION, so the tick
+    # block -- which is left of that on the House form -- needs a full-width one.
+    pitches = [columns[i][1] - columns[i][0] for i in range(len(columns))]
+    ladder_pitch = float(sorted(pitches)[len(pitches) // 2]) if pitches else 0.0
+    type_columns = find_type_columns(
+        [rule["x"] for rule in find_vertical_rules(dark, 0)], ladder[0], ladder_pitch
+    )
+
+    def _densities(ya: int, yb: int, cells: list[tuple[int, int]]) -> list[float]:
+        out: list[float] = []
+        for cx0, cx1 in cells:
+            cell_w = cx1 - cx0
+            xa, xb = cx0 + int(cell_w * CELL_MARGIN), cx1 - int(cell_w * CELL_MARGIN)
+            out.append(cell_ink_density(dark[ya:yb, xa:xb]))
+        return out
+
     profile = interior.sum(axis=1) / float(interior.shape[1])
     inked_rows = [int(y) for y in np.nonzero(profile >= MIN_BAND_INK_FRACTION)[0]]
     bands: list[dict[str, Any]] = []
@@ -371,12 +495,14 @@ def analyze_amount_grid(gray: Any) -> dict[str, Any] | None:
         a, b = y0 + group[0], y0 + group[-1] + 1
         trim = int((b - a) * BAND_ROW_MARGIN)
         ya, yb = a + trim, b - trim
-        densities: list[float] = []
-        for cx0, cx1 in columns:
-            cell_w = cx1 - cx0
-            xa, xb = cx0 + int(cell_w * CELL_MARGIN), cx1 - int(cell_w * CELL_MARGIN)
-            densities.append(cell_ink_density(dark[ya:yb, xa:xb]))
-        bands.append({"y0": int(a), "y1": int(b), "densities": densities})
+        band: dict[str, Any] = {
+            "y0": int(a),
+            "y1": int(b),
+            "densities": _densities(ya, yb, columns),
+        }
+        if type_columns is not None:
+            band["typeDensities"] = _densities(ya, yb, type_columns)
+        bands.append(band)
 
     # The empty-cell baseline comes from the bands that are not header text.
     def _is_text(densities: list[float]) -> bool:
@@ -384,6 +510,18 @@ def analyze_amount_grid(gray: Any) -> dict[str, Any] | None:
 
     plain = [d for band in bands if not _is_text(band["densities"]) for d in band["densities"]]
     baseline = float(np.median(plain)) if plain else 0.0
+
+    # The type baseline is the median of the *quieter* of the two cells in each
+    # band, not the median of both pooled. On a page where every row is a Sale
+    # -- which is exactly the page this exists for -- half the pooled values are
+    # ticks, and their median lands between inked and empty and swallows the
+    # signal. The quieter cell of a row that ticks one column is the empty one.
+    quiet = [
+        min(band["typeDensities"])
+        for band in bands
+        if "typeDensities" in band and not _is_text(band["densities"])
+    ]
+    type_baseline = float(np.median(quiet)) if quiet else 0.0
 
     # Header zone: everything down to the last header-text band in the top
     # part of the ladder (the letters row, the dollar ranges). Brokerage
@@ -412,6 +550,8 @@ def analyze_amount_grid(gray: Any) -> dict[str, Any] | None:
         "hrules": hrules,
         "bands": bands,
         "baseline": baseline,
+        "typeColumns": type_columns,
+        "typeBaseline": type_baseline,
         "headerEnd": int(header_end),
         "captionEnd": int(caption_end),
     }
@@ -537,10 +677,42 @@ def classify_band(densities: list[float], baseline: float) -> dict[str, Any]:
     return record
 
 
+def classify_type(densities: list[float] | None, baseline: float) -> dict[str, Any]:
+    """Say whether one band ticks Purchase, ticks Sale, or neither.
+
+    ``kind`` is ``purchase``, ``sale``, ``none`` (neither column inked) or
+    ``ambiguous`` (both, or one not clearly dominant). ``none`` is a normal,
+    frequent answer -- an Exchange row ticks neither of the two columns read --
+    so this can confirm or contradict a claim of purchase or sale and says
+    nothing at all about any other type. That is the whole failure it exists
+    for: a Sale published as a purchase (435 rows) or as an exchange (188).
+    """
+
+    record: dict[str, Any] = {"kind": "unknown", "name": None, "best": None, "second": None}
+    if not densities or len(densities) < 2:
+        return record
+    threshold = max(MARK_MIN_DENSITY, baseline * MARK_BASELINE_FACTOR + MARK_BASELINE_OFFSET)
+    order = sorted(range(len(densities)), key=lambda i: densities[i], reverse=True)
+    best, second = order[0], order[1]
+    best_d, second_d = densities[best], densities[second]
+    record.update(
+        best=round(best_d, 4), second=round(second_d, 4), threshold=round(threshold, 4)
+    )
+    if best_d < threshold:
+        record["kind"] = "none"
+    elif second_d >= threshold or second_d >= MARK_DOMINANCE * best_d:
+        record["kind"] = "ambiguous"
+    else:
+        record["kind"] = TYPE_COLUMN_NAMES[best]
+        record["name"] = TYPE_COLUMN_NAMES[best]
+    return record
+
+
 def classify_bands(analysis: dict[str, Any]) -> list[dict[str, Any]]:
     """Classify every band; bands inside the header zone are ``header``."""
 
     baseline = float(analysis.get("baseline") or 0.0)
+    type_baseline = float(analysis.get("typeBaseline") or 0.0)
     header_end = int(analysis.get("headerEnd") or 0)
     caption_end = int(analysis.get("captionEnd") or header_end)
     last = len(analysis["columns"]) - 1
@@ -548,6 +720,7 @@ def classify_bands(analysis: dict[str, Any]) -> list[dict[str, Any]]:
     for band in analysis["bands"]:
         record = classify_band(band["densities"], baseline)
         record["y0"], record["y1"] = band["y0"], band["y1"]
+        record["type"] = classify_type(band.get("typeDensities"), type_baseline)
         if record["kind"] != "text":
             if band["y1"] <= header_end:
                 record["kind"] = "header"
@@ -565,14 +738,35 @@ def align_rows(bands: list[dict[str, Any]], expected_rows: int) -> list[dict[str
     """Pair the model's rows (top to bottom) with the ticked bands.
 
     Candidates are the marked and ambiguous bands in page order. An exact count
-    match pairs them one to one. One extra candidate whose first band is a
-    clean tick in column B is the paper form's pre-printed example row and is
-    dropped. Anything else is a failed alignment.
+    match pairs them one to one. Otherwise runt bands are dropped, and only
+    then, one extra candidate whose first band is a clean tick in column B is
+    taken for the paper form's pre-printed example row. Anything else is a
+    failed alignment.
+
+    The order matters, and it is measured. The example-row rule cannot tell a
+    real first row from a stray band, and column B is also the commonest real
+    amount, so on any page with one spurious band it silently drops the first
+    row and shifts every row after it. On 8221360 page 2 that is exactly what
+    happened: a five-pixel band among bands 25 to 31 pixels tall made nine
+    candidates for eight rows, the rule dropped Micron Technology, and five of
+    the seven rows then carried another row's amount -- checked against two
+    independent blind transcriptions of the page. Dropping the runt first
+    makes the count match on its own and the example-row rule never fires.
     """
 
     candidates = [band for band in bands if band["kind"] in ("marked", "ambiguous")]
     if expected_rows <= 0:
         return None
+    if len(candidates) == expected_rows:
+        return candidates
+    if len(candidates) > expected_rows:
+        heights = sorted(band["y1"] - band["y0"] for band in candidates)
+        median = heights[len(heights) // 2]
+        kept = [
+            band for band in candidates if (band["y1"] - band["y0"]) >= median * RUNT_BAND_RATIO
+        ]
+        if expected_rows <= len(kept) < len(candidates):
+            candidates = kept
     if len(candidates) == expected_rows:
         return candidates
     if (
@@ -594,7 +788,15 @@ def detect_page(analysis: dict[str, Any] | None, expected_rows: int) -> dict[str
     """
 
     if analysis is None:
-        return {"status": "no-grid", "columns": 0, "bands": 0, "candidates": 0, "letters": []}
+        return {
+            "status": "no-grid",
+            "columns": 0,
+            "bands": 0,
+            "candidates": 0,
+            "letters": [],
+            "types": [],
+            "typeColumns": None,
+        }
     classified = classify_bands(analysis)
     candidates = [band for band in classified if band["kind"] in ("marked", "ambiguous")]
     base = {
@@ -602,6 +804,8 @@ def detect_page(analysis: dict[str, Any] | None, expected_rows: int) -> dict[str
         "bands": len(classified),
         "candidates": len(candidates),
         "letters": [],
+        "types": [],
+        "typeColumns": analysis.get("typeColumns"),
     }
     if expected_rows <= 0:
         return {"status": "no-rows", **base}
@@ -612,6 +816,13 @@ def detect_page(analysis: dict[str, Any] | None, expected_rows: int) -> dict[str
         "status": "ok",
         **base,
         "letters": [{"letter": band["letter"], "kind": band["kind"]} for band in aligned],
+        # One entry per expected row, in the same order as `letters`, because
+        # both come off the same aligned bands. `kind` is purchase / sale /
+        # none / ambiguous / unknown; only the first two are an assertion.
+        "types": [
+            {"kind": band["type"]["kind"], "name": band["type"].get("name")}
+            for band in aligned
+        ],
     }
 
 

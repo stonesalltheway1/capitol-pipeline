@@ -172,3 +172,84 @@ def test_constants_are_sane() -> None:
     assert ptr_grid.AMOUNT_LETTERS == "ABCDEFGHIJK"
     assert 0 < ptr_grid.CELL_MARGIN < 0.5
     assert ptr_grid.MIN_LADDER_RULES <= ptr_grid.MAX_LADDER_RULES
+
+
+# ---------------------------------------------------------------------------
+# The Type block: Purchase against Sale
+# ---------------------------------------------------------------------------
+#
+# Every expectation below is what two independent blind transcriptions of the
+# page agreed on, and each was then confirmed by eye on the rendered page. The
+# reads never saw the database, the pipeline's own result, or each other.
+
+
+def _types(name: str, expected_rows: int) -> list[str]:
+    result = detect_page(analyze_amount_grid(_load(name)), expected_rows=expected_rows)
+    assert result["status"] == "ok", (name, result["status"])
+    return [entry["kind"] for entry in result["types"]]
+
+
+def test_type_columns_are_found_on_both_layouts() -> None:
+    for name in ("8221322_p2", "8221322_p19", "8221358_p20", "8221360_p2", "9116141_p2"):
+        analysis = analyze_amount_grid(_load(name))
+        assert analysis is not None, name
+        columns = analysis["typeColumns"]
+        assert columns is not None, name
+        assert len(columns) == 2, name
+        # Purchase then Sale, adjacent, left of the ladder.
+        assert columns[0][1] == columns[1][0], name
+        assert columns[1][1] < analysis["columns"][0][0], name
+
+
+def test_the_two_pages_both_model_reads_got_wrong() -> None:
+    # 8221358 page 20 and 8221322 page 19 are the pages where gemini-3.8-flash
+    # and gemini-3.5-flash BOTH took the Type column one column to the left and
+    # returned purchase for rows the form ticks under Sale. Between them they
+    # are most of the 623 wrong transaction types that were published.
+    assert _types("8221322_p19", 19) == ["sale"] * 19
+    assert set(_types("8221358_p20", 18)) <= {"sale", "none", "ambiguous"}
+    assert "purchase" not in _types("8221358_p20", 18)
+
+
+def test_mixed_page_reads_purchase_then_sale() -> None:
+    # 8221322 page 2: six purchases, then thirteen sales. A page that is all
+    # one answer cannot tell a working detector from one that is stuck.
+    kinds = _types("8221322_p2", 19)
+    assert kinds[:6] == ["purchase"] * 6
+    assert set(kinds[6:]) <= {"sale", "none", "ambiguous"}
+    assert "purchase" not in kinds[6:]
+
+
+def test_house_form_reads_every_row_as_purchase() -> None:
+    assert _types("9116141_p2", 26) == ["purchase"] * 26
+
+
+def test_house_form_partial_sale_is_not_read_as_a_purchase() -> None:
+    # 8221360 page 2 is the other House layout, which gives Partial Sale its
+    # own column: Micron and the Treasury bill are Purchase, the other five are
+    # Partial Sale. A partial sale leaves both columns this reads empty, so the
+    # detector must be silent on them and must never call them purchases.
+    kinds = _types("8221360_p2", 7)
+    assert kinds[0] == "purchase"
+    assert kinds[4] == "purchase"
+    assert [k for i, k in enumerate(kinds) if i not in (0, 4)] == ["none"] * 5
+
+
+def test_a_runt_band_does_not_shift_every_row_on_the_page() -> None:
+    # 8221360 page 2 carries a five-pixel band among bands 25 to 31 pixels
+    # tall, which made eight candidates for seven rows. The example-row rule
+    # then dropped Micron Technology and every row after it took the next
+    # row's amount: five of seven wrong. Runt bands go first now.
+    result = detect_page(analyze_amount_grid(_load("8221360_p2")), expected_rows=7)
+    assert result["status"] == "ok"
+    assert [entry["letter"] for entry in result["letters"]] == ["B", "B", "C", "B", "F", "C", "D"]
+
+
+def test_a_page_that_does_not_show_the_shape_says_nothing() -> None:
+    # The detector must decline rather than guess. 8219362 is the older ten
+    # column form; whatever it finds, it may not invent a Purchase/Sale pair
+    # that is not two adjacent narrow columns left of the ladder.
+    analysis = analyze_amount_grid(_load("8219362_p1"))
+    assert analysis is not None
+    columns = analysis["typeColumns"]
+    assert columns is None or (len(columns) == 2 and columns[1][1] < analysis["columns"][0][0])

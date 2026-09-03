@@ -969,6 +969,11 @@ def test_detector_confirms_and_contradicts_the_model_letter() -> None:
             "disagreed": 1,
             "ambiguous": 0,
             "resolved": 0,
+            # The Type block is read off the same aligned bands. These
+            # synthetic pages carry no Purchase/Sale columns, so the detector
+            # is silent on the type -- the correct answer, not a default.
+            "typeAgreed": 0,
+            "typeDisagreed": 0,
         }
     ]
 
@@ -1460,3 +1465,87 @@ def test_reconcile_stored_transcription_settles_an_amount_with_no_model(
     )
     assert rows[0]["amount_min"] is None
     assert detector["resolved"] == 0
+
+
+def _real_grid(name: str):
+    """The grid analysis of a real rendered page fixture."""
+    from pathlib import Path
+
+    import pytest as _pytest
+
+    fitz = _pytest.importorskip("fitz")
+    from capitol_pipeline.parsers.ptr_grid import analyze_amount_grid, gray_from_pixmap
+
+    path = Path(__file__).parent / "fixtures" / "ptr_pages" / f"{name}.png"
+    pixmap = fitz.Pixmap(str(path))
+    gray = gray_from_pixmap(pixmap.samples, pixmap.width, pixmap.height, pixmap.n)
+    analysis = analyze_amount_grid(gray)
+    assert analysis is not None
+    return analysis
+
+
+def test_detector_withdraws_a_sale_the_model_called_a_purchase() -> None:
+    """The 623-row failure, reproduced, and stopped.
+
+    8221322 page 19 ticks Sale on all nineteen rows and the Purchase column is
+    empty on every one. Both Gemini reads returned purchase, agreed with each
+    other, and the site published nineteen sales as purchases. Here the model
+    rows say the same wrong thing and the detector has to take the type away.
+    """
+    from capitol_pipeline.parsers.ptr_vision import apply_checkbox_detector
+
+    pages = [{"index": 19, "grid": _real_grid("8221322_p19")}]
+    rows = [
+        _row(f"row {i}", page_number=19, transaction_type="purchase")
+        for i in range(19)
+    ]
+    rows, summaries = apply_checkbox_detector(rows, pages)
+
+    assert summaries[0]["status"] == "ok"
+    assert summaries[0]["typeDisagreed"] == 19
+    assert summaries[0]["typeAgreed"] == 0
+    assert [row["detectorType"] for row in rows] == ["sale"] * 19
+    assert [row["detectorTypeStatus"] for row in rows] == ["disagree"] * 19
+    # The type is gone, so `split_scanned_trades` withholds every one of them
+    # rather than publishing a sale as a purchase.
+    assert [row["transaction_type"] for row in rows] == [None] * 19
+    assert all(row["legibility"] == "partial" for row in rows)
+    assert "reads a tick under Sale" in rows[0]["comment"]
+
+
+def test_detector_confirms_a_type_the_model_got_right() -> None:
+    """The same page read correctly is left alone; and an exchange is refused.
+
+    9116141 page 2 ticks Purchase on all twenty-six rows. A correct model read
+    must come through untouched, or the check would cost more than it saves.
+    """
+    from capitol_pipeline.parsers.ptr_vision import apply_checkbox_detector
+
+    pages = [{"index": 2, "grid": _real_grid("9116141_p2")}]
+    rows = [_row(f"row {i}", page_number=2, transaction_type="purchase") for i in range(26)]
+    rows, summaries = apply_checkbox_detector(rows, pages)
+    assert summaries[0]["typeAgreed"] == 26
+    assert summaries[0]["typeDisagreed"] == 0
+    assert [row["transaction_type"] for row in rows] == ["purchase"] * 26
+
+    # 188 of the wrong rows were sales published as exchanges, not purchases.
+    pages = [{"index": 19, "grid": _real_grid("8221322_p19")}]
+    rows = [_row(f"row {i}", page_number=19, transaction_type="exchange") for i in range(19)]
+    rows, _ = apply_checkbox_detector(rows, pages)
+    assert [row["transaction_type"] for row in rows] == [None] * 19
+
+
+def test_detector_does_not_touch_a_partial_sale() -> None:
+    """A sale_partial is not contradicted by a tick under Sale.
+
+    The brokerage grid ticks Sale and a separate "Partial Transaction" column
+    for a partial sale, so the Sale column being inked says nothing about which
+    of the two it is. Contradicting here would withhold correct rows.
+    """
+    from capitol_pipeline.parsers.ptr_vision import apply_checkbox_detector
+
+    pages = [{"index": 19, "grid": _real_grid("8221322_p19")}]
+    rows = [_row(f"row {i}", page_number=19, transaction_type="sale_partial") for i in range(19)]
+    rows, summaries = apply_checkbox_detector(rows, pages)
+    assert summaries[0]["typeDisagreed"] == 0
+    assert [row["transaction_type"] for row in rows] == ["sale_partial"] * 19

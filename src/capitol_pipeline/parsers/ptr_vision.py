@@ -1535,6 +1535,32 @@ def _null_amount(row: dict[str, Any], note: str) -> None:
     row["comment"] = f"{existing}; {note}" if existing else note
 
 
+def _null_type(row: dict[str, Any], note: str) -> None:
+    """Withdraw a transaction type the checkbox detector contradicts."""
+
+    row["transaction_type"] = None
+    row["legibility"] = _downgrade(_worst_legibility(row.get("legibility")), "partial")
+    existing = _merge_comment(row.get("comment"))
+    row["comment"] = f"{existing}; {note}" if existing else note
+
+
+#: What each detector verdict rules out. The detector reads only the Purchase
+#: and Sale columns, so it can contradict a claim and confirm one, and says
+#: nothing about any other type -- a row it reads as "none" may be an exchange,
+#: a partial sale on the House form, or an unticked row.
+#:
+#: "sale" is compatible with ``sale_partial`` on purpose. The brokerage grid
+#: ticks Sale *and* a separate "Partial Transaction" column for a partial sale,
+#: so the Sale column being inked does not distinguish the two; the House form
+#: gives Partial Sale its own column, which leaves Sale empty and makes the
+#: detector say "none" rather than "sale". Either way, "sale" never contradicts
+#: ``sale_partial``.
+_TYPE_CONTRADICTS: dict[str, frozenset[str]] = {
+    "purchase": frozenset({"sale", "sale_partial", "exchange"}),
+    "sale": frozenset({"purchase", "exchange"}),
+}
+
+
 def _has_amount(row: dict[str, Any]) -> bool:
     """Whether the row still carries a usable dollar band."""
 
@@ -1592,6 +1618,8 @@ def apply_checkbox_detector(
     for row in rows:
         row.setdefault("detectorLetter", None)
         row.setdefault("detectorStatus", "unchecked")
+        row.setdefault("detectorType", None)
+        row.setdefault("detectorTypeStatus", "unchecked")
     for index, page in sorted(by_page.items()):
         page_rows = [row for row in rows if _page_of(row) == index]
         aligned_rows = [row for row in page_rows if not row.get("_unmatched")]
@@ -1608,14 +1636,47 @@ def apply_checkbox_detector(
             "disagreed": 0,
             "ambiguous": 0,
             "resolved": 0,
+            "typeAgreed": 0,
+            "typeDisagreed": 0,
         }
         if result["status"] != "ok":
             for row in page_rows:
                 row["detectorStatus"] = result["status"]
+                row["detectorTypeStatus"] = result["status"]
             summaries.append(summary)
             continue
         summary["rowsAligned"] = len(aligned_rows)
-        for row, found in zip(aligned_rows, result["letters"]):
+        types = result.get("types") or [{"kind": "unknown"}] * len(result["letters"])
+        for row, found, found_type in zip(aligned_rows, result["letters"], types):
+            # -- the Type block -------------------------------------------
+            # Same aligned bands as the amount ladder, so this costs nothing
+            # extra and cannot drift out of step with it. This is the check
+            # that was missing when 623 of one member's published transactions
+            # said purchase or exchange where the form ticks Sale: two Gemini
+            # reads of one model family agreed with each other and there was
+            # nothing on the page to contradict them.
+            kind = found_type.get("kind")
+            row["detectorType"] = kind if kind in _TYPE_CONTRADICTS else None
+            model_type = str(row.get("transaction_type") or "").strip().lower() or None
+            if kind not in _TYPE_CONTRADICTS:
+                row["detectorTypeStatus"] = "unchecked"
+            elif model_type is None:
+                # Nothing to check, and the detector does not fill it in: on
+                # the brokerage grid a ticked Sale column is a sale or a
+                # partial sale and the page does not say which.
+                row["detectorTypeStatus"] = "unchecked"
+            elif model_type in _TYPE_CONTRADICTS[kind]:
+                row["detectorTypeStatus"] = "disagree"
+                summary["typeDisagreed"] = summary.get("typeDisagreed", 0) + 1
+                _null_type(
+                    row,
+                    f"checkbox detector reads a tick under {kind.capitalize()} "
+                    f"but the model reported {model_type}",
+                )
+            else:
+                row["detectorTypeStatus"] = "agree"
+                summary["typeAgreed"] = summary.get("typeAgreed", 0) + 1
+
             row["detectorLetter"] = found["letter"]
             model_letter = _letter(row) or _letter_from_band(row)
             if found["kind"] == "ambiguous":
@@ -1646,6 +1707,7 @@ def apply_checkbox_detector(
         for row in page_rows:
             if row.get("_unmatched"):
                 row["detectorStatus"] = "unaligned"
+                row["detectorTypeStatus"] = "unaligned"
         summaries.append(summary)
     return rows, summaries
 
@@ -2967,6 +3029,8 @@ TRANSCRIPTION_FIELDS: tuple[str, ...] = tuple(TRANSACTION_ITEM_SCHEMA["required"
     "line_number",
     "detectorLetter",
     "detectorStatus",
+    "detectorType",
+    "detectorTypeStatus",
 )
 
 #: Merged rows stored verbatim on ``visionParse.transcription``. Generous: the
