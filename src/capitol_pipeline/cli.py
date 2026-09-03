@@ -434,7 +434,13 @@ def is_scanned_read(parsed: HousePtrParseResult) -> bool:
     return is_vision_parser_version(parsed.parser_version)
 
 
+#: Row ratings a scanned filing will publish under review. Measured, not chosen
+#: -- see :func:`split_scanned_trades`.
+PUBLISHABLE_LEGIBILITY = frozenset({"clear"})
+
+
 def split_scanned_trades(
+    parsed: HousePtrParseResult,
     trades: list[NormalizedTradeRow],
 ) -> tuple[list[NormalizedTradeRow], list[tuple[NormalizedTradeRow, str]]]:
     """Split a scanned filing's rows into what publishes and what is held back.
@@ -447,21 +453,55 @@ def split_scanned_trades(
     2026-09-03 it withheld about 2,596 rows nothing disputed.
 
     A row publishes when it carries a transaction date, a transaction type and
-    an amount band. Short of that it stays on the stub, because a trade with
-    no amount is a blank on the page and a trade with no date cannot be timed
-    against a vote or a deadline. The filing keeps its place in the review
-    queue either way, and the site says how many of its rows are missing.
+    an amount band, **and the reader rated it clear**. Short of any of those it
+    stays on the stub, the filing keeps its place in the review queue, and the
+    site says how many of its rows are missing.
+
+    The legibility condition is measured. Docs 8221322 and 8221358 were read by
+    this path and then transcribed again, twice, by two independent readers of
+    a different model family that were never shown the result. Of the 798 rows
+    where all three could be compared:
+
+        rating     rows   wrong type   wrong amount
+        clear       653            0              0
+        partial     145           37              8
+
+    Every error was on a row this path had already rated ``partial``, and no
+    row it rated ``clear`` was wrong about anything. The 37 wrong types are two
+    whole pages of 8221358 whose Type column *both* Gemini reads took one
+    column to the left -- two reads by two versions of one model family are not
+    independent of each other, which is the reason the rating has to be part of
+    the rule rather than the agreement alone. The amount ladder has an
+    independent check in ``parsers/ptr_grid.py``; the Type column has none yet,
+    and until it does this is what stands in for one.
+
+    A ``None`` rating publishes. It means a transcription from before the
+    reader recorded one, and those are replayed from the stub rather than read
+    fresh; treating them as unrated would withhold whole filings that were
+    published correctly long ago.
     """
+
+    ratings = {
+        transaction.line_number: transaction.legibility
+        for transaction in parsed.transactions
+    }
+
+    def rating_for(trade: NormalizedTradeRow) -> str | None:
+        line = str(trade.source_id or "").rsplit("-", 1)[-1]
+        return ratings.get(int(line)) if line.isdigit() else None
 
     publishable: list[NormalizedTradeRow] = []
     withheld: list[tuple[NormalizedTradeRow, str]] = []
     for trade in trades:
+        rating = rating_for(trade)
         if not trade.transaction_date:
             withheld.append((trade, "no transaction date"))
         elif not trade.transaction_type:
             withheld.append((trade, "no transaction type"))
         elif not trade.amount_min or not trade.amount_max:
             withheld.append((trade, "no amount band"))
+        elif rating is not None and rating not in PUBLISHABLE_LEGIBILITY:
+            withheld.append((trade, f"the read rated this row {rating}"))
         else:
             publishable.append(trade)
     return publishable, withheld
@@ -487,7 +527,7 @@ def persist_parsed_house_stub(
     status = resolve_house_stub_status(stub, parsed, trades)
     scanned_under_review = bool(trades) and is_scanned_read(parsed) and status != "parsed"
     if scanned_under_review:
-        publishable, withheld = split_scanned_trades(trades)
+        publishable, withheld = split_scanned_trades(parsed, trades)
         trade_summary = (
             upsert_trade_rows_to_neon(settings, publishable)
             if publishable

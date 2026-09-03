@@ -35,9 +35,10 @@ def _stub(member_id: str | None = "m-K000389") -> FilingStub:
     )
 
 
-def _transaction() -> HousePtrTransaction:
+def _transaction(*, line: int = 1, legibility: str | None = "clear") -> HousePtrTransaction:
     return HousePtrTransaction(
-        line_number=1,
+        legibility=legibility,
+        line_number=line,
         asset_description="Lear Corporation",
         asset_type="Asset",
         transaction_type="purchase",
@@ -143,6 +144,51 @@ def test_a_scan_in_review_publishes_the_rows_that_are_settled(exporter: _Calls) 
         "no amount band": 1,
         "no transaction date": 1,
         "reads disagree on transaction type": 3,
+    }
+
+
+def test_a_row_the_read_could_not_rate_clear_is_withheld(exporter: _Calls) -> None:
+    """The reader's own rating is part of the publish rule, and it is measured.
+
+    Docs 8221322 and 8221358 were read by the vision path and then transcribed
+    again, twice, by two independent readers of a different model family that
+    were never shown the result. Of the 798 rows where all three could be
+    compared, 653 were rated ``clear`` and **not one** of those was wrong about
+    its type or its amount; all 37 wrong types and all 8 wrong amounts were on
+    rows already rated ``partial``. The 37 are two whole pages whose Type
+    column both Gemini reads took one column to the left -- two reads by two
+    versions of one model family are not independent of each other, so the
+    rating has to be part of the rule rather than the agreement alone.
+    """
+
+    parsed = HousePtrParseResult(
+        doc_id="8219444",
+        parser_confidence=0.85,
+        parser_version="gemini-vision-v2",
+        transactions=[
+            _transaction(line=1, legibility="clear"),
+            _transaction(line=2, legibility="partial"),
+            _transaction(line=3, legibility="illegible"),
+            _transaction(line=4, legibility=None),
+        ],
+        vision_report={"ok": True, "needsReview": True, "needsReviewReasons": ["reads disagree on transaction_type"]},
+    )
+    trades = [_trade(line=1), _trade(line=2), _trade(line=3), _trade(line=4)]
+
+    summary = cli.persist_parsed_house_stub(Settings(), _stub(), parsed, trades)
+
+    # Rated clear publishes. Rated partial or illegible does not. An unrated
+    # row is a transcription from before the reader recorded a rating, replayed
+    # from the stub rather than read fresh, and it publishes.
+    assert [row.source_id for row in exporter.upserts[0]] == [
+        "tr-house-8219444-1",
+        "tr-house-8219444-4",
+    ]
+    assert summary["trades"]["withheld"] == 2
+    vision = exporter.marks[0]["metadata_extra"]["visionParse"]
+    assert vision["withheldReasons"] == {
+        "the read rated this row partial": 1,
+        "the read rated this row illegible": 1,
     }
 
 

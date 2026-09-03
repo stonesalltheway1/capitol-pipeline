@@ -811,6 +811,13 @@ def _vision_transaction_type(raw: object) -> str:
     return _VISION_TRANSACTION_TYPE_MAP.get(value, "purchase")
 
 
+def _vision_legibility(raw: object) -> str | None:
+    """The reader's own rating of a row, normalised. None when it gave none."""
+
+    value = str(raw or "").strip().lower()
+    return value if value in {"clear", "partial", "illegible"} else None
+
+
 def _vision_to_transactions(payload: list[dict]) -> list[HousePtrTransaction]:
     """Normalize vision rows through the same helpers the text parser uses."""
 
@@ -844,6 +851,7 @@ def _vision_to_transactions(payload: list[dict]) -> list[HousePtrTransaction]:
                 amount_max=amount_max,
                 owner=_vision_owner(raw_row.get("owner")),  # type: ignore[arg-type]
                 comment=comment,
+                legibility=_vision_legibility(raw_row.get("legibility")),
             )
         )
     return out

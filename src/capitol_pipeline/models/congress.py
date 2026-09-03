@@ -86,6 +86,11 @@ class HousePtrTransaction(BaseModel):
     # Status: New", "Subholding Of: <account>", "Description: ...",
     # "Comments: ..."), joined with " | ". Never part of asset_description.
     comment: str | None = None
+    # How well the reader could read this row: "clear", "partial" or
+    # "illegible". Set only on the vision path; None from the text parser,
+    # where the question does not arise. It decides whether the row publishes
+    # while its filing is under review -- see split_scanned_trades.
+    legibility: str | None = None
 
 
 class HousePtrParseResult(BaseModel):
