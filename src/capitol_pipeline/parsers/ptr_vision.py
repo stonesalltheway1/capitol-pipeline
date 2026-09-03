@@ -87,8 +87,10 @@ TRANSACTION_ITEM_SCHEMA: dict[str, Any] = {
     "additionalProperties": False,
     "properties": {
         "owner": {
-            "type": ["string", "null"],
-            "enum": ["self", "spouse", "dependent", "joint", None],
+            "anyOf": [
+                {"type": "string", "enum": ["self", "spouse", "dependent", "joint"]},
+                {"type": "null"},
+            ],
             "description": (
                 "Owner column. Blank means the filer -> 'self'. SP -> 'spouse'. "
                 "DC -> 'dependent'. JT -> 'joint'. Null only when the column is "

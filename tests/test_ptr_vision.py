@@ -214,12 +214,11 @@ def test_schema_declares_every_required_field() -> None:
         "exchange",
     ]
     assert item["properties"]["legibility"]["enum"] == ["clear", "partial", "illegible"]
-    assert item["properties"]["owner"]["enum"] == [
-        "self",
-        "spouse",
-        "dependent",
-        "joint",
-        None,
+    owner = item["properties"]["owner"]
+    assert "enum" not in owner  # a nullable enum must be anyOf, not type+enum with null
+    assert owner["anyOf"] == [
+        {"type": "string", "enum": ["self", "spouse", "dependent", "joint"]},
+        {"type": "null"},
     ]
 
 
