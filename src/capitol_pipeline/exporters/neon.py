@@ -3778,6 +3778,7 @@ def mark_house_stub_processed(
     last_error: str | None = None,
     raw_text_preview: str | None = None,
     parsed_transactions: list[dict[str, object]] | None = None,
+    metadata_extra: dict[str, object] | None = None,
 ) -> None:
     """Update a House stub after parsing so the site can surface its current state."""
 
@@ -3792,6 +3793,8 @@ def mark_house_stub_processed(
             "parsedTransactions": parsed_transactions or [],
         }
     )
+    if metadata_extra:
+        metadata.update(metadata_extra)
 
     update_house_stub_state(
         settings,

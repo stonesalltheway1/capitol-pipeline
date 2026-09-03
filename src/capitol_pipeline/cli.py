@@ -106,7 +106,8 @@ from capitol_pipeline.models.usaspending import (
     UsaspendingRecipientRecord,
 )
 from capitol_pipeline.normalizers.crypto_assets import classify_crypto_asset
-from capitol_pipeline.parsers.house_ptr import parse_house_ptr_pdf
+from capitol_pipeline.parsers.house_ptr import VISION_BACKENDS, parse_house_ptr_pdf
+from capitol_pipeline.parsers.ptr_vision import VISION_PARSER_VERSION
 from capitol_pipeline.processors.chunking import build_search_chunks
 from capitol_pipeline.processors.embeddings import get_embedder
 from capitol_pipeline.processors.headshots import (
@@ -267,6 +268,14 @@ def build_retry_after_iso(error: Exception, attempts: int) -> str:
     ).isoformat()
 
 
+VISION_BACKEND_HELP = (
+    "Claude vision transcription for scanned or handwritten PTRs. "
+    "'off' never calls the model; 'auto' calls it only when the text parser "
+    "scores under 0.5 or produced no OCR text; 'claude' always calls it. "
+    "Disable globally with CAPITOL_PTR_VISION_DISABLED=1."
+)
+
+
 def build_review_retry_after_iso(hours: int) -> str:
     """Return the next review retry time for a hard-to-parse House PTR."""
 
@@ -299,6 +308,7 @@ def parse_live_house_stub(
     stub: FilingStub,
     settings: Settings,
     ocr_backend: str,
+    vision_backend: str = "off",
 ) -> tuple[HousePtrParseResult, list[NormalizedTradeRow]]:
     """Download and parse a live House PTR filing."""
 
@@ -310,7 +320,33 @@ def parse_live_house_stub(
             stub=stub,
             settings=settings,
             backend=ocr_backend,
+            vision_backend=vision_backend,
         )
+
+
+def resolve_house_stub_status(
+    stub: FilingStub,
+    parsed: HousePtrParseResult,
+    trades: list[NormalizedTradeRow],
+) -> str:
+    """Decide whether a parsed House PTR leaves the review queue.
+
+    A vision transcription overrides the confidence threshold with the model's
+    own legibility verdict: more than half the rows illegible keeps the stub in
+    ``needs_review``, anything better marks it ``parsed``. A stub whose member
+    never resolved, or that produced no trade rows, can never be ``parsed``.
+    """
+
+    if not trades or not stub.member.id:
+        return "needs_review"
+    vision = parsed.vision_report
+    if (
+        parsed.parser_version == VISION_PARSER_VERSION
+        and isinstance(vision, dict)
+        and vision.get("ok")
+    ):
+        return "needs_review" if vision.get("needsReview") else "parsed"
+    return "parsed" if parsed.parser_confidence >= 0.6 else "needs_review"
 
 
 def persist_parsed_house_stub(
@@ -323,7 +359,10 @@ def persist_parsed_house_stub(
 
     sync_house_stubs_to_neon(settings, [stub])
     trade_summary = upsert_trade_rows_to_neon(settings, trades)
-    status = "parsed" if trades and stub.member.id and parsed.parser_confidence >= 0.6 else "needs_review"
+    status = resolve_house_stub_status(stub, parsed, trades)
+    metadata_extra: dict[str, object] | None = (
+        {"visionParse": parsed.vision_report} if parsed.vision_report else None
+    )
     mark_house_stub_processed(
         settings,
         stub,
@@ -338,11 +377,13 @@ def persist_parsed_house_stub(
         ),
         raw_text_preview=parsed.raw_text_preview,
         parsed_transactions=[transaction.model_dump() for transaction in parsed.transactions],
+        metadata_extra=metadata_extra,
     )
     return {
         "stubs": {"upserted": 1},
         "trades": trade_summary,
         "stubStatus": status,
+        "visionParse": parsed.vision_report,
     }
 
 
@@ -450,6 +491,7 @@ def process_house_queue_rows(
     with_search_index: bool = False,
     with_embeddings: bool = False,
     review_retry_hours: int = 12,
+    vision_backend: str = "off",
 ) -> dict[str, object]:
     """Process a batch of queued House PTR stubs from Neon."""
 
@@ -462,6 +504,10 @@ def process_house_queue_rows(
         "tradeRowsUpserted": 0,
         "searchDocumentsUpserted": 0,
         "searchChunksUpserted": 0,
+        "visionBackend": vision_backend,
+        "visionCalls": 0,
+        "visionRowsRecovered": 0,
+        "visionCostUsd": 0.0,
         "processed": [],
     }
 
@@ -495,9 +541,17 @@ def process_house_queue_rows(
         )
 
         try:
-            parsed, trades = parse_live_house_stub(stub, settings, ocr_backend)
+            parsed, trades = parse_live_house_stub(stub, settings, ocr_backend, vision_backend)
             upsert_summary = persist_parsed_house_stub(settings, stub, parsed, trades)
             status = str(upsert_summary["stubStatus"])
+            vision_report = parsed.vision_report if isinstance(parsed.vision_report, dict) else None
+            if vision_report:
+                summary["visionCalls"] += 1
+                summary["visionRowsRecovered"] += int(vision_report.get("rowCount") or 0)
+                summary["visionCostUsd"] = round(
+                    float(summary["visionCostUsd"]) + float(vision_report.get("costUsd") or 0.0),
+                    6,
+                )
             if status == "parsed":
                 summary["parsed"] += 1
                 if current_status == "needs_review":
@@ -554,7 +608,16 @@ def process_house_queue_rows(
                 "docId": stub.doc_id,
                 "status": status,
                 "tradeRows": trade_rows,
+                "parserVersion": parsed.parser_version,
             }
+            if vision_report:
+                processed_item["visionParse"] = {
+                    "ok": vision_report.get("ok"),
+                    "reason": vision_report.get("reason"),
+                    "rowCount": vision_report.get("rowCount"),
+                    "legibility": vision_report.get("legibility"),
+                    "costUsd": vision_report.get("costUsd"),
+                }
             if index_summary:
                 processed_item["searchDocumentId"] = (index_summary.get("document") or {}).get("document_id")  # type: ignore[union-attr]
                 processed_item["searchChunks"] = (index_summary.get("chunks") or {}).get("upserted", 0)  # type: ignore[union-attr]
@@ -2321,6 +2384,13 @@ def ocr_file(pdf_path: Path) -> None:
     default=OcrBackend.AUTO.value,
     show_default=True,
 )
+@click.option(
+    "--vision-backend",
+    type=click.Choice(VISION_BACKENDS),
+    default="off",
+    show_default=True,
+    help=VISION_BACKEND_HELP,
+)
 def parse_house_ptr_command(
     pdf_path: Path,
     doc_id: str,
@@ -2334,6 +2404,7 @@ def parse_house_ptr_command(
     district: str | None,
     upsert: bool,
     ocr_backend: str,
+    vision_backend: str,
 ) -> None:
     """OCR and parse a House PTR PDF into structured transactions."""
 
@@ -2358,6 +2429,7 @@ def parse_house_ptr_command(
         stub=stub,
         settings=settings,
         backend=ocr_backend,
+        vision_backend=vision_backend,
     )
 
     upsert_summary: dict[str, object] | None = None
@@ -2811,6 +2883,13 @@ def embed_search_corpus_command(
     default=OcrBackend.AUTO.value,
     show_default=True,
 )
+@click.option(
+    "--vision-backend",
+    type=click.Choice(VISION_BACKENDS),
+    default="off",
+    show_default=True,
+    help=VISION_BACKEND_HELP,
+)
 def process_house_backlog_command(
     limit: int,
     export_registry: bool,
@@ -2819,6 +2898,7 @@ def process_house_backlog_command(
     include_needs_review: bool,
     review_retry_hours: int,
     ocr_backend: str,
+    vision_backend: str,
 ) -> None:
     """Process queued House PTR stubs from Neon in batch order."""
 
@@ -2836,12 +2916,19 @@ def process_house_backlog_command(
         with_search_index=with_search_index,
         with_embeddings=with_embeddings,
         review_retry_hours=review_retry_hours,
+        vision_backend=vision_backend,
     )
     click.echo(json.dumps(summary, indent=2))
 
 
 @cli.command("process-house-review")
-@click.option("--limit", type=int, default=2, show_default=True)
+@click.option(
+    "--limit",
+    type=int,
+    default=2,
+    show_default=True,
+    help="Hard cap on filings per run. Every one may cost a vision call.",
+)
 @click.option("--export-registry/--no-export-registry", default=True, show_default=True)
 @click.option("--with-search-index/--no-search-index", default=True, show_default=True)
 @click.option("--with-embeddings/--no-embeddings", default=False, show_default=True)
@@ -2852,6 +2939,13 @@ def process_house_backlog_command(
     default=OcrBackend.DOCLING.value,
     show_default=True,
 )
+@click.option(
+    "--vision-backend",
+    type=click.Choice(VISION_BACKENDS),
+    default="auto",
+    show_default=True,
+    help=VISION_BACKEND_HELP,
+)
 def process_house_review_command(
     limit: int,
     export_registry: bool,
@@ -2859,6 +2953,7 @@ def process_house_review_command(
     with_embeddings: bool,
     review_retry_hours: int,
     ocr_backend: str,
+    vision_backend: str,
 ) -> None:
     """Reprocess the House PTR review queue with an alternate OCR backend."""
 
@@ -2876,6 +2971,7 @@ def process_house_review_command(
         with_search_index=with_search_index,
         with_embeddings=with_embeddings,
         review_retry_hours=review_retry_hours,
+        vision_backend=vision_backend,
     )
     summary["mode"] = "needs_review"
     click.echo(json.dumps(summary, indent=2))

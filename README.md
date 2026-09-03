@@ -15,6 +15,7 @@ PTR filings and asset normalization.
 - Official Senate eFD (efdsearch.senate.gov) scraper for Periodic Transaction Reports
 - Senate watcher and Quiver source adapters (both now legacy)
 - House PTR parser for text and PDF-backed filings
+- Claude vision transcription for scanned and handwritten PTRs the OCR chain cannot read
 - CapitolExposed-compatible member registry resolution
 - Crypto asset classifier for direct coins, ETFs and trusts, and adjacent equities
 - Bridge helpers that emit shapes compatible with CapitolExposed database tables
@@ -91,8 +92,18 @@ capitol-pipeline process-house-doc \
   --doc-id 20033783 \
   --upsert
 
+# Read a scanned or handwritten PTR with Claude vision instead of OCR
+capitol-pipeline parse-house-ptr ./scan.pdf \
+  --doc-id 20033783 \
+  --filing-year 2026 \
+  --member-name "Roger Williams" \
+  --vision-backend claude
+
 # Process a batch of queued House PTR stubs directly from CapitolExposed
 capitol-pipeline process-house-backlog --limit 10
+
+# Drain the needs_review queue, handing unreadable scans to Claude vision
+capitol-pipeline process-house-review --limit 5 --vision-backend auto
 
 # Create the pipeline-managed search schema in Neon
 capitol-pipeline ensure-search-schema
@@ -193,6 +204,57 @@ Relevant settings (all `CAPITOL_`-prefixed environment variables):
 - `CAPITOL_SENATE_EFD_MAX_REPORTS_PER_RUN`
 - `CAPITOL_SENATE_EFD_LOOKBACK_DAYS`
 - `CAPITOL_SENATE_EFD_FLOOR_DAYS`
+
+## House PTR Vision Path
+
+About 210 House PTRs sit in `house_filing_stubs.status = 'needs_review'` because
+they are photocopies or handwritten forms. The OCR chain returns fragments like
+`| 9 984 F 1 | Sale | 1 |`, the regex parser scores 0.0, and the filing is never
+turned into trade rows. `--vision-backend` sends the PDF itself to Claude as a
+`document` content block and asks for the transaction grid back as
+schema-constrained JSON.
+
+| Value | Behavior |
+|---|---|
+| `off` | Never calls the model. Default on `parse-house-ptr`, `process-house-backlog` and `house-ingest`. |
+| `auto` | Calls the model only when the text parser scored under 0.5 or produced no OCR text. **Default on `process-house-review`.** |
+| `claude` | Always calls the model for the filing, even when the text parser was confident. Use it to spot-check one document. |
+
+`--ocr-backend` is unchanged and still selects the OCR chain
+(`pymupdf` / `surya` / `olmocr` / `docling` / `auto`). The two flags are
+independent: the OCR pass always runs first and its text is what decides
+whether `auto` escalates.
+
+The escalation order inside `parse_house_ptr_pdf` is:
+
+1. OCR + the regex parser.
+2. If the regex found nothing but the OCR text layer is genuinely readable, the
+   existing Haiku 4.5 **text** fallback (`ptr_llm_fallback.py`) still runs.
+3. If the text is junk or the parse is weak and the vision backend is `auto` or
+   `claude`, the PDF goes to the vision model (`ptr_vision.py`).
+
+Vision rows are normalized through exactly the same helpers as text rows
+(`clean_asset_description`, `infer_asset_type`, `normalize_date`, the crypto
+classifier, member resolution from the stub), so they land with the same
+`tr-house-{doc_id}-{line}` ids and are indistinguishable in the `trades` table
+apart from `parser_version`.
+
+Settings:
+
+- `CAPITOL_PTR_VISION_DISABLED=1` — kill switch; the path skips with a reason
+  and the stub stays `needs_review`.
+- `CAPITOL_PTR_VISION_MODEL` — override the model (default `claude-sonnet-5`).
+- `ANTHROPIC_API_KEY` (or `ANTHROPIC_AUTH_TOKEN`) — required; without it the
+  path skips rather than failing the run.
+
+Guardrails: one filing per call, PDFs over 25 pages or 20 MB are skipped with a
+reason, one retry on 429/5xx, and `--limit` caps filings per run.
+
+Every attempt is recorded on the stub under `metadata.visionParse` with the
+model, token usage, estimated cost, per-row legibility counts, and the skip
+reason when it did not run. A filing leaves the review queue when the model
+rated more than half its rows legible; otherwise it stays `needs_review` with
+the transcription attached for a human.
 
 ## Search Layer
 

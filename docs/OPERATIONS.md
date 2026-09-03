@@ -11,6 +11,8 @@ CapitolExposed's Neon database. The production path should be:
 
 - `DATABASE_URL`
 - `OPENAI_API_KEY`
+- `ANTHROPIC_API_KEY` (only for the House PTR vision review path; without it the
+  vision step skips instead of failing)
 
 ## Scheduled workflows
 
@@ -63,6 +65,95 @@ Offshore corpus needs a fresh rebuild.
 - Corpus refresh twice daily
 - Offshore match refresh weekly
 - Offshore full raw ingest only when the upstream ICIJ archive changes
+
+## House PTR review queue (Claude vision)
+
+Roughly 210 House PTRs are stuck in `house_filing_stubs.status = 'needs_review'`
+because they are scanned or handwritten. OCR produces junk, the regex parser
+scores 0.0, and re-running OCR with a different backend does not help. Those
+filings are readable by a vision model, so `process-house-review` can hand the
+PDF straight to Claude.
+
+Drain the queue in small, capped batches:
+
+```bash
+python -u -m capitol_pipeline process-house-review \
+  --limit 5 \
+  --ocr-backend pymupdf \
+  --vision-backend auto \
+  --with-search-index \
+  --no-embeddings
+```
+
+`--ocr-backend` still selects the OCR chain and `--vision-backend` is a separate
+flag for the Claude transcription path:
+
+- `off` — never call the model (the default everywhere except this command).
+- `auto` — call it only when the text parser scored under 0.5 or the OCR text
+  was empty. The default for `process-house-review`.
+- `claude` — always call it for the filing. Use it to spot-check one document
+  with `parse-house-ptr --vision-backend claude`.
+
+`--ocr-backend pymupdf` is the cheap choice here: on a scan the OCR pass has
+nothing to find, so there is no point paying for `docling`. Keep
+`--ocr-backend docling` when you want one more genuine OCR attempt first.
+
+Required environment on the box:
+
+- `ANTHROPIC_API_KEY` (or `ANTHROPIC_AUTH_TOKEN`). Without it the vision path
+  skips with a reason instead of failing the run.
+- `CAPITOL_PTR_VISION_MODEL` — optional model override; defaults to
+  `claude-sonnet-5`.
+- `CAPITOL_PTR_VISION_DISABLED=1` — kill switch. Set it and every filing is
+  skipped with `reason: disabled by CAPITOL_PTR_VISION_DISABLED` and stays in
+  the queue. Use this first if spend or output quality looks wrong; you do not
+  need to redeploy.
+
+Guardrails, in order: the env kill switch, missing credentials, PDFs over 20 MB,
+PDFs over 25 pages, one filing per call, one retry on 429/5xx, and `--limit` as
+the hard per-run cap. Skipped filings keep `needs_review` and record why.
+
+### Reading the summary JSON
+
+`process-house-review` adds four fields on top of the usual counters:
+
+- `visionBackend` — which mode the run used
+- `visionCalls` — filings where a vision attempt was recorded (including skips)
+- `visionRowsRecovered` — transactions transcribed
+- `visionCostUsd` — estimated spend for the run
+
+Per filing, `processed[].parserVersion` is `claude-sonnet-5-vision-v1` when the
+rows came from vision rather than the regex or Haiku text paths, and
+`processed[].visionParse` carries the row count, legibility counts, cost, and
+skip reason.
+
+### Where cost is recorded
+
+Cost is estimated in the pipeline, not read back from a bill. Every attempt
+writes `house_filing_stubs.metadata.visionParse` with token usage
+(`inputTokens`, `cacheReadTokens`, `cacheWriteTokens`, `outputTokens`), the
+`costUsd` estimate, and the `pricing` block the estimate used, so an old row
+still explains itself if rates change. Claude Sonnet 5 is $2 / $10 per MTok,
+cache reads bill at 0.1x input and cache writes at 1.25x input. The ~2,000-token
+system prompt is sent with `cache_control: ephemeral`, so after the first filing
+in a run it should show up as `cacheReadTokens`, not `inputTokens`.
+
+Query the running total:
+
+```sql
+SELECT count(*) AS filings,
+       round(sum((metadata->'visionParse'->>'costUsd')::numeric), 4) AS usd
+FROM house_filing_stubs
+WHERE metadata->'visionParse' IS NOT NULL;
+```
+
+### When a filing stays in needs_review
+
+The model rates each row `clear`, `partial`, or `illegible`. More than half the
+rows `illegible` keeps the stub `needs_review` with the transcription attached
+under `metadata.parsedTransactions` for a human to check; anything better marks
+it `parsed`. A stub whose member never resolved can never be marked `parsed`
+regardless of legibility — fix the member registry first.
 
 ## Senate trades
 
@@ -141,6 +232,7 @@ be updated to match or the site and the pipeline will disagree about trade ids.
 ```bash
 python -u -m capitol_pipeline corpus-status
 python -u -m capitol_pipeline house-ingest --year 2026 --batch-size 25 --max-batches 6
+python -u -m capitol_pipeline process-house-review --limit 5 --ocr-backend pymupdf --vision-backend auto
 python -u -m capitol_pipeline senate-ingest --provider efd --with-search-index --no-embeddings
 python -u -m capitol_pipeline dedupe-senate-trades --dry-run
 python -u -m capitol_pipeline ingest-fara --mode bulk --skip-existing --with-match-index
@@ -176,3 +268,11 @@ python -u -m capitol_pipeline embed-search-corpus --batch-size 100 --max-batches
   session cookie, which is what happens if the site changes that form.
 - If the House Clerk feed references a PDF before it is published, the stub is
   deferred and retried later. That is expected behavior.
+- If `process-house-review` reports `visionCalls: 0` while filings stay in the
+  queue, read `metadata.visionParse.reason` on one of them. The usual causes are
+  the `CAPITOL_PTR_VISION_DISABLED` kill switch, a missing `ANTHROPIC_API_KEY`,
+  or a filing over the 25-page / 20 MB guardrail.
+- If `visionCostUsd` climbs faster than expected, check that
+  `visionParse.usage.cacheReadTokens` is non-zero after the first filing in a
+  run. Zero cache reads across a batch means the cached system prefix is being
+  invalidated and every filing is paying full input price.

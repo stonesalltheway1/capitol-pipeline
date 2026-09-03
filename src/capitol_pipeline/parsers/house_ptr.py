@@ -17,12 +17,30 @@ from capitol_pipeline.models.congress import (
 )
 from capitol_pipeline.normalizers.crypto_assets import classify_crypto_asset
 from capitol_pipeline.parsers.ptr_llm_fallback import extract_via_haiku
+from capitol_pipeline.parsers.ptr_vision import (
+    VISION_PARSER_VERSION,
+    build_vision_metadata,
+    extract_via_vision,
+)
 from capitol_pipeline.processors.ocr import fix_font_mojibake, OcrProcessor
 
 logger = logging.getLogger(__name__)
 
 REGEX_PARSER_VERSION = "regex-v1"
 LLM_PARSER_VERSION = "haiku-4.5-fallback-v1"
+
+#: Vision parser selection. ``off`` never calls the model, ``auto`` calls it
+#: only when the text path failed, ``claude`` always calls it for the filing.
+VISION_BACKENDS: tuple[str, ...] = ("off", "auto", "claude")
+
+#: Text-parser confidence below which ``auto`` hands the PDF to the vision model.
+VISION_CONFIDENCE_FLOOR = 0.5
+
+#: Below this much readable OCR text the text layer is treated as junk and the
+#: Haiku text fallback is skipped in favour of reading the pages as images.
+MIN_DECENT_OCR_CHARS = 400
+MIN_DECENT_OCR_WORDS = 40
+MIN_DECENT_OCR_ALPHA_RATIO = 0.55
 
 _LLM_OWNER_MAP: dict[str, str] = {
     "self": "self",
@@ -31,6 +49,20 @@ _LLM_OWNER_MAP: dict[str, str] = {
     "dependent": "child",
     "trust": "self",
     "unknown": "self",
+}
+
+_VISION_OWNER_MAP: dict[str, str] = {
+    "self": "self",
+    "spouse": "spouse",
+    "dependent": "child",
+    "joint": "joint",
+}
+
+_VISION_TRANSACTION_TYPE_MAP: dict[str, str] = {
+    "purchase": "purchase",
+    "sale": "sale",
+    "sale_partial": "sale",
+    "exchange": "exchange",
 }
 
 def _range_pattern(low: str, high: str) -> re.Pattern[str]:
@@ -514,11 +546,143 @@ def _run_llm_fallback(
     return parsed, build_trade_rows_from_house_ptr(parsed, stub)
 
 
+def ocr_text_is_decent(text: str | None) -> bool:
+    """Return whether an OCR text layer is worth handing to the text fallback.
+
+    Scanned PTRs come back as fragments like ``| 9 984 F 1 | Sale | 1 |``: long
+    enough to look like output, useless to a text model. Those go straight to
+    the vision path instead.
+    """
+
+    stripped = (text or "").strip()
+    if len(stripped) < MIN_DECENT_OCR_CHARS:
+        return False
+    meaningful = [char for char in stripped if not char.isspace()]
+    if not meaningful:
+        return False
+    alpha_ratio = sum(1 for char in meaningful if char.isalpha()) / len(meaningful)
+    if alpha_ratio < MIN_DECENT_OCR_ALPHA_RATIO:
+        return False
+    return len(re.findall(r"[A-Za-z]{3,}", stripped)) >= MIN_DECENT_OCR_WORDS
+
+
+def _vision_owner(raw: object) -> str:
+    value = str(raw or "").strip().lower()
+    return _VISION_OWNER_MAP.get(value, "self")
+
+
+def _vision_transaction_type(raw: object) -> str:
+    value = str(raw or "").strip().lower()
+    return _VISION_TRANSACTION_TYPE_MAP.get(value, "purchase")
+
+
+def _vision_to_transactions(payload: list[dict]) -> list[HousePtrTransaction]:
+    """Normalize vision rows through the same helpers the text parser uses."""
+
+    out: list[HousePtrTransaction] = []
+    for index, raw_row in enumerate(payload, start=1):
+        if not isinstance(raw_row, dict):
+            continue
+        ticker = raw_row.get("ticker")
+        ticker = ticker.strip().upper() if isinstance(ticker, str) and ticker.strip() else None
+        description = clean_asset_description(
+            str(raw_row.get("asset_description") or "").strip(),
+            ticker,
+        )
+        if not description:
+            continue
+        amount_min, amount_max = _llm_amount_bounds(
+            raw_row.get("amount_min"), raw_row.get("amount_max")
+        )
+        out.append(
+            HousePtrTransaction(
+                line_number=index,
+                asset_description=description,
+                ticker=ticker,
+                asset_type=infer_asset_type(raw_row.get("asset_type_code")),
+                transaction_type=_vision_transaction_type(raw_row.get("transaction_type")),  # type: ignore[arg-type]
+                transaction_date=normalize_date(raw_row.get("transaction_date")),
+                notification_date=normalize_date(raw_row.get("notification_date")),
+                amount_min=amount_min,
+                amount_max=amount_max,
+                owner=_vision_owner(raw_row.get("owner")),  # type: ignore[arg-type]
+            )
+        )
+    return out
+
+
+def _run_vision_parse(
+    pdf_path: Path,
+    stub: FilingStub,
+    text_preview: str,
+) -> tuple[tuple[HousePtrParseResult, list[NormalizedTradeRow]] | None, dict[str, object]]:
+    """Transcribe a PDF with Claude vision.
+
+    Returns ``(result_or_None, metadata)``. The metadata is always returned so
+    the caller can record the attempt -- including a skip reason -- on the stub
+    even when no usable rows came back.
+    """
+
+    try:
+        report = extract_via_vision(pdf_path)
+    except Exception as exc:  # pragma: no cover - defensive
+        logger.exception("house_ptr vision: extract_via_vision raised: %s", exc)
+        return None, {"ok": False, "skipped": True, "reason": f"vision parser raised: {exc}"}
+
+    metadata = build_vision_metadata(report)
+
+    raw_transactions = report.get("transactions") or []
+    if not raw_transactions:
+        logger.info(
+            "house_ptr vision: no rows recovered for %s (reason=%r cost=$%.4f)",
+            pdf_path.name,
+            report.get("reason"),
+            float(report.get("cost_usd") or 0.0),
+        )
+        return None, metadata
+
+    transactions = dedupe_transactions(stub, _vision_to_transactions(raw_transactions))
+    valid_transactions = [
+        transaction
+        for transaction in transactions
+        if get_transaction_date_issue(transaction.transaction_date, stub.filing_date) is None
+    ]
+    if not valid_transactions:
+        logger.info("house_ptr vision: all rows filtered as invalid for %s", pdf_path.name)
+        metadata["reason"] = "every transcribed row failed date validation"
+        metadata["needsReview"] = True
+        return None, metadata
+
+    confidence = float(report.get("confidence") or 0.0)
+    parsed = HousePtrParseResult(
+        doc_id=stub.doc_id,
+        member_name=parse_header_name(text_preview) or stub.member.name,
+        state=parse_header_state(text_preview) or stub.member.state,
+        parser_confidence=confidence,
+        parser_version=VISION_PARSER_VERSION,
+        raw_text_preview=text_preview[:1200],
+        transactions=valid_transactions,
+        vision_report=metadata,
+    )
+    logger.info(
+        "house_ptr vision: recovered %d rows for %s "
+        "(parser_version=%s parser_confidence=%.2f needsReview=%s cost=$%.4f)",
+        len(valid_transactions),
+        pdf_path.name,
+        VISION_PARSER_VERSION,
+        confidence,
+        metadata.get("needsReview"),
+        float(report.get("cost_usd") or 0.0),
+    )
+    return (parsed, build_trade_rows_from_house_ptr(parsed, stub)), metadata
+
+
 def parse_house_ptr_pdf(
     pdf_path: Path,
     stub: FilingStub,
     settings: Settings | None = None,
     backend: str | OcrBackend = OcrBackend.AUTO,
+    vision_backend: str = "off",
 ) -> tuple[HousePtrParseResult, list[NormalizedTradeRow]]:
     settings = settings or Settings()
     processor = OcrProcessor(settings, backend=backend)
@@ -526,23 +690,59 @@ def parse_house_ptr_pdf(
     text = result.document.ocrText if result.document and result.document.ocrText else ""
     parsed, rows = parse_house_ptr_text(text, stub)
 
-    if parsed.transactions:
-        return parsed, rows
+    mode = str(vision_backend or "off").strip().lower()
+    if mode not in VISION_BACKENDS:
+        mode = "off"
+    force_vision = mode == "claude"
+    vision_enabled = mode in {"auto", "claude"}
 
     text_has_content = bool((text or "").strip())
-    if not text_has_content:
+    decent_text = ocr_text_is_decent(text)
+    weak_text_parse = (
+        not parsed.transactions
+        or not text_has_content
+        or parsed.parser_confidence < VISION_CONFIDENCE_FLOOR
+    )
+
+    if not weak_text_parse and not force_vision:
+        return parsed, rows
+
+    # The Haiku text fallback still owns the case the regex missed but the OCR
+    # text layer is genuinely readable. Skip it when the caller forced vision.
+    if not parsed.transactions and decent_text and not force_vision:
         logger.debug(
-            "house_ptr: no OCR text for %s; invoking LLM fallback unconditionally",
-            pdf_path.name,
-        )
-    else:
-        logger.debug(
-            "house_ptr: regex found 0 rows despite %d chars of text for %s; invoking LLM fallback",
+            "house_ptr: regex found 0 rows despite %d chars of usable text for %s; "
+            "invoking the Haiku text fallback",
             len(text),
             pdf_path.name,
         )
+        fallback = _run_llm_fallback(pdf_path, stub, normalize_text(text))
+        if fallback is not None:
+            return fallback
 
-    fallback = _run_llm_fallback(pdf_path, stub, normalize_text(text))
-    if fallback is None:
-        return parsed, rows
-    return fallback
+    if vision_enabled:
+        logger.debug(
+            "house_ptr: handing %s to the vision parser (mode=%s confidence=%.2f textChars=%d)",
+            pdf_path.name,
+            mode,
+            parsed.parser_confidence,
+            len(text or ""),
+        )
+        vision_result, vision_metadata = _run_vision_parse(pdf_path, stub, normalize_text(text))
+        if vision_result is not None:
+            return vision_result
+        # Record the attempt even though it produced nothing usable.
+        parsed = parsed.model_copy(update={"vision_report": vision_metadata})
+
+    # Vision is off, unavailable, or empty-handed: fall back to Haiku on the
+    # raw text exactly as this parser did before the vision path existed.
+    if not parsed.transactions and not decent_text:
+        logger.debug(
+            "house_ptr: no usable OCR text for %s; invoking the Haiku text fallback",
+            pdf_path.name,
+        )
+        fallback = _run_llm_fallback(pdf_path, stub, normalize_text(text))
+        if fallback is not None:
+            return fallback
+
+    return parsed, rows

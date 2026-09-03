@@ -90,6 +90,10 @@ class HousePtrParseResult(BaseModel):
     parser_version: str = "regex-v1"
     raw_text_preview: str | None = None
     transactions: list[HousePtrTransaction] = Field(default_factory=list)
+    # Compact record of a Claude vision transcription attempt (model, usage,
+    # estimated cost, legibility counts, skip reason). Written to the stub's
+    # ``metadata.visionParse``; None whenever the vision path never ran.
+    vision_report: dict[str, object] | None = None
 
 
 class NormalizedAsset(BaseModel):
