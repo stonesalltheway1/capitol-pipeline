@@ -175,7 +175,6 @@ from capitol_pipeline.sources.senate_ethics import (
     normalize_senate_watcher_trade,
 )
 from capitol_pipeline.sources.usaspending import (
-from capitol_pipeline.members_historical import sync_members_historical_command
     DEFAULT_USASPENDING_END_DATE,
     DEFAULT_USASPENDING_START_DATE,
     UsaspendingApiClient,
@@ -3342,5 +3341,7 @@ def sync_member_headshots_command(
 
 if __name__ == "__main__":
     cli()
+
+from capitol_pipeline.members_historical import sync_members_historical_command  # noqa: E402
 
 cli.add_command(sync_members_historical_command)
