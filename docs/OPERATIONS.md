@@ -102,8 +102,8 @@ Required environment on the box:
 
 - `ANTHROPIC_API_KEY` (or `ANTHROPIC_AUTH_TOKEN`). Without it the vision path
   skips with a reason instead of failing the run.
-- `CAPITOL_PTR_VISION_MODEL` — optional model override; defaults to
-  `claude-sonnet-5`.
+- `CAPITOL_PTR_VISION_MODEL` — optional read-model override; defaults to
+  `claude-opus-5`. Orientation detection always uses `claude-haiku-4-5`.
 - `CAPITOL_PTR_VISION_DISABLED=1` — kill switch. Set it and every filing is
   skipped with `reason: disabled by CAPITOL_PTR_VISION_DISABLED` and stays in
   the queue. Use this first if spend or output quality looks wrong; you do not
@@ -122,10 +122,14 @@ the hard per-run cap. Skipped filings keep `needs_review` and record why.
 - `visionRowsRecovered` — transactions transcribed
 - `visionCostUsd` — estimated spend for the run
 
-Per filing, `processed[].parserVersion` is `claude-sonnet-5-vision-v1` when the
-rows came from vision rather than the regex or Haiku text paths, and
-`processed[].visionParse` carries the row count, legibility counts, cost, and
-skip reason.
+Per filing, `processed[].parserVersion` is `claude-vision-v2` (older rows carry
+`claude-sonnet-5-vision-v1`; anything starting `claude-` and containing
+`vision` is the vision path) when the rows came from vision rather than the
+regex or Haiku text paths, and `processed[].visionParse` carries the row count,
+legibility counts, cost, and skip reason. The full `metadata.visionParse` record
+also has `orientation` (rotation and method per page), `readAgreement`
+(`rowsA`, `rowsB`, `matched`, `fieldDisagreements`), and `calls` (usage and cost
+per orientation call and per read).
 
 ### Where cost is recorded
 
@@ -133,10 +137,13 @@ Cost is estimated in the pipeline, not read back from a bill. Every attempt
 writes `house_filing_stubs.metadata.visionParse` with token usage
 (`inputTokens`, `cacheReadTokens`, `cacheWriteTokens`, `outputTokens`), the
 `costUsd` estimate, and the `pricing` block the estimate used, so an old row
-still explains itself if rates change. Claude Sonnet 5 is $2 / $10 per MTok,
-cache reads bill at 0.1x input and cache writes at 1.25x input. The ~2,000-token
-system prompt is sent with `cache_control: ephemeral`, so after the first filing
-in a run it should show up as `cacheReadTokens`, not `inputTokens`.
+still explains itself if rates change. Claude Opus 5 is $5 / $25 per MTok and
+Claude Haiku 4.5 (orientation only) $1 / $5; cache reads bill at 0.1x input and
+cache writes at 1.25x input. Every filing costs two Opus reads plus one or two
+Haiku calls per page, and `usage` / `costUsd` are the sum across all of them.
+The ~2,000-token system prompt is sent with `cache_control: ephemeral`, so after
+the first read of a run it should show up as `cacheReadTokens`, not
+`inputTokens`.
 
 Query the running total:
 

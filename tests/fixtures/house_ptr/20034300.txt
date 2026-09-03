@@ -1,0 +1,110 @@
+Periodic Transaction Report
+Clerk of the House of Representatives • Legislative Resource Center • B81 Cannon Building • Washington, DC 20515
+Filer Information
+Name:
+Hon. Kelly Louise Morrison
+Status:
+Member
+State/District: MN03
+Transactions
+ID
+Owner Asset
+Transaction
+Type
+Date
+Notification
+Date
+Amount
+Cap.
+Gains >
+$200?
+JT
+Artistry in Motion, LLC [OI]
+P
+04/15/2026
+04/15/2026
+$50,001 -
+$100,000
+Filing Status: New
+Subholding Of: Investment Fund 1
+Description: Live events special effects, Northridge, CA
+JT
+Cavall [OI]
+P
+04/14/2026
+04/14/2026
+$1,001 - $15,000
+Filing Status: New
+Subholding Of: Investment Fund 1
+Description: Sports Software, London, UK
+JT
+Hermeus Corp [OI]
+S
+05/04/2026 05/01/2026
+$15,001 -
+$50,000
+Filing Status: New
+Subholding Of: Investment Fund 1
+Description: High speed aircraft manufacturer, Atlanta, GA
+JT
+Pelvital USA, Inc. [OI]
+P
+04/17/2026
+04/17/2026
+$15,001 -
+$50,000
+Filing Status: New
+Subholding Of: Investment Fund 1
+Description: Medical devices, Minneapolis, MN
+JT
+Saronic Technologies [OI]
+S
+05/04/2026 05/01/2026
+$15,001 -
+$50,000
+Filing Status: New
+Subholding Of: Investment Fund 1
+Description: Autonomous maritime vessels, Austin, TX
+Filing ID #20034300
+
+
+ID
+Owner Asset
+Transaction
+Type
+Date
+Notification
+Date
+Amount
+Cap.
+Gains >
+$200?
+JT
+Star Catcher Industries, Inc. [OI]
+S
+05/04/2026 05/01/2026
+$15,001 -
+$50,000
+Filing Status: New
+Subholding Of: Investment Fund 1
+Description: Energy infrastructure in space, Jacksonville, FL
+JT
+Star Catcher Industries, Inc. [OI]
+P
+04/06/2026 04/06/2026
+$15,001 -
+$50,000
+Filing Status: New
+Subholding Of: Investment Fund 1
+Description: Energy infrastructure in space, Jacksonville, FL
+* For the complete list of asset type abbreviations, please visit https://fd.house.gov/reference/asset-type-codes.aspx.
+Investment Vehicle Details
+Investment Fund 1 (Owner: JT)
+Location: US
+Initial Public Offerings
+ Yes 
+ No
+Certification and Signature
+ I CERTIFY that the statements I have made on the attached Periodic Transaction Report are true, complete, and correct to the best of
+my knowledge and belief. Further, I CERTIFY that I have disclosed all transactions as required by the STOCK Act.
+Digitally Signed: Hon. Kelly Louise Morrison , 05/05/2026

@@ -107,7 +107,7 @@ from capitol_pipeline.models.usaspending import (
 )
 from capitol_pipeline.normalizers.crypto_assets import classify_crypto_asset
 from capitol_pipeline.parsers.house_ptr import VISION_BACKENDS, parse_house_ptr_pdf
-from capitol_pipeline.parsers.ptr_vision import VISION_PARSER_VERSION
+from capitol_pipeline.parsers.ptr_vision import is_vision_parser_version
 from capitol_pipeline.processors.chunking import build_search_chunks
 from capitol_pipeline.processors.embeddings import get_embedder
 from capitol_pipeline.processors.headshots import (
@@ -341,7 +341,7 @@ def resolve_house_stub_status(
         return "needs_review"
     vision = parsed.vision_report
     if (
-        parsed.parser_version == VISION_PARSER_VERSION
+        is_vision_parser_version(parsed.parser_version)
         and isinstance(vision, dict)
         and vision.get("ok")
     ):

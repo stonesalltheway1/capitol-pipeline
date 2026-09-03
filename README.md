@@ -233,6 +233,17 @@ The escalation order inside `parse_house_ptr_pdf` is:
 3. If the text is junk or the parse is weak and the vision backend is `auto` or
    `claude`, the PDF goes to the vision model (`ptr_vision.py`).
 
+The vision path (`parser_version` `claude-vision-v2`) renders each page with
+pymupdf to a PNG (150 DPI, long edge capped at 1568 px), asks `claude-haiku-4-5`
+which way the scan must turn to read upright (falling back to "a portrait page
+is a sideways landscape form, rotate 90"), and sends the upright images to
+`claude-opus-5` **twice** as independent requests. Rows are matched across the
+two reads by asset description; a field is only kept when both reads agree, a
+disagreement on the date, type, or amount nulls the field and marks the row
+`illegible`, a row only one read saw is kept but marked `illegible`, and a
+row-count mismatch or any critical disagreement keeps the stub in review. When
+pymupdf is unavailable the PDF is sent as a `document` block instead.
+
 Vision rows are normalized through exactly the same helpers as text rows
 (`clean_asset_description`, `infer_asset_type`, `normalize_date`, the crypto
 classifier, member resolution from the stub), so they land with the same
@@ -243,7 +254,7 @@ Settings:
 
 - `CAPITOL_PTR_VISION_DISABLED=1` — kill switch; the path skips with a reason
   and the stub stays `needs_review`.
-- `CAPITOL_PTR_VISION_MODEL` — override the model (default `claude-sonnet-5`).
+- `CAPITOL_PTR_VISION_MODEL` — override the read model (default `claude-opus-5`).
 - `ANTHROPIC_API_KEY` (or `ANTHROPIC_AUTH_TOKEN`) — required; without it the
   path skips rather than failing the run.
 

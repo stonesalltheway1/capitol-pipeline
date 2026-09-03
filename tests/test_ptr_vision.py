@@ -2,12 +2,17 @@
 
 Every test patches ``ptr_vision._client_once`` (the module-level client
 factory) so the request kwargs are inspectable and no network call is made.
-The database exporter is never touched; only the pure status helper is.
+The fake client answers ``messages.stream`` (the transcription reads, cycled
+through a list of payloads so the two reads can differ) and
+``messages.create`` (the Haiku orientation question). The database exporter is
+never touched; only the pure status helper is.
 """
 
 from __future__ import annotations
 
+import base64
 import json
+import struct
 from pathlib import Path
 from typing import Any
 
@@ -20,13 +25,20 @@ from capitol_pipeline.parsers import house_ptr, ptr_vision
 from capitol_pipeline.parsers.house_ptr import parse_house_ptr_text
 from capitol_pipeline.parsers.ptr_vision import (
     MODEL_ID,
+    ORIENTATION_MODEL_ID,
     PTR_VISION_SCHEMA,
     VISION_PARSER_VERSION,
     build_vision_metadata,
+    detect_orientation,
     estimate_cost_usd,
     extract_via_vision,
+    is_vision_parser_version,
     legibility_confidence,
     majority_illegible,
+    match_rows,
+    orientation_heuristic,
+    pricing_for_model,
+    reconcile_reads,
     summarize_legibility,
 )
 
@@ -56,6 +68,34 @@ CHEVRON_VISION_ROW: dict[str, Any] = {
     "legibility": "clear",
 }
 
+ATT_ROW: dict[str, Any] = {
+    "owner": "self",
+    "asset_description": "AT&T",
+    "ticker": None,
+    "asset_type_code": None,
+    "transaction_type": "purchase",
+    "transaction_date": "2022-01-06",
+    "notification_date": "2023-07-22",
+    "amount_min": 1001,
+    "amount_max": 15000,
+    "cap_gains_over_200": None,
+    "comment": None,
+    "legibility": "partial",
+}
+
+GE_ROW: dict[str, Any] = {
+    **ATT_ROW,
+    "asset_description": "General Electric",
+    "transaction_type": "sale_partial",
+}
+
+
+def _payload(*rows: dict[str, Any], **header: Any) -> dict[str, Any]:
+    base = {"filer_name": None, "filing_date": None, "page_count": 1, "notes": None}
+    base.update(header)
+    base["transactions"] = list(rows)
+    return base
+
 
 # ---------------------------------------------------------------------------
 # Fake Anthropic client
@@ -72,11 +112,11 @@ class _Block:
 
 
 class _Usage:
-    def __init__(self) -> None:
-        self.input_tokens = 4_000
+    def __init__(self, *, input_tokens: int = 4_000, output_tokens: int = 800) -> None:
+        self.input_tokens = input_tokens
         self.cache_read_input_tokens = 2_000
         self.cache_creation_input_tokens = 1_000
-        self.output_tokens = 800
+        self.output_tokens = output_tokens
 
 
 class _Message:
@@ -90,8 +130,20 @@ class _Message:
         self.usage = _Usage()
 
 
+class _OrientationMessage:
+    """What ``messages.create`` returns for the Haiku orientation question."""
+
+    def __init__(self, answer: str) -> None:
+        self.content = [_Block("text", text=answer)]
+        self.stop_reason = "end_turn"
+        self.stop_details = None
+        self.usage = _Usage(input_tokens=1_500, output_tokens=2)
+        self.usage.cache_read_input_tokens = 0
+        self.usage.cache_creation_input_tokens = 0
+
+
 class _StreamManager:
-    def __init__(self, message: _Message) -> None:
+    def __init__(self, message: Any) -> None:
         self._message = message
 
     def __enter__(self) -> "_StreamManager":
@@ -100,38 +152,86 @@ class _StreamManager:
     def __exit__(self, *_exc: object) -> bool:
         return False
 
-    def get_final_message(self) -> _Message:
+    def get_final_message(self) -> Any:
         return self._message
 
 
 class _Messages:
-    def __init__(self, message: _Message, captured: dict, calls: list[int]) -> None:
-        self._message = message
+    def __init__(
+        self,
+        messages: list[Any],
+        captured: list[dict],
+        calls: list[int],
+        *,
+        orientation_answers: list[str],
+        orientation_error: Exception | None,
+        orientation_requests: list[dict],
+    ) -> None:
+        self._messages = messages
         self._captured = captured
         self._calls = calls
+        self._orientation_answers = orientation_answers
+        self._orientation_error = orientation_error
+        self._orientation_requests = orientation_requests
 
     def stream(self, **kwargs: Any) -> _StreamManager:
+        index = len(self._calls)
         self._calls.append(1)
-        self._captured.update(kwargs)
-        return _StreamManager(self._message)
+        self._captured.append(kwargs)
+        return _StreamManager(self._messages[min(index, len(self._messages) - 1)])
+
+    def create(self, **kwargs: Any) -> _OrientationMessage:
+        index = len(self._orientation_requests)
+        self._orientation_requests.append(kwargs)
+        if self._orientation_error is not None:
+            raise self._orientation_error
+        answers = self._orientation_answers
+        return _OrientationMessage(answers[min(index, len(answers) - 1)])
 
 
 class _FakeClient:
-    def __init__(self, message: _Message, captured: dict, calls: list[int]) -> None:
-        self.messages = _Messages(message, captured, calls)
+    def __init__(self, messages: _Messages) -> None:
+        self.messages = messages
+
+
+class _Captured(list):
+    """A list of read kwargs that also carries the orientation requests."""
+
+    orientation_requests: list[dict]
 
 
 def _install_fake_client(
     monkeypatch: pytest.MonkeyPatch,
-    payload: dict,
+    payloads: dict | list[dict],
     *,
     stop_reason: str = "end_turn",
-) -> tuple[dict, list[int]]:
-    captured: dict = {}
+    orientation: str | list[str] = "0",
+    orientation_error: Exception | None = None,
+) -> tuple[list[dict], list[int]]:
+    """Install a fake client. Returns ``(captured_read_kwargs, read_calls)``.
+
+    ``payloads`` is one payload (both reads identical) or a list, one per read.
+    ``orientation`` is the text Haiku answers with (a list cycles per call).
+    The orientation requests are attached to the returned list as
+    ``captured.orientation_requests`` for tests that need them.
+    """
+
+    payload_list = payloads if isinstance(payloads, list) else [payloads]
+    captured = _Captured()
     calls: list[int] = []
-    client = _FakeClient(_Message(payload, stop_reason=stop_reason), captured, calls)
+    orientation_requests: list[dict] = []
+    messages = _Messages(
+        [_Message(payload, stop_reason=stop_reason) for payload in payload_list],
+        captured,
+        calls,
+        orientation_answers=orientation if isinstance(orientation, list) else [orientation],
+        orientation_error=orientation_error,
+        orientation_requests=orientation_requests,
+    )
+    client = _FakeClient(messages)
     monkeypatch.setattr(ptr_vision, "_client", None)
     monkeypatch.setattr(ptr_vision, "_client_once", lambda: client)
+    captured.orientation_requests = orientation_requests  # type: ignore[attr-defined]
     return captured, calls
 
 
@@ -142,9 +242,33 @@ def _enable(monkeypatch: pytest.MonkeyPatch) -> None:
 
 
 def _write_pdf(tmp_path: Path, name: str = "scan.pdf") -> Path:
+    """A PDF stub pymupdf cannot render: exercises the document-block fallback."""
+
     pdf = tmp_path / name
     pdf.write_bytes(b"%PDF-1.4\n%\xe2\xe3\xcf\xd3\ntrailer\n%%EOF\n")
     return pdf
+
+
+def _write_real_pdf(tmp_path: Path, *, portrait: bool = True, pages: int = 1) -> Path:
+    """A real one-or-more page PDF rendered by pymupdf: exercises the image path."""
+
+    fitz = pytest.importorskip("fitz")
+    document = fitz.open()
+    width, height = (612, 792) if portrait else (792, 612)
+    for index in range(pages):
+        page = document.new_page(width=width, height=height)
+        page.insert_text((72, 100), f"PERIODIC TRANSACTION REPORT page {index + 1}", fontsize=18)
+    pdf = tmp_path / "real.pdf"
+    document.save(str(pdf))
+    document.close()
+    return pdf
+
+
+def _png_size(png_b64: str) -> tuple[int, int]:
+    raw = base64.b64decode(png_b64)
+    assert raw[:8] == b"\x89PNG\r\n\x1a\n"
+    width, height = struct.unpack(">II", raw[16:24])
+    return width, height
 
 
 def _stub() -> FilingStub:
@@ -228,13 +352,45 @@ def test_schema_avoids_keywords_structured_outputs_reject() -> None:
 
 
 def test_system_prompt_clears_the_minimum_cacheable_prefix() -> None:
-    # Sonnet 5 caches nothing below 1,024 tokens; ~4 chars/token is the floor
-    # this prompt has to clear for cache_control to do anything at all.
+    # Opus 5 caches nothing below 512 tokens and Sonnet 5 below 1,024;
+    # ~4 chars/token is the floor this prompt has to clear for cache_control
+    # to do anything at all.
     assert len(ptr_vision.SYSTEM_PROMPT) > 4_500
 
 
 # ---------------------------------------------------------------------------
-# Request shape + good response
+# Versioning
+# ---------------------------------------------------------------------------
+
+
+def test_parser_version_is_generic_and_matched_by_prefix() -> None:
+    assert VISION_PARSER_VERSION == "claude-vision-v2"
+    assert is_vision_parser_version(VISION_PARSER_VERSION)
+    assert is_vision_parser_version("claude-sonnet-5-vision-v1")
+    assert is_vision_parser_version("Claude-Opus-5-Vision-v3")
+    assert not is_vision_parser_version("regex-v1")
+    assert not is_vision_parser_version("haiku-4.5-fallback-v1")
+    assert not is_vision_parser_version(None)
+    assert not is_vision_parser_version("")
+
+
+def test_status_override_applies_to_old_and_new_vision_versions() -> None:
+    stub = _stub()
+    trades = [object()]
+    for version in ("claude-sonnet-5-vision-v1", VISION_PARSER_VERSION):
+        parsed = HousePtrParseResult(
+            doc_id=stub.doc_id,
+            parser_confidence=0.3,
+            parser_version=version,
+            vision_report={"ok": True, "needsReview": False},
+        )
+        assert resolve_house_stub_status(stub, parsed, trades) == "parsed", version  # type: ignore[arg-type]
+        parsed_review = parsed.model_copy(update={"vision_report": {"ok": True, "needsReview": True}})
+        assert resolve_house_stub_status(stub, parsed_review, trades) == "needs_review", version  # type: ignore[arg-type]
+
+
+# ---------------------------------------------------------------------------
+# Request shape + good response (document-block fallback)
 # ---------------------------------------------------------------------------
 
 
@@ -242,21 +398,21 @@ def test_good_response_parses_and_request_is_well_formed(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
     _enable(monkeypatch)
-    payload = {
-        "filer_name": "Roger Williams",
-        "filing_date": "2026-01-05",
-        "page_count": 2,
-        "notes": "Second page is a faxed continuation.",
-        "transactions": [
-            CHEVRON_VISION_ROW,
-            {**CHEVRON_VISION_ROW, "ticker": None, "legibility": "partial"},
-        ],
-    }
+    payload = _payload(
+        CHEVRON_VISION_ROW,
+        {**CHEVRON_VISION_ROW, "ticker": None, "legibility": "partial"},
+        filer_name="Roger Williams",
+        filing_date="2026-01-05",
+        page_count=2,
+        notes="Second page is a faxed continuation.",
+    )
     captured, calls = _install_fake_client(monkeypatch, payload)
 
     result = extract_via_vision(_write_pdf(tmp_path))
 
-    assert calls == [1]
+    # Two independent reads of the same content.
+    assert calls == [1, 1]
+    assert captured[0]["messages"] == captured[1]["messages"]
     assert result["ok"] is True
     assert result["skipped"] is False
     assert len(result["transactions"]) == 2
@@ -266,44 +422,610 @@ def test_good_response_parses_and_request_is_well_formed(
     assert result["confidence"] == 0.8
     assert result["needs_review"] is False
     assert result["parser_version"] == VISION_PARSER_VERSION
+    assert result["model"] == "claude-opus-5"
 
     # Request shape
-    assert captured["model"] == MODEL_ID
-    assert captured["max_tokens"] == 16000
-    assert captured["thinking"] == {"type": "adaptive"}
-    assert captured["output_config"]["effort"] == "medium"
-    assert captured["output_config"]["format"]["type"] == "json_schema"
-    assert captured["output_config"]["format"]["schema"] is PTR_VISION_SCHEMA
-    assert "temperature" not in captured
-    assert "top_p" not in captured
-    assert "budget_tokens" not in json.dumps(captured["thinking"])
+    request = captured[0]
+    assert request["model"] == MODEL_ID == "claude-opus-5"
+    assert request["max_tokens"] == 16000
+    assert request["thinking"] == {"type": "adaptive"}
+    assert request["output_config"]["effort"] == ptr_vision.EFFORT
+    assert request["output_config"]["format"]["type"] == "json_schema"
+    assert request["output_config"]["format"]["schema"] is PTR_VISION_SCHEMA
+    assert "temperature" not in request
+    assert "top_p" not in request
+    assert "budget_tokens" not in json.dumps(request["thinking"])
 
     # Cached, substantive system block
-    assert captured["system"][0]["cache_control"] == {"type": "ephemeral"}
-    assert captured["system"][0]["type"] == "text"
+    assert request["system"][0]["cache_control"] == {"type": "ephemeral"}
+    assert request["system"][0]["type"] == "text"
 
-    # The PDF document block precedes the text block
-    content = captured["messages"][0]["content"]
+    # No renderable pages -> the PDF document block precedes the text block
+    content = request["messages"][0]["content"]
     assert content[0]["type"] == "document"
     assert content[0]["source"]["type"] == "base64"
     assert content[0]["source"]["media_type"] == "application/pdf"
     assert "\n" not in content[0]["source"]["data"]
     assert content[1]["type"] == "text"
+    assert result["orientation"] is None
+    assert captured.orientation_requests == []  # type: ignore[attr-defined]
 
 
 def test_model_id_env_override(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
     _enable(monkeypatch)
-    monkeypatch.setenv("CAPITOL_PTR_VISION_MODEL", "claude-opus-5")
-    captured, _ = _install_fake_client(
-        monkeypatch,
-        {"filer_name": None, "filing_date": None, "page_count": 1, "notes": None,
-         "transactions": [CHEVRON_VISION_ROW]},
-    )
+    monkeypatch.setenv("CAPITOL_PTR_VISION_MODEL", "claude-sonnet-5")
+    captured, _ = _install_fake_client(monkeypatch, _payload(CHEVRON_VISION_ROW))
 
     result = extract_via_vision(_write_pdf(tmp_path))
 
-    assert captured["model"] == "claude-opus-5"
-    assert result["model"] == "claude-opus-5"
+    assert captured[0]["model"] == "claude-sonnet-5"
+    assert captured[1]["model"] == "claude-sonnet-5"
+    assert result["model"] == "claude-sonnet-5"
+    # Cost follows the override: two reads at Sonnet 5 rates.
+    per_read = (4_000 * 2.0 + 2_000 * 0.2 + 1_000 * 2.5 + 800 * 10.0) / 1_000_000
+    assert result["cost_usd"] == pytest.approx(2 * per_read)
+
+
+def test_filing_context_is_appended_to_the_user_turn(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    _enable(monkeypatch)
+    captured, _ = _install_fake_client(monkeypatch, _payload(CHEVRON_VISION_ROW))
+
+    extract_via_vision(_write_pdf(tmp_path), filing_year=2023, filing_date="2023-08-11")
+
+    text = captured[0]["messages"][0]["content"][-1]["text"]
+    assert "2023-08-11" in text
+    assert "never to fill in a date you cannot read" in text
+    # The cached system prompt is untouched by per-filing context.
+    assert captured[0]["system"][0]["text"] == ptr_vision.SYSTEM_PROMPT
+
+
+# ---------------------------------------------------------------------------
+# Page images + orientation
+# ---------------------------------------------------------------------------
+
+
+def test_orientation_heuristic_rotates_portrait_pages() -> None:
+    # The paper form is landscape: a portrait page is a sideways scan.
+    assert orientation_heuristic(1275, 1650) == 90
+    assert orientation_heuristic(1650, 1275) == 0
+    assert orientation_heuristic(1000, 1000) == 0
+
+
+def _orientation_client(
+    monkeypatch: pytest.MonkeyPatch,
+    answers: list[str],
+    *,
+    error: Exception | None = None,
+) -> tuple[Any, list[dict]]:
+    captured, _ = _install_fake_client(
+        monkeypatch, _payload(), orientation=answers, orientation_error=error
+    )
+    return ptr_vision._client_once(), captured.orientation_requests  # type: ignore[attr-defined]
+
+
+def _fake_render(calls: list[tuple[int, int]]) -> Any:
+    def render(rotation: int, max_long_edge: int = ptr_vision.MAX_IMAGE_LONG_EDGE) -> bytes:
+        calls.append((rotation, max_long_edge))
+        return f"png-{rotation}".encode()
+
+    return render
+
+
+def test_detect_orientation_compares_four_candidates_and_confirms(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    client, requests = _orientation_client(monkeypatch, ["270", "YES"])
+    rendered: list[tuple[int, int]] = []
+
+    rotation, method, usage = detect_orientation(
+        client, _fake_render(rendered), width=612, height=792
+    )
+
+    assert (rotation, method) == (270, "model-confirmed")
+    # All four candidates rendered small, in rotation order.
+    small = ptr_vision.ORIENTATION_CANDIDATE_LONG_EDGE
+    assert rendered == [(0, small), (90, small), (180, small), (270, small)]
+    assert len(requests) == 2
+
+    first = requests[0]
+    assert first["model"] == ORIENTATION_MODEL_ID == "claude-haiku-4-5"
+    assert first["max_tokens"] <= 16
+    assert "thinking" not in first
+    content = first["messages"][0]["content"]
+    assert [block["type"] for block in content] == [
+        "text", "image", "text", "image", "text", "image", "text", "image", "text",
+    ]
+    assert [block["text"] for block in content if block["type"] == "text"][:4] == [
+        "Label 0:", "Label 90:", "Label 180:", "Label 270:",
+    ]
+    assert all(
+        block["source"]["media_type"] == "image/png" for block in content if block["type"] == "image"
+    )
+    assert content[3]["source"]["data"] == base64.b64encode(b"png-90").decode()
+    assert "0, 90, 180, or 270" in content[-1]["text"]
+
+    # The confirmation shows the chosen candidate alone.
+    confirm = requests[1]["messages"][0]["content"]
+    assert confirm[0]["source"]["data"] == base64.b64encode(b"png-270").decode()
+    assert "YES or NO" in confirm[1]["text"]
+    assert usage["input"] == 3_000  # both Haiku calls counted
+
+
+def test_detect_orientation_falls_back_when_confirmation_says_no(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # Picked 0 for a portrait page, then retracted: the heuristic (90) wins.
+    client, _ = _orientation_client(monkeypatch, ["0", "NO"])
+    assert detect_orientation(client, _fake_render([]), width=612, height=792)[:2] == (
+        90,
+        "model-corrected",
+    )
+    # Picked 90 and retracted, but 90 is also the heuristic: take the opposite turn.
+    client, _ = _orientation_client(monkeypatch, ["90", "NO"])
+    assert detect_orientation(client, _fake_render([]), width=612, height=792)[:2] == (
+        270,
+        "model-corrected",
+    )
+
+
+def test_detect_orientation_falls_back_to_the_heuristic_when_the_call_fails(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    client, _ = _orientation_client(monkeypatch, ["0"], error=RuntimeError("haiku down"))
+    assert detect_orientation(client, _fake_render([]), width=612, height=792)[:2] == (
+        90,
+        "heuristic",
+    )
+    assert detect_orientation(client, _fake_render([]), width=792, height=612)[:2] == (
+        0,
+        "heuristic",
+    )
+
+
+def test_detect_orientation_falls_back_on_an_unparseable_answer(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    client, _ = _orientation_client(monkeypatch, ["it is sideways"])
+    assert detect_orientation(client, _fake_render([]), width=612, height=792)[:2] == (
+        90,
+        "heuristic",
+    )
+
+
+def test_detect_orientation_falls_back_when_rendering_fails(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    client, requests = _orientation_client(monkeypatch, ["0"])
+
+    def broken(_rotation: int, _max_long_edge: int = 0) -> bytes:
+        raise RuntimeError("render exploded")
+
+    assert detect_orientation(client, broken, width=612, height=792)[:2] == (90, "heuristic")
+    assert requests == []
+
+
+def test_image_request_shape_with_a_real_pdf(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    _enable(monkeypatch)
+    pdf = _write_real_pdf(tmp_path, portrait=True, pages=2)
+    captured, calls = _install_fake_client(monkeypatch, _payload(CHEVRON_VISION_ROW), orientation="0")
+
+    result = extract_via_vision(pdf)
+
+    assert calls == [1, 1]
+    content = captured[0]["messages"][0]["content"]
+    # label, image, label, image, instruction
+    assert [block["type"] for block in content] == ["text", "image", "text", "image", "text"]
+    assert content[0]["text"] == "Page 1 of 2:"
+    assert content[2]["text"] == "Page 2 of 2:"
+    sizes: list[tuple[int, int]] = []
+    for block in (content[1], content[3]):
+        assert block["source"] == {
+            "type": "base64",
+            "media_type": "image/png",
+            "data": block["source"]["data"],
+        }
+        assert "\n" not in block["source"]["data"]
+        width, height = _png_size(block["source"]["data"])
+        assert max(width, height) <= ptr_vision.MAX_IMAGE_LONG_EDGE
+        assert height > width  # answered 0 -> left portrait
+        sizes.append((width, height))
+    assert content[-1]["type"] == "text"
+    assert "Transcribe every transaction row" in content[-1]["text"]
+    assert not any(block["type"] == "document" for block in content)
+    # Both reads saw byte-identical images.
+    assert captured[1]["messages"] == captured[0]["messages"]
+
+    assert result["orientation"] == [
+        {"page": 1, "rotation": 0, "method": "model-confirmed", "width": sizes[0][0], "height": sizes[0][1]},
+        {"page": 2, "rotation": 0, "method": "model-confirmed", "width": sizes[1][0], "height": sizes[1][1]},
+    ]
+    orientation_requests = captured.orientation_requests  # type: ignore[attr-defined]
+    assert len(orientation_requests) == 4  # per page: four candidates, then a confirmation
+    assert all(request["model"] == ORIENTATION_MODEL_ID for request in orientation_requests)
+    # Candidates are rendered smaller than the read images.
+    candidate = orientation_requests[0]["messages"][0]["content"][1]
+    assert max(_png_size(candidate["source"]["data"])) <= ptr_vision.ORIENTATION_CANDIDATE_LONG_EDGE
+
+    # Usage and cost are summed across the orientation calls and both reads.
+    assert result["usage"] == {
+        "input": 2 * 4_000 + 4 * 1_500,
+        "cache_read": 2 * 2_000,
+        "cache_write": 2 * 1_000,
+        "output": 2 * 800 + 4 * 2,
+    }
+    read_cost = (4_000 * 5.0 + 2_000 * 0.5 + 1_000 * 6.25 + 800 * 25.0) / 1_000_000
+    orient_cost = (1_500 * 1.0 + 2 * 5.0) / 1_000_000
+    assert result["cost_usd"] == pytest.approx(2 * read_cost + 4 * orient_cost)
+    assert [call["label"] for call in result["calls"]] == ["orientation", "read A", "read B"]
+    assert result["calls"][0]["model"] == ORIENTATION_MODEL_ID
+    assert result["calls"][1]["model"] == MODEL_ID
+    # Each read records what it saw, one compact line per row, for reviewers.
+    assert result["calls"][1]["rows"] == [
+        "Chevron Corporation Common Stock | sale_partial | 2025-12-22 | 2025-12-22 | 15001-50000 | - | clear"
+    ]
+    assert result["calls"][2]["rows"] == result["calls"][1]["rows"]
+
+
+def test_portrait_page_is_rotated_upright_before_the_read(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    _enable(monkeypatch)
+    pdf = _write_real_pdf(tmp_path, portrait=True)
+    captured, _ = _install_fake_client(
+        monkeypatch, _payload(CHEVRON_VISION_ROW), orientation=["90", "YES"]
+    )
+
+    result = extract_via_vision(pdf)
+
+    image = captured[0]["messages"][0]["content"][1]
+    width, height = _png_size(image["source"]["data"])
+    assert width > height  # rotated 90 -> landscape
+    assert result["orientation"][0]["rotation"] == 90
+    assert result["orientation"][0]["method"] == "model-confirmed"
+    assert result["orientation"][0]["width"] == width
+    assert result["orientation"][0]["height"] == height
+
+
+def test_portrait_page_uses_the_heuristic_when_haiku_is_down(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    _enable(monkeypatch)
+    pdf = _write_real_pdf(tmp_path, portrait=True)
+    captured, _ = _install_fake_client(
+        monkeypatch, _payload(CHEVRON_VISION_ROW), orientation_error=RuntimeError("503")
+    )
+
+    result = extract_via_vision(pdf)
+
+    image = captured[0]["messages"][0]["content"][1]
+    width, height = _png_size(image["source"]["data"])
+    assert width > height
+    assert result["orientation"] == [
+        {"page": 1, "rotation": 90, "method": "heuristic", "width": width, "height": height}
+    ]
+    assert result["ok"] is True
+
+
+def test_document_block_fallback_when_pymupdf_is_unavailable(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    _enable(monkeypatch)
+    pdf = _write_real_pdf(tmp_path)
+    monkeypatch.setattr(ptr_vision, "_pdf_module", lambda: None)
+    captured, calls = _install_fake_client(monkeypatch, _payload(CHEVRON_VISION_ROW))
+
+    result = extract_via_vision(pdf)
+
+    assert calls == [1, 1]
+    content = captured[0]["messages"][0]["content"]
+    assert content[0]["type"] == "document"
+    assert content[1]["type"] == "text"
+    assert result["orientation"] is None
+    assert captured.orientation_requests == []  # type: ignore[attr-defined]
+    assert result["ok"] is True
+
+
+# ---------------------------------------------------------------------------
+# Two-read agreement
+# ---------------------------------------------------------------------------
+
+
+def test_reconcile_reads_keeps_fields_both_reads_agree_on() -> None:
+    rows, agreement = reconcile_reads([ATT_ROW, GE_ROW], [dict(ATT_ROW), dict(GE_ROW)])
+
+    assert agreement == {
+        "rowsA": 2,
+        "rowsB": 2,
+        "matched": 2,
+        "unmatchedA": 0,
+        "unmatchedB": 0,
+        "rowCountsAgree": True,
+        "fieldDisagreements": {},
+    }
+    assert [row["asset_description"] for row in rows] == ["AT&T", "General Electric"]
+    assert rows[0]["transaction_date"] == "2022-01-06"
+    assert rows[0]["amount_min"] == 1001 and rows[0]["amount_max"] == 15000
+    assert rows[0]["transaction_type"] == "purchase"
+    assert rows[1]["transaction_type"] == "sale_partial"
+    assert [row["legibility"] for row in rows] == ["partial", "partial"]
+
+
+def test_reconcile_reads_matches_on_normalized_description() -> None:
+    # Case, punctuation and an "Inc." suffix should not stop a match.
+    read_b = {**ATT_ROW, "asset_description": "at & t inc"}
+    rows, agreement = reconcile_reads([ATT_ROW], [read_b])
+
+    assert agreement["matched"] == 1
+    # Same legibility on both: the longer of two agreeing-ish descriptions wins.
+    assert rows[0]["asset_description"] == "at & t inc"
+    assert rows[0]["transaction_date"] == "2022-01-06"
+
+
+def test_reconcile_reads_prefers_the_more_legible_description() -> None:
+    # A handwriting misread of the same row ("Art+T" for "AT&T") still pairs
+    # up, and the reading the model rated clear wins over the longer one.
+    read_a = {**ATT_ROW, "legibility": "clear"}
+    read_b = {**ATT_ROW, "asset_description": "Art+T", "legibility": "partial"}
+    rows, agreement = reconcile_reads([read_a], [read_b])
+
+    assert agreement["matched"] == 1
+    assert rows[0]["asset_description"] == "AT&T"
+    assert rows[0]["legibility"] == "partial"  # worst of the two ratings
+
+
+def test_reconcile_reads_nulls_a_disputed_transaction_date_and_marks_illegible() -> None:
+    read_b = {**ATT_ROW, "transaction_date": "2023-07-12"}
+    rows, agreement = reconcile_reads([ATT_ROW], [read_b])
+
+    assert rows[0]["transaction_date"] is None
+    assert rows[0]["legibility"] == "illegible"
+    assert rows[0]["amount_min"] == 1001  # untouched fields survive
+    assert "transaction_date" in rows[0]["comment"]
+    assert agreement["fieldDisagreements"] == {"transaction_date": 1}
+    assert agreement["rowCountsAgree"] is True
+
+
+def test_reconcile_reads_nulls_a_disputed_amount_and_marks_illegible() -> None:
+    read_b = {**ATT_ROW, "amount_min": 15001, "amount_max": 50000}
+    rows, agreement = reconcile_reads([ATT_ROW], [read_b])
+
+    assert rows[0]["amount_min"] is None and rows[0]["amount_max"] is None
+    assert rows[0]["legibility"] == "illegible"
+    assert rows[0]["transaction_date"] == "2022-01-06"
+    assert agreement["fieldDisagreements"] == {"amount": 1}
+
+
+def test_reconcile_reads_nulls_a_disputed_type_and_marks_illegible() -> None:
+    read_b = {**ATT_ROW, "transaction_type": "sale"}
+    rows, agreement = reconcile_reads([ATT_ROW], [read_b])
+
+    assert rows[0]["transaction_type"] is None
+    assert rows[0]["legibility"] == "illegible"
+    assert agreement["fieldDisagreements"] == {"transaction_type": 1}
+
+
+def test_reconcile_reads_soft_fields_null_but_only_downgrade_to_partial() -> None:
+    read_a = {**CHEVRON_VISION_ROW, "owner": "self"}
+    read_b = {**CHEVRON_VISION_ROW, "owner": "spouse", "ticker": "cvx", "notification_date": None}
+    rows, agreement = reconcile_reads([read_a], [read_b])
+
+    assert rows[0]["owner"] is None
+    assert rows[0]["ticker"] == "CVX"  # case-insensitive agreement
+    assert rows[0]["notification_date"] is None
+    assert rows[0]["transaction_date"] == "2025-12-22"
+    assert rows[0]["legibility"] == "partial"
+    assert agreement["fieldDisagreements"] == {"notification_date": 1, "owner": 1}
+
+
+def test_reconcile_reads_keeps_an_unmatched_row_as_illegible() -> None:
+    read_b = {**ATT_ROW, "asset_description": "Art+T", "transaction_date": "2023-07-12"}
+    rows, agreement = reconcile_reads([ATT_ROW, GE_ROW], [dict(ATT_ROW), read_b])
+
+    assert agreement["rowsA"] == 2 and agreement["rowsB"] == 2
+    assert agreement["matched"] == 1
+    assert agreement["unmatchedA"] == 1 and agreement["unmatchedB"] == 1
+    assert agreement["rowCountsAgree"] is True
+    assert [row["asset_description"] for row in rows] == ["AT&T", "General Electric", "Art+T"]
+    assert rows[0]["legibility"] == "partial"
+    assert rows[1]["legibility"] == "illegible"
+    assert "read A" in rows[1]["comment"]
+    assert rows[2]["legibility"] == "illegible"
+    assert "read B" in rows[2]["comment"]
+    assert rows[2]["transaction_date"] == "2023-07-12"  # values kept for the reviewer
+
+
+def test_reconcile_reads_records_a_row_count_mismatch() -> None:
+    rows, agreement = reconcile_reads([ATT_ROW, GE_ROW], [dict(ATT_ROW)])
+
+    assert agreement["rowsA"] == 2 and agreement["rowsB"] == 1 and agreement["matched"] == 1
+    assert agreement["rowCountsAgree"] is False
+    assert [row["legibility"] for row in rows] == ["partial", "illegible"]
+
+
+def test_match_rows_uses_transaction_type_to_pair_same_asset_rows() -> None:
+    buy = {**ATT_ROW, "transaction_type": "purchase"}
+    sell = {**ATT_ROW, "transaction_type": "sale"}
+    # Read B lists them in the opposite order.
+    pairs = match_rows([buy, sell], [dict(sell), dict(buy)])
+    assert [(i, j) for i, j, _ratio in pairs] == [(0, 1), (1, 0)]
+
+
+def test_match_rows_ignores_dissimilar_descriptions() -> None:
+    assert match_rows([ATT_ROW], [GE_ROW]) == []
+    assert match_rows([ATT_ROW], [{**ATT_ROW, "asset_description": "Apple Inc"}]) == []
+    assert match_rows([GE_ROW], [{**GE_ROW, "asset_description": "General Motors"}]) == []
+    # A bare generic suffix never matches on containment alone.
+    assert match_rows([{**ATT_ROW, "asset_description": "Inc"}], [{**ATT_ROW, "asset_description": "Apple Inc"}]) == []
+
+
+def test_two_reads_end_to_end_agree(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    _enable(monkeypatch)
+    _install_fake_client(
+        monkeypatch, [_payload(ATT_ROW, GE_ROW), _payload(dict(ATT_ROW), dict(GE_ROW))]
+    )
+
+    result = extract_via_vision(_write_pdf(tmp_path), filing_year=2023, filing_date="2023-08-11")
+
+    assert result["ok"] is True
+    assert result["needs_review"] is False
+    assert result["needs_review_reasons"] == []
+    assert result["read_agreement"]["matched"] == 2
+    assert [row["transaction_date"] for row in result["transactions"]] == ["2022-01-06"] * 2
+    assert result["attempts"] == 2
+    assert result["usage"]["input"] == 8_000
+
+
+def test_two_reads_end_to_end_disagree_on_a_date(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    _enable(monkeypatch)
+    _install_fake_client(
+        monkeypatch,
+        [
+            _payload(ATT_ROW, GE_ROW),
+            _payload({**ATT_ROW, "transaction_date": "2023-07-12"}, dict(GE_ROW)),
+        ],
+    )
+
+    result = extract_via_vision(_write_pdf(tmp_path), filing_year=2023)
+
+    assert result["needs_review"] is True
+    assert result["needs_review_reasons"] == ["reads disagree on transaction_date"]
+    assert result["legibility"] == {"clear": 0, "partial": 1, "illegible": 1, "total": 2}
+    assert result["transactions"][0]["transaction_date"] is None
+    assert result["transactions"][1]["transaction_date"] == "2022-01-06"
+
+
+def test_two_reads_end_to_end_with_different_row_counts_need_review(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    _enable(monkeypatch)
+    _install_fake_client(monkeypatch, [_payload(ATT_ROW, GE_ROW), _payload(dict(ATT_ROW))])
+
+    result = extract_via_vision(_write_pdf(tmp_path), filing_year=2023)
+
+    assert result["read_agreement"]["rowsA"] == 2
+    assert result["read_agreement"]["rowsB"] == 1
+    assert result["read_agreement"]["rowCountsAgree"] is False
+    assert result["needs_review"] is True
+    assert "reads disagree on row count" in result["needs_review_reasons"]
+    metadata = build_vision_metadata(result)
+    assert metadata["readAgreement"] == result["read_agreement"]
+    assert metadata["needsReview"] is True
+
+
+def test_example_row_is_scrubbed_from_both_reads_before_matching(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    _enable(monkeypatch)
+    example = {**ATT_ROW, "asset_description": "Example: Mega Corp. Common Stock",
+               "transaction_date": "2020-02-05"}
+    leaked = {**GE_ROW, "transaction_date": "2020-02-05"}
+    _install_fake_client(
+        monkeypatch,
+        [_payload(example, ATT_ROW, leaked), _payload(dict(ATT_ROW), dict(example), dict(leaked))],
+    )
+
+    result = extract_via_vision(_write_pdf(tmp_path), filing_year=2023)
+
+    assert result["example_row_scrubs"] == 4  # example row + leaked date, in each read
+    assert [row["asset_description"] for row in result["transactions"]] == ["AT&T", "General Electric"]
+    assert result["transactions"][1]["transaction_date"] is None
+    assert result["transactions"][1]["legibility"] == "illegible"
+    assert result["read_agreement"]["rowsA"] == 2 and result["read_agreement"]["rowsB"] == 2
+    assert build_vision_metadata(result)["exampleRowScrubs"] == 4
+
+
+def test_second_read_failure_keeps_rows_but_sends_them_all_to_review(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    _enable(monkeypatch)
+    message = _Message(_payload(ATT_ROW, GE_ROW))
+    seen: list[int] = []
+
+    class _BadRequest(Exception):
+        status_code = 400
+
+    class _SecondReadFails:
+        def stream(self, **_kwargs: Any) -> _StreamManager:
+            seen.append(1)
+            if len(seen) == 2:
+                raise _BadRequest("boom")
+            return _StreamManager(message)
+
+    class _Client:
+        messages = _SecondReadFails()
+
+    monkeypatch.setattr(ptr_vision, "_client", None)
+    monkeypatch.setattr(ptr_vision, "_client_once", lambda: _Client())
+
+    result = extract_via_vision(_write_pdf(tmp_path), filing_year=2023)
+
+    assert len(seen) == 2
+    assert result["ok"] is True
+    assert result["needs_review"] is True
+    assert result["read_agreement"]["rowsB"] is None
+    assert "boom" in result["read_agreement"]["readBFailed"]
+    assert [row["legibility"] for row in result["transactions"]] == ["illegible", "illegible"]
+    assert result["calls"][1]["ok"] is False
+
+
+def test_run_vision_parse_keeps_bond_names_the_text_cleaner_would_gut(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    # The text-layer cleaner strips "...<3+ digits> " as an account number,
+    # which turns this handwritten muni bond into "5%". Pin that behaviour so
+    # the guard is exercised whatever the live cleaner does.
+    import re as _re
+
+    monkeypatch.setattr(
+        house_ptr,
+        "clean_asset_description",
+        lambda raw, _ticker: _re.sub(r"^.*?\b\d{3,}\s+", "", raw),
+    )
+    bond = {**ATT_ROW, "asset_description": "MINNESOTA ST BD GRP 160 5%", "owner": "spouse"}
+    _install_fake_client(monkeypatch, _payload(bond, dict(CHEVRON_VISION_ROW)))
+    stub = _stub()
+
+    result, metadata = house_ptr._run_vision_parse(_write_pdf(tmp_path), stub, "")
+
+    assert result is not None
+    parsed, trades = result
+    assert [t.asset_description for t in parsed.transactions] == [
+        "MINNESOTA ST BD GRP 160 5%",
+        "Chevron Corporation Common Stock",  # untouched when cleaning is benign
+    ]
+    assert trades[0].asset_description == "MINNESOTA ST BD GRP 160 5%"
+    assert metadata["descriptionsRestored"] == 1
+
+
+def test_run_vision_parse_drops_rows_with_a_disputed_type(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    _enable(monkeypatch)
+    _install_fake_client(
+        monkeypatch,
+        [
+            _payload(ATT_ROW, GE_ROW),
+            _payload({**ATT_ROW, "transaction_type": "sale"}, dict(GE_ROW)),
+        ],
+    )
+    stub = _stub()
+    stub.filing_year = 2023
+    stub.filing_date = "2023-08-11"
+
+    result, metadata = house_ptr._run_vision_parse(_write_pdf(tmp_path), stub, "")
+
+    assert result is not None
+    parsed, trades = result
+    # AT&T (disputed type) is dropped rather than defaulting to "purchase".
+    assert [t.asset_description for t in parsed.transactions] == ["General Electric"]
+    assert len(trades) == 1
+    assert metadata["rowsDroppedForType"] == 1
+    assert metadata["needsReview"] is True
+    assert resolve_house_stub_status(stub, parsed, trades) == "needs_review"
 
 
 # ---------------------------------------------------------------------------
@@ -346,7 +1068,7 @@ def test_page_limit_skips_without_calling_the_model(
 ) -> None:
     _enable(monkeypatch)
     monkeypatch.setattr(ptr_vision, "count_pdf_pages", lambda _path: 41)
-    _, calls = _install_fake_client(monkeypatch, {"transactions": [CHEVRON_VISION_ROW]})
+    _, calls = _install_fake_client(monkeypatch, _payload(CHEVRON_VISION_ROW))
 
     result = extract_via_vision(_write_pdf(tmp_path))
 
@@ -362,7 +1084,7 @@ def test_byte_limit_skips_without_calling_the_model(
 ) -> None:
     _enable(monkeypatch)
     monkeypatch.setattr(ptr_vision, "MAX_VISION_PDF_BYTES", 32)
-    _, calls = _install_fake_client(monkeypatch, {"transactions": [CHEVRON_VISION_ROW]})
+    _, calls = _install_fake_client(monkeypatch, _payload(CHEVRON_VISION_ROW))
     pdf = tmp_path / "big.pdf"
     pdf.write_bytes(b"%PDF-1.4\n" + b"x" * 500)
 
@@ -376,19 +1098,20 @@ def test_refusal_and_truncation_are_reported_not_parsed(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
     _enable(monkeypatch)
-    payload = {"filer_name": None, "filing_date": None, "page_count": 1, "notes": None,
-               "transactions": [CHEVRON_VISION_ROW]}
+    payload = _payload(CHEVRON_VISION_ROW)
 
-    _install_fake_client(monkeypatch, payload, stop_reason="refusal")
+    _, calls = _install_fake_client(monkeypatch, payload, stop_reason="refusal")
     refused = extract_via_vision(_write_pdf(tmp_path))
+    assert calls == [1]  # a refused first read is not repeated
     assert refused["skipped"] is True
     assert refused["transactions"] == []
     assert "refused" in str(refused["reason"])
     # usage is still recorded so the run accounts for what it spent
     assert refused["usage"]["output"] == 800
 
-    _install_fake_client(monkeypatch, payload, stop_reason="max_tokens")
+    _, calls = _install_fake_client(monkeypatch, payload, stop_reason="max_tokens")
     truncated = extract_via_vision(_write_pdf(tmp_path))
+    assert calls == [1]
     assert truncated["skipped"] is True
     assert "max_tokens" in str(truncated["reason"])
 
@@ -399,9 +1122,7 @@ def test_retries_once_on_a_429_then_succeeds(
     _enable(monkeypatch)
     monkeypatch.setattr(ptr_vision, "RETRY_SLEEP_SECONDS", 0)
 
-    payload = {"filer_name": None, "filing_date": None, "page_count": 1, "notes": None,
-               "transactions": [CHEVRON_VISION_ROW]}
-    message = _Message(payload)
+    message = _Message(_payload(CHEVRON_VISION_ROW))
     attempts: list[int] = []
 
     class _RateLimited(Exception):
@@ -422,17 +1143,18 @@ def test_retries_once_on_a_429_then_succeeds(
 
     result = extract_via_vision(_write_pdf(tmp_path))
 
-    assert len(attempts) == 2
+    # read A: 429 then success; read B: success
+    assert len(attempts) == 3
     assert result["ok"] is True
-    assert result["attempts"] == 2
+    assert result["attempts"] == 3
+    assert [call["attempts"] for call in result["calls"]] == [2, 1]
 
 
 def test_sdk_without_output_config_falls_back_to_strict_tool_use(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
     _enable(monkeypatch)
-    payload = {"filer_name": None, "filing_date": None, "page_count": 1, "notes": None,
-               "transactions": [CHEVRON_VISION_ROW]}
+    payload = _payload(CHEVRON_VISION_ROW)
 
     class _ToolMessage:
         content = [_Block("tool_use", payload=payload)]
@@ -457,8 +1179,10 @@ def test_sdk_without_output_config_falls_back_to_strict_tool_use(
 
     result = extract_via_vision(_write_pdf(tmp_path))
 
-    assert len(seen) == 2
+    # read A: rejected then tool form; read B goes straight to the tool form.
+    assert len(seen) == 3
     assert "output_config" not in seen[1]
+    assert "output_config" not in seen[2]
     tool = seen[1]["tools"][0]
     assert tool["name"] == ptr_vision.VISION_TOOL_NAME
     assert tool["strict"] is True
@@ -472,8 +1196,7 @@ def test_api_rejecting_json_schema_falls_back_to_strict_tool_use(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
     _enable(monkeypatch)
-    payload = {"filer_name": None, "filing_date": None, "page_count": 1, "notes": None,
-               "transactions": [CHEVRON_VISION_ROW]}
+    payload = _payload(CHEVRON_VISION_ROW)
 
     class _ToolMessage:
         content = [_Block("tool_use", payload=payload)]
@@ -501,8 +1224,9 @@ def test_api_rejecting_json_schema_falls_back_to_strict_tool_use(
 
     result = extract_via_vision(_write_pdf(tmp_path))
 
-    assert len(seen) == 2
-    assert seen[1]["output_config"] == {"effort": "medium"}
+    assert len(seen) == 3
+    assert seen[1]["output_config"] == {"effort": ptr_vision.EFFORT}
+    assert seen[2]["output_config"] == {"effort": ptr_vision.EFFORT}
     assert result["ok"] is True
     assert result["structuredOutput"] is False
 
@@ -529,7 +1253,7 @@ def test_non_retryable_error_gives_up_immediately(
 
     result = extract_via_vision(_write_pdf(tmp_path))
 
-    assert len(attempts) == 1
+    assert len(attempts) == 1  # the second read is not attempted
     assert result["skipped"] is True
     assert "api error" in str(result["reason"])
 
@@ -555,47 +1279,75 @@ def test_legibility_summary_and_confidence() -> None:
     assert majority_illegible({"total": 0}) is True
 
 
-def test_cost_uses_sonnet_5_rates_with_cache_multipliers() -> None:
-    # 1M plain input ($2) + 1M cache reads ($0.20) + 1M cache writes ($2.50)
-    # + 1M output ($10) = $14.70
+def test_pricing_table_covers_the_read_and_orientation_models() -> None:
+    assert pricing_for_model("claude-opus-5") == (5.0, 25.0)
+    assert pricing_for_model("claude-haiku-4-5") == (1.0, 5.0)
+    assert pricing_for_model("claude-sonnet-5") == (2.0, 10.0)
+    # Family fallback for dated / future ids, Opus tier for anything unknown.
+    assert pricing_for_model("claude-opus-5-20270101") == (5.0, 25.0)
+    assert pricing_for_model("claude-haiku-9") == (1.0, 5.0)
+    assert pricing_for_model("something-else") == ptr_vision.DEFAULT_PRICING
+    assert (ptr_vision.PRICE_INPUT_PER_MTOK, ptr_vision.PRICE_OUTPUT_PER_MTOK) == (5.0, 25.0)
+
+
+def test_cost_uses_opus_5_rates_with_cache_multipliers(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.delenv("CAPITOL_PTR_VISION_MODEL", raising=False)
+    usage = {
+        "input": 1_000_000,
+        "cache_read": 1_000_000,
+        "cache_write": 1_000_000,
+        "output": 1_000_000,
+    }
+    # 1M plain input ($5) + 1M cache reads ($0.50) + 1M cache writes ($6.25)
+    # + 1M output ($25) = $36.75
+    assert estimate_cost_usd(usage) == pytest.approx(36.75)
+    assert estimate_cost_usd(usage, "claude-opus-5") == pytest.approx(36.75)
+
+
+def test_cost_uses_haiku_4_5_rates_for_orientation_calls() -> None:
+    # 1M plain input ($1) + 1M cache reads ($0.10) + 1M cache writes ($1.25)
+    # + 1M output ($5) = $7.35
     cost = estimate_cost_usd(
         {
             "input": 1_000_000,
             "cache_read": 1_000_000,
             "cache_write": 1_000_000,
             "output": 1_000_000,
-        }
+        },
+        ORIENTATION_MODEL_ID,
     )
-    assert cost == pytest.approx(14.70)
+    assert cost == pytest.approx(7.35)
 
 
 def test_vision_metadata_carries_usage_and_cost(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
     _enable(monkeypatch)
-    _install_fake_client(
-        monkeypatch,
-        {"filer_name": "Roger Williams", "filing_date": None, "page_count": 1,
-         "notes": None, "transactions": [CHEVRON_VISION_ROW]},
-    )
+    _install_fake_client(monkeypatch, _payload(CHEVRON_VISION_ROW, filer_name="Roger Williams"))
 
     metadata = build_vision_metadata(extract_via_vision(_write_pdf(tmp_path)))
 
     assert metadata["model"] == MODEL_ID
+    assert metadata["orientationModel"] == ORIENTATION_MODEL_ID
     assert metadata["parserVersion"] == VISION_PARSER_VERSION
     assert metadata["ok"] is True
     assert metadata["needsReview"] is False
     assert metadata["rowCount"] == 1
+    # Summed over two reads (document fallback: no orientation call).
     assert metadata["usage"] == {
-        "inputTokens": 4_000,
-        "cacheReadTokens": 2_000,
-        "cacheWriteTokens": 1_000,
-        "outputTokens": 800,
+        "inputTokens": 8_000,
+        "cacheReadTokens": 4_000,
+        "cacheWriteTokens": 2_000,
+        "outputTokens": 1_600,
     }
-    # 4000*$2 + 2000*$0.20 + 1000*$2.50 + 800*$10, per MTok
-    assert metadata["costUsd"] == pytest.approx(0.0189)
-    assert metadata["pricing"]["inputPerMTok"] == 2.0
-    assert metadata["pricing"]["outputPerMTok"] == 10.0
+    # per read: 4000*$5 + 2000*$0.50 + 1000*$6.25 + 800*$25, per MTok = $0.04725
+    assert metadata["costUsd"] == pytest.approx(0.0945)
+    assert metadata["pricing"]["inputPerMTok"] == 5.0
+    assert metadata["pricing"]["outputPerMTok"] == 25.0
+    assert metadata["pricing"]["orientation"] == {"inputPerMTok": 1.0, "outputPerMTok": 5.0}
+    assert metadata["orientation"] is None
+    assert metadata["readAgreement"]["matched"] == 1
+    assert [call["label"] for call in metadata["calls"]] == ["read A", "read B"]
     assert "transactions" not in metadata
 
 
@@ -615,11 +1367,7 @@ def test_illegible_majority_keeps_the_stub_in_needs_review(
         {**CHEVRON_VISION_ROW, "asset_description": "RTX Corporation", "ticker": "RTX",
          "legibility": "clear"},
     ]
-    _install_fake_client(
-        monkeypatch,
-        {"filer_name": None, "filing_date": None, "page_count": 1, "notes": None,
-         "transactions": rows},
-    )
+    _install_fake_client(monkeypatch, _payload(*rows))
 
     stub = _stub()
     result, metadata = house_ptr._run_vision_parse(_write_pdf(tmp_path), stub, "")
@@ -643,11 +1391,7 @@ def test_legible_majority_leaves_the_review_queue(
         {**CHEVRON_VISION_ROW, "asset_description": "RTX Corporation", "ticker": "RTX",
          "legibility": "clear"},
     ]
-    _install_fake_client(
-        monkeypatch,
-        {"filer_name": None, "filing_date": None, "page_count": 1, "notes": None,
-         "transactions": rows},
-    )
+    _install_fake_client(monkeypatch, _payload(*rows))
 
     stub = _stub()
     result, metadata = house_ptr._run_vision_parse(_write_pdf(tmp_path), stub, "")
@@ -664,11 +1408,7 @@ def test_unresolved_member_can_never_be_marked_parsed(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
     _enable(monkeypatch)
-    _install_fake_client(
-        monkeypatch,
-        {"filer_name": None, "filing_date": None, "page_count": 1, "notes": None,
-         "transactions": [CHEVRON_VISION_ROW]},
-    )
+    _install_fake_client(monkeypatch, _payload(CHEVRON_VISION_ROW))
     stub = _stub()
     stub.member.id = None
 
@@ -705,8 +1445,7 @@ def test_vision_rows_are_indistinguishable_from_text_parsed_rows(
     _enable(monkeypatch)
     _install_fake_client(
         monkeypatch,
-        {"filer_name": "Roger Williams", "filing_date": "2026-01-05", "page_count": 1,
-         "notes": None, "transactions": [CHEVRON_VISION_ROW]},
+        _payload(CHEVRON_VISION_ROW, filer_name="Roger Williams", filing_date="2026-01-05"),
     )
 
     result, _metadata = house_ptr._run_vision_parse(_write_pdf(tmp_path), stub, CHEVRON_TEXT)
@@ -755,20 +1494,14 @@ def test_vision_crypto_rows_go_through_the_classifier(
     _enable(monkeypatch)
     _install_fake_client(
         monkeypatch,
-        {
-            "filer_name": None,
-            "filing_date": None,
-            "page_count": 1,
-            "notes": None,
-            "transactions": [
-                {
-                    **CHEVRON_VISION_ROW,
-                    "asset_description": "Bitcoin",
-                    "ticker": "BTC",
-                    "transaction_type": "purchase",
-                }
-            ],
-        },
+        _payload(
+            {
+                **CHEVRON_VISION_ROW,
+                "asset_description": "Bitcoin",
+                "ticker": "BTC",
+                "transaction_type": "purchase",
+            }
+        ),
     )
 
     result, _metadata = house_ptr._run_vision_parse(_write_pdf(tmp_path), _stub(), "")
@@ -786,19 +1519,13 @@ def test_vision_owner_and_partial_sale_mapping(
     _enable(monkeypatch)
     _install_fake_client(
         monkeypatch,
-        {
-            "filer_name": None,
-            "filing_date": None,
-            "page_count": 1,
-            "notes": None,
-            "transactions": [
-                {**CHEVRON_VISION_ROW, "owner": "dependent"},
-                {**CHEVRON_VISION_ROW, "owner": "joint", "asset_description": "Apple Inc.",
-                 "ticker": "AAPL", "transaction_type": "exchange"},
-                {**CHEVRON_VISION_ROW, "owner": "spouse", "asset_description": "RTX Corporation",
-                 "ticker": "RTX", "transaction_type": "purchase"},
-            ],
-        },
+        _payload(
+            {**CHEVRON_VISION_ROW, "owner": "dependent"},
+            {**CHEVRON_VISION_ROW, "owner": "joint", "asset_description": "Apple Inc.",
+             "ticker": "AAPL", "transaction_type": "exchange"},
+            {**CHEVRON_VISION_ROW, "owner": "spouse", "asset_description": "RTX Corporation",
+             "ticker": "RTX", "transaction_type": "purchase"},
+        ),
     )
 
     result, _metadata = house_ptr._run_vision_parse(_write_pdf(tmp_path), _stub(), "")
@@ -851,21 +1578,18 @@ def test_parse_house_ptr_pdf_calls_vision_when_the_text_path_is_weak(
         "extract_via_haiku",
         lambda *_a, **_k: pytest.fail("Haiku text fallback must not run on junk OCR text"),
     )
-    _, calls = _install_fake_client(
-        monkeypatch,
-        {"filer_name": None, "filing_date": None, "page_count": 1, "notes": None,
-         "transactions": [CHEVRON_VISION_ROW]},
-    )
+    _, calls = _install_fake_client(monkeypatch, _payload(CHEVRON_VISION_ROW))
 
     parsed, rows = house_ptr.parse_house_ptr_pdf(
         pdf, stub=stub, backend="pymupdf", vision_backend="auto"
     )
 
-    assert calls == [1]
+    assert calls == [1, 1]
     assert parsed.parser_version == VISION_PARSER_VERSION
     assert len(rows) == 1
     assert isinstance(parsed.vision_report, dict)
     assert parsed.vision_report["ok"] is True
+    assert parsed.vision_report["readAgreement"]["matched"] == 1
 
 
 def test_parse_house_ptr_pdf_skips_vision_when_backend_is_off(
@@ -888,7 +1612,7 @@ def test_parse_house_ptr_pdf_skips_vision_when_backend_is_off(
             return _Result()
 
     monkeypatch.setattr(house_ptr, "OcrProcessor", _GoodProcessor)
-    _, calls = _install_fake_client(monkeypatch, {"transactions": [CHEVRON_VISION_ROW]})
+    _, calls = _install_fake_client(monkeypatch, _payload(CHEVRON_VISION_ROW))
 
     parsed, rows = house_ptr.parse_house_ptr_pdf(
         pdf, stub=_stub(), backend="pymupdf", vision_backend="off"
@@ -928,7 +1652,7 @@ def test_parse_house_ptr_pdf_records_a_skipped_vision_attempt(
         "extract_via_haiku",
         lambda *_a, **_k: {"transactions": [], "parser_notes": "", "usage": {}, "confidence": 0.0},
     )
-    _, calls = _install_fake_client(monkeypatch, {"transactions": [CHEVRON_VISION_ROW]})
+    _, calls = _install_fake_client(monkeypatch, _payload(CHEVRON_VISION_ROW))
 
     parsed, rows = house_ptr.parse_house_ptr_pdf(
         pdf, stub=_stub(), backend="pymupdf", vision_backend="auto"

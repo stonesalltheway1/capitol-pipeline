@@ -7,18 +7,35 @@ returns fragments like ``| 9 984 F 1 | Sale | 1 |``, the regex parser scores
 0.0, and the filing never becomes trade rows. A vision-capable model reads
 those pages directly.
 
-This module sends the **PDF itself** to Claude as a ``document`` content block
-and asks for the transaction grid back as schema-constrained JSON. It is a peer
-of :mod:`capitol_pipeline.parsers.ptr_llm_fallback` (the Haiku text fallback,
-still used when the OCR text layer is decent), not a replacement.
+How a filing is read (v2)
+-------------------------
+1. Every page is rendered with ``pymupdf`` to a PNG at about 150 DPI with the
+   long edge capped at :data:`MAX_IMAGE_LONG_EDGE` pixels.
+2. Each page is also rendered small at 0, 90, 180 and 270 degrees, and a cheap
+   ``claude-haiku-4-5`` call is shown all four and asked which one reads
+   upright; a second call confirms the pick. (Asking how far a single sideways
+   scan is turned was routinely answered "0".) If that fails, a portrait page
+   is assumed to be a sideways landscape form and rotated 90 degrees.
+3. The upright page images are sent to the read model (``claude-opus-5`` by
+   default) **twice**, as two independent requests, asking for the transaction
+   grid back as schema-constrained JSON. The model is not deterministic, so a
+   field is only trusted when both reads agree on it. Disagreements are nulled
+   and the row is marked ``illegible``; rows only one read saw are kept but
+   marked ``illegible``; a row-count mismatch forces manual review.
+4. When ``pymupdf`` is not importable the PDF itself is sent as a ``document``
+   block instead, and orientation is left to the model.
+
+This module is a peer of :mod:`capitol_pipeline.parsers.ptr_llm_fallback`
+(the Haiku text fallback, still used when the OCR text layer is decent), not a
+replacement.
 
 Guardrails
 ----------
 * ``CAPITOL_PTR_VISION_DISABLED=1`` kills the path at runtime.
 * PDFs over :data:`MAX_VISION_PDF_PAGES` pages or :data:`MAX_VISION_PDF_BYTES`
   bytes are skipped with a reason; the stub stays ``needs_review``.
-* One filing per call, one retry on 429/5xx, and the caller caps filings per
-  run with ``--limit``.
+* One filing per call, one retry on 429/5xx per read, and the caller caps
+  filings per run with ``--limit``.
 
 Nothing here touches the database. The caller records
 ``usage`` / ``cost_usd`` / ``reason`` into the stub's ``visionParse`` metadata.
@@ -26,12 +43,12 @@ Nothing here touches the database. The caller records
 
 from __future__ import annotations
 
-import re
-
 import base64
+import difflib
 import json
 import logging
 import os
+import re
 import time
 from pathlib import Path
 from typing import Any
@@ -40,30 +57,86 @@ logger = logging.getLogger(__name__)
 
 # -- Model + version --------------------------------------------------------
 
-#: Default vision model. Override per-run with ``CAPITOL_PTR_VISION_MODEL``.
-MODEL_ID = "claude-sonnet-5"
+#: Default read model. Override per-run with ``CAPITOL_PTR_VISION_MODEL``.
+MODEL_ID = "claude-opus-5"
 
-#: Recorded as ``parser_version`` on every row this path produces.
-VISION_PARSER_VERSION = "claude-sonnet-5-vision-v1"
+#: Cheap model used only to decide page orientation.
+ORIENTATION_MODEL_ID = "claude-haiku-4-5"
+
+#: Recorded as ``parser_version`` on every row this path produces. Named
+#: generically so a model swap does not need a new literal everywhere; use
+#: :func:`is_vision_parser_version` rather than comparing against it.
+VISION_PARSER_VERSION = "claude-vision-v2"
 
 #: Used when the installed SDK rejects ``output_config`` and we fall back to
 #: a single strict tool.
 VISION_TOOL_NAME = "record_ptr_transactions"
+
+
+def is_vision_parser_version(version: object) -> bool:
+    """Return whether a ``parser_version`` string came from this module.
+
+    Matches every version this path has ever written (``claude-sonnet-5-vision-v1``
+    and ``claude-vision-v2`` alike) so status decisions keyed on the literal
+    keep working across model changes.
+    """
+
+    text = str(version or "").strip().lower()
+    return text.startswith("claude-") and "vision" in text
+
 
 # -- Guardrails -------------------------------------------------------------
 
 MAX_VISION_PDF_PAGES = 25
 MAX_VISION_PDF_BYTES = 20 * 1024 * 1024
 MAX_OUTPUT_TOKENS = 16000
-EFFORT = "medium"
+EFFORT = "high"
 RETRY_SLEEP_SECONDS = 5.0
 
-# -- Pricing (Claude Sonnet 5: $2 / $10 per MTok) ---------------------------
+#: Independent reads of the same page images per filing.
+READS_PER_FILING = 2
 
-PRICE_INPUT_PER_MTOK = 2.0
-PRICE_OUTPUT_PER_MTOK = 10.0
+# -- Page rendering ---------------------------------------------------------
+
+RENDER_DPI = 150
+MAX_IMAGE_LONG_EDGE = 1568
+ROTATIONS: tuple[int, ...] = (0, 90, 180, 270)
+ORIENTATION_MAX_TOKENS = 8
+
+#: The four candidate renderings shown to the orientation model are smaller
+#: than the read images: legible enough to tell upright from sideways, cheap
+#: enough that four of them cost less than one read image.
+ORIENTATION_CANDIDATE_LONG_EDGE = 1000
+
+# -- Pricing (USD per MTok: input, output) ----------------------------------
+
+MODEL_PRICING: dict[str, tuple[float, float]] = {
+    "claude-opus-5": (5.0, 25.0),
+    "claude-opus-4-8": (5.0, 25.0),
+    "claude-opus-4-7": (5.0, 25.0),
+    "claude-opus-4-6": (5.0, 25.0),
+    "claude-sonnet-5": (2.0, 10.0),
+    "claude-sonnet-4-6": (3.0, 15.0),
+    "claude-haiku-4-5": (1.0, 5.0),
+}
+
+#: Family fallbacks for dated or future ids, checked by prefix in this order.
+_FAMILY_PRICING: tuple[tuple[str, tuple[float, float]], ...] = (
+    ("claude-opus", (5.0, 25.0)),
+    ("claude-sonnet-5", (2.0, 10.0)),
+    ("claude-sonnet", (3.0, 15.0)),
+    ("claude-haiku", (1.0, 5.0)),
+)
+
+#: Unknown model: assume the Opus tier so estimates err high.
+DEFAULT_PRICING: tuple[float, float] = (5.0, 25.0)
+
 CACHE_READ_MULTIPLIER = 0.1
 CACHE_WRITE_MULTIPLIER = 1.25
+
+#: The default read model's rates, kept as module constants for callers that
+#: only need the headline numbers.
+PRICE_INPUT_PER_MTOK, PRICE_OUTPUT_PER_MTOK = MODEL_PRICING[MODEL_ID]
 
 _EMPTY_USAGE: dict[str, int] = {
     "input": 0,
@@ -77,6 +150,27 @@ LEGIBILITY_WEIGHTS: dict[str, float] = {
     "partial": 0.6,
     "illegible": 0.0,
 }
+
+_LEGIBILITY_RANK: dict[str, int] = {"clear": 0, "partial": 1, "illegible": 2}
+_LEGIBILITY_BY_RANK: tuple[str, ...] = ("clear", "partial", "illegible")
+
+# -- Two-read agreement -----------------------------------------------------
+
+#: Minimum ``difflib`` ratio between normalized asset descriptions for two
+#: rows from different reads to be treated as the same transaction.
+SIMILARITY_THRESHOLD = 0.8
+
+#: Disagreement on any of these nulls the field and marks the row illegible.
+CRITICAL_FIELDS: tuple[str, ...] = ("transaction_date", "transaction_type", "amount")
+
+#: Disagreement on these nulls the field and marks the row at least partial.
+SOFT_FIELDS: tuple[str, ...] = (
+    "notification_date",
+    "owner",
+    "ticker",
+    "asset_type_code",
+    "cap_gains_over_200",
+)
 
 
 # -- Output schema ----------------------------------------------------------
@@ -217,9 +311,9 @@ PTR_VISION_SCHEMA: dict[str, Any] = {
 
 
 # -- System prompt ----------------------------------------------------------
-# Kept stable and cached with ``cache_control: ephemeral``. Sonnet 5's minimum
-# cacheable prefix is 1,024 tokens, so this is deliberately substantive: it has
-# to clear that floor to cache at all, and every filing in the review queue
+# Kept stable and cached with ``cache_control: ephemeral``. Opus 5 caches
+# prefixes from 512 tokens; Sonnet 5 from 1,024. This is deliberately
+# substantive so it clears both floors, and every filing in the review queue
 # reuses it verbatim.
 
 # The blank House PTR form carries a pre-printed example row in the grid
@@ -269,7 +363,7 @@ def scrub_example_row_values(
     return kept, scrubbed
 
 
-SYSTEM_PROMPT = """You are a careful transcriptionist for United States House of Representatives Periodic Transaction Reports (PTRs). You are given the pages of a single filing as a PDF. Most of the filings you will see are photocopies, faxes, phone photographs, or forms completed by hand, which is exactly why they reached you: automated text extraction already failed on them. Your job is to read the transaction grid off the page and return it as structured data, transcribing exactly what is written and never improving on it.
+SYSTEM_PROMPT = """You are a careful transcriptionist for United States House of Representatives Periodic Transaction Reports (PTRs). You are given the pages of a single filing, usually as one image per page that has already been turned upright, occasionally as the PDF itself. Most of the filings you will see are photocopies, faxes, phone photographs, or forms completed by hand, which is exactly why they reached you: automated text extraction already failed on them. Your job is to read the transaction grid off the page and return it as structured data, transcribing exactly what is written and never improving on it.
 
 ## The form
 
@@ -281,13 +375,13 @@ Beneath the header is the transaction table. On the standard printed form the co
 
 1. **Owner** - who holds the asset.
 2. **Asset** - the security description, sometimes with a ticker in parentheses and an asset-type code in square brackets.
-3. **Transaction Type** - a single letter code.
+3. **Transaction Type** - a single letter code, or on the paper form three tick-box columns headed P, S and S (partial), with a fourth for E.
 4. **Date** - the date of the transaction itself.
 5. **Notification Date** - the date the filer was notified of the transaction.
-6. **Amount** - a checked or circled dollar range bucket.
+6. **Amount** - a checked or circled dollar range bucket; on the paper form one tick-box column per bucket.
 7. **Cap. Gains > $200?** - a yes/no checkbox for capital gains over two hundred dollars.
 
-Handwritten and older filings often collapse, reorder, or omit columns, and may run the amount bucket into the margin. Read the column headers on the page you are actually given rather than assuming this order, and map what you find onto the fields of the schema.
+Handwritten and older filings often collapse, reorder, or omit columns, and may run the amount bucket into the margin. Read the column headers on the page you are actually given rather than assuming this order, and map what you find onto the fields of the schema. Follow each row with a ruler's discipline: the tick mark that belongs to a row sits on that row's horizontal line, and the column it belongs to is the one whose header is directly above it. Count columns from the left edge of the amount ladder rather than estimating.
 
 ## Owner codes
 
@@ -304,10 +398,10 @@ If a code is present but you genuinely cannot make it out, report null rather th
 
 - **P** - purchase. Report `purchase`.
 - **S** - sale. Report `sale`.
-- **S (partial)** - a partial sale, sometimes written "S(partial)", "S - partial", or "SP" in the type column rather than the owner column. Report `sale_partial`.
+- **S (partial)** - a partial sale, sometimes written "S(partial)", "S - partial", or "SP" in the type column rather than the owner column. On the paper form it is its own tick-box column to the right of S. Report `sale_partial`.
 - **E** - exchange. Report `exchange`.
 
-Be careful with "SP": in the Owner column it means spouse, in the Type column it means a partial sale. Decide from which column the mark sits in, not from the letters alone.
+Be careful with "SP": in the Owner column it means spouse, in the Type column it means a partial sale. Decide from which column the mark sits in, not from the letters alone. When the type is a tick in one of several columns, report the column whose header is directly above the tick; a tick under "S (partial)" is `sale_partial`, not `sale`.
 
 ## Amount buckets
 
@@ -332,7 +426,7 @@ The paper form itself carries a PRE-PRINTED EXAMPLE ROW in the transaction grid,
 
 Scans are often rotated ninety degrees or upside down; read them in the orientation of the printed text.
 
-Dates are printed on the form as MM/DD/YYYY. Convert every date to YYYY-MM-DD. Two-digit years belong to the reporting period; use the calendar year in the header to resolve them. The Transaction Date is when the trade happened; the Notification Date is when the filer learned of it, and for a self-directed account the two are often identical. The Notification Date is frequently blank on handwritten forms - report null, not a copy of the transaction date. If a date is smudged, cropped, or overwritten so that you cannot read it, report null and mark the row's legibility accordingly. A date you cannot read is never worth guessing: a wrong date silently corrupts the disclosure timeline that this data feeds.
+Dates are printed on the form as MM/DD/YYYY, and handwritten as M/D/YY more often than not. Convert every date to YYYY-MM-DD. Two-digit years belong to the reporting period; use the calendar year in the header, or the filing date you are told, to resolve them. The Transaction Date is when the trade happened; the Notification Date is when the filer learned of it, and for a self-directed account the two are often identical. The two dates sit in two separate columns: never read the notification column and report it as the transaction date, and never copy one column into the other. The Notification Date is frequently blank on handwritten forms - report null, not a copy of the transaction date. No date on the form can be later than the date the report was filed. If a date is smudged, cropped, or overwritten so that you cannot read it, report null and mark the row's legibility accordingly. A date you cannot read is never worth guessing: a wrong date silently corrupts the disclosure timeline that this data feeds.
 
 ## Cap. Gains > $200?
 
@@ -341,6 +435,8 @@ This is a single checkbox per row. A tick, an X, or a "Y" means true; an explici
 ## Asset descriptions and subholdings
 
 Transcribe the asset description as written. Keep issuer names, share-class wording such as "Common Stock" or "Class A", bond coupon rates and maturity dates, fund names, and municipal issuer names intact. Do not expand abbreviations, do not correct spelling, and do not normalize punctuation or capitalization.
+
+Handwriting is the exception to the spelling rule. A handwritten asset is almost always the name of a real, usually well-known, issuer or fund: "AT&T", "General Electric", "Apple", "Vanguard 500". When the strokes could be read either as a nonsense string or as a real issuer name, report the real issuer name, rate the row `partial`, and put your literal reading in the comment. An ampersand in handwriting often looks like a plus sign, a capital T like a lower-case t, and a capital G like a 6.
 
 A ticker appears in parentheses immediately after the description on printed forms. Report only the bare symbol, with no parentheses. Municipal bonds, private funds, limited partnerships, real estate, and directly held cryptocurrency usually have no ticker: report null. **Never supply a ticker that is not printed on the page**, even when the issuer obviously has one - a downstream classifier depends on the distinction between a disclosed ticker and an inferred one.
 
@@ -368,6 +464,23 @@ USER_INSTRUCTION = (
     "Report. Read the pages as images; the text layer is unreliable or absent. "
     "Return the filing header fields and one entry per transaction row, in "
     "printed order, using null wherever the page is illegible."
+)
+
+ORIENTATION_SYSTEM_PROMPT = (
+    "You judge the orientation of scanned document pages. Reply with a single "
+    "number and nothing else."
+)
+
+ORIENTATION_QUESTION = (
+    "These are four renderings of the same scanned page, each rotated clockwise by "
+    "the number of degrees in its label. Exactly one of them shows the printed and "
+    "handwritten text upright, reading normally left to right and top to bottom. "
+    "Answer with that rendering's label only: 0, 90, 180, or 270."
+)
+
+ORIENTATION_CONFIRM_QUESTION = (
+    "Is the text on this scanned page upright, reading normally left to right and "
+    "top to bottom? Answer YES or NO."
 )
 
 
@@ -410,16 +523,27 @@ def _has_credentials() -> bool:
 # -- Helpers ----------------------------------------------------------------
 
 
-def count_pdf_pages(pdf_path: Path) -> int | None:
-    """Return the page count, or None when no PDF reader is importable."""
+def _pdf_module() -> Any | None:
+    """Return the importable pymupdf module, or None."""
 
     for module_name in ("pymupdf", "fitz"):
         try:
-            module = __import__(module_name)
+            return __import__(module_name)
+        except Exception:  # pragma: no cover - depends on optional extras
+            continue
+    return None
+
+
+def count_pdf_pages(pdf_path: Path) -> int | None:
+    """Return the page count, or None when no PDF reader is importable."""
+
+    module = _pdf_module()
+    if module is not None:
+        try:
             with module.open(str(pdf_path)) as document:
                 return int(document.page_count)
         except Exception:  # pragma: no cover - depends on optional extras
-            continue
+            pass
     try:  # pragma: no cover - depends on optional extras
         from pypdf import PdfReader
 
@@ -428,14 +552,31 @@ def count_pdf_pages(pdf_path: Path) -> int | None:
         return None
 
 
-def estimate_cost_usd(usage: dict[str, int]) -> float:
-    """Estimate request cost in USD from a normalized usage dict."""
+def pricing_for_model(model: str | None) -> tuple[float, float]:
+    """Return ``(input, output)`` USD per MTok for a model id."""
 
+    key = (model or "").strip().lower()
+    if key in MODEL_PRICING:
+        return MODEL_PRICING[key]
+    for family, price in _FAMILY_PRICING:
+        if key.startswith(family):
+            return price
+    return DEFAULT_PRICING
+
+
+def estimate_cost_usd(usage: dict[str, int], model: str | None = None) -> float:
+    """Estimate request cost in USD from a normalized usage dict.
+
+    ``model`` defaults to the configured read model; pass
+    :data:`ORIENTATION_MODEL_ID` for the orientation calls.
+    """
+
+    price_in, price_out = pricing_for_model(model or resolve_model_id())
     dollars = (
-        int(usage.get("input") or 0) * PRICE_INPUT_PER_MTOK
-        + int(usage.get("cache_read") or 0) * PRICE_INPUT_PER_MTOK * CACHE_READ_MULTIPLIER
-        + int(usage.get("cache_write") or 0) * PRICE_INPUT_PER_MTOK * CACHE_WRITE_MULTIPLIER
-        + int(usage.get("output") or 0) * PRICE_OUTPUT_PER_MTOK
+        int(usage.get("input") or 0) * price_in
+        + int(usage.get("cache_read") or 0) * price_in * CACHE_READ_MULTIPLIER
+        + int(usage.get("cache_write") or 0) * price_in * CACHE_WRITE_MULTIPLIER
+        + int(usage.get("output") or 0) * price_out
     ) / 1_000_000
     return round(dollars, 6)
 
@@ -449,6 +590,18 @@ def _normalize_usage(usage: Any) -> dict[str, int]:
         "cache_write": int(getattr(usage, "cache_creation_input_tokens", 0) or 0),
         "output": int(getattr(usage, "output_tokens", 0) or 0),
     }
+
+
+def sum_usage(*usages: dict[str, int] | None) -> dict[str, int]:
+    """Add normalized usage dicts field by field."""
+
+    total = dict(_EMPTY_USAGE)
+    for usage in usages:
+        if not usage:
+            continue
+        for key in total:
+            total[key] += int(usage.get(key) or 0)
+    return total
 
 
 def summarize_legibility(transactions: list[dict[str, Any]]) -> dict[str, int]:
@@ -493,6 +646,7 @@ def _skip(reason: str, **extra: Any) -> dict[str, Any]:
         "skipped": True,
         "reason": reason,
         "model": resolve_model_id(),
+        "orientation_model": ORIENTATION_MODEL_ID,
         "parser_version": VISION_PARSER_VERSION,
         "filer_name": None,
         "filing_date": None,
@@ -506,6 +660,9 @@ def _skip(reason: str, **extra: Any) -> dict[str, Any]:
         "cost_usd": 0.0,
         "stop_reason": None,
         "attempts": 0,
+        "orientation": None,
+        "read_agreement": None,
+        "calls": [],
     }
     payload.update(extra)
     return payload
@@ -544,9 +701,259 @@ def _rejected_structured_output(error: Exception) -> bool:
     return any(token in message for token in ("output_config", "json_schema", "output_format"))
 
 
-def _request_kwargs(
+# -- Page images + orientation ---------------------------------------------
+
+
+def _image_block(png: bytes) -> dict[str, Any]:
+    return {
+        "type": "image",
+        "source": {
+            "type": "base64",
+            "media_type": "image/png",
+            "data": base64.standard_b64encode(png).decode("ascii"),
+        },
+    }
+
+
+def _render_page(
+    page: Any,
+    module: Any,
+    base_rotation: int,
+    rotation: int,
+    max_long_edge: int = MAX_IMAGE_LONG_EDGE,
+) -> tuple[bytes, int, int]:
+    """Render one page as PNG bytes with ``rotation`` degrees clockwise applied.
+
+    ``page.set_rotation`` follows the PDF ``/Rotate`` convention (clockwise) and
+    only changes the in-memory document. The zoom is chosen so the page renders
+    at :data:`RENDER_DPI` unless that would push the long edge past
+    ``max_long_edge``.
+    """
+
+    page.set_rotation((base_rotation + rotation) % 360)
+    rect = page.rect
+    long_edge = float(max(rect.width, rect.height)) or 1.0
+    zoom = min(RENDER_DPI / 72.0, max_long_edge / long_edge)
+    pixmap = page.get_pixmap(matrix=module.Matrix(zoom, zoom), alpha=False)
+    return pixmap.tobytes("png"), int(pixmap.width), int(pixmap.height)
+
+
+def orientation_heuristic(width: int, height: int) -> int:
+    """Rotation to apply when the model cannot be asked.
+
+    The House PTR paper form is landscape, so a portrait page is almost always a
+    sideways scan of it. Which way it was turned is a coin toss; 90 is the
+    convention here and the model confirms it when it can.
+    """
+
+    return 90 if height > width else 0
+
+
+def _first_text(message: Any) -> str:
+    for block in list(getattr(message, "content", None) or []):
+        if getattr(block, "type", None) == "text":
+            return str(getattr(block, "text", "") or "")
+    return ""
+
+
+def _ask_orientation(client: Any, content: list[dict[str, Any]]) -> tuple[str, dict[str, int]]:
+    response = client.messages.create(
+        model=ORIENTATION_MODEL_ID,
+        max_tokens=ORIENTATION_MAX_TOKENS,
+        system=ORIENTATION_SYSTEM_PROMPT,
+        messages=[{"role": "user", "content": content}],
+    )
+    return _first_text(response), _normalize_usage(getattr(response, "usage", None))
+
+
+def _said_no(answer: str) -> bool:
+    return bool(re.search(r"\bno\b", answer, re.IGNORECASE)) and not re.search(
+        r"\byes\b", answer, re.IGNORECASE
+    )
+
+
+def detect_orientation(
+    client: Any,
+    render: Any,
+    *,
+    width: int,
+    height: int,
+) -> tuple[int, str, dict[str, int]]:
+    """Return ``(rotation, method, usage)`` for one page.
+
+    ``render`` is a callable ``(rotation, max_long_edge) -> png``. All four
+    rotations are rendered small and shown together to
+    :data:`ORIENTATION_MODEL_ID`, which picks the upright one; judging
+    candidates side by side is far more reliable than asking how far a single
+    image is turned (a lone sideways scan was routinely called "0"). The chosen
+    rendering is then shown once more to confirm; a "no" falls back to
+    :func:`orientation_heuristic`, or to the opposite turn when the heuristic
+    is the rejected answer. Any failure falls back to the heuristic.
+    """
+
+    usage = dict(_EMPTY_USAGE)
+    try:
+        candidates = {
+            rotation: render(rotation, ORIENTATION_CANDIDATE_LONG_EDGE) for rotation in ROTATIONS
+        }
+        content: list[dict[str, Any]] = []
+        for rotation in ROTATIONS:
+            content.append({"type": "text", "text": f"Label {rotation}:"})
+            content.append(_image_block(candidates[rotation]))
+        content.append({"type": "text", "text": ORIENTATION_QUESTION})
+        answer, call_usage = _ask_orientation(client, content)
+        usage = sum_usage(usage, call_usage)
+        match = re.search(r"\b(0|90|180|270)\b", answer)
+        if match is None:
+            logger.warning("ptr_vision: orientation model answered %r; using heuristic", answer)
+            return orientation_heuristic(width, height), "heuristic", usage
+        rotation = int(match.group(1))
+
+        confirmation, call_usage = _ask_orientation(
+            client,
+            [_image_block(candidates[rotation]), {"type": "text", "text": ORIENTATION_CONFIRM_QUESTION}],
+        )
+        usage = sum_usage(usage, call_usage)
+        if _said_no(confirmation):
+            fallback = orientation_heuristic(width, height)
+            if fallback == rotation:
+                fallback = {0: 180, 90: 270, 180: 0, 270: 90}[rotation]
+            logger.info(
+                "ptr_vision: orientation model retracted %d degrees; using %d", rotation, fallback
+            )
+            return fallback, "model-corrected", usage
+        return rotation, "model-confirmed", usage
+    except Exception as error:  # noqa: BLE001 - orientation must never fail the read
+        logger.warning(
+            "ptr_vision: orientation call failed (%s: %s); using heuristic",
+            type(error).__name__,
+            error,
+        )
+    return orientation_heuristic(width, height), "heuristic", usage
+
+
+def prepare_page_images(
+    pdf_path: Path,
+    client: Any,
+) -> tuple[list[dict[str, Any]], list[dict[str, Any]], dict[str, int]] | None:
+    """Render every page upright.
+
+    Returns ``(pages, orientation, usage)`` or None when pymupdf is unavailable
+    or cannot open the file. Each page is ``{"index", "png", "width", "height"}``
+    and each orientation entry ``{"page", "rotation", "method", "width",
+    "height"}``. ``usage`` is the orientation model's summed token usage.
+    """
+
+    module = _pdf_module()
+    if module is None:
+        return None
+    try:
+        document = module.open(str(pdf_path))
+    except Exception as error:  # noqa: BLE001 - fall back to the document block
+        logger.warning("ptr_vision: pymupdf could not open %s: %s", pdf_path.name, error)
+        return None
+
+    pages: list[dict[str, Any]] = []
+    orientation: list[dict[str, Any]] = []
+    usage = dict(_EMPTY_USAGE)
+    try:
+        with document:
+            for position in range(int(document.page_count)):
+                page = document[position]
+                base_rotation = int(getattr(page, "rotation", 0) or 0)
+                rect = page.rect
+                natural_width, natural_height = float(rect.width), float(rect.height)
+
+                def _render(
+                    rotation: int,
+                    max_long_edge: int = MAX_IMAGE_LONG_EDGE,
+                    _page: Any = page,
+                    _base: int = base_rotation,
+                ) -> bytes:
+                    return _render_page(_page, module, _base, rotation, max_long_edge)[0]
+
+                rotation, method, call_usage = detect_orientation(
+                    client, _render, width=int(natural_width), height=int(natural_height)
+                )
+                usage = sum_usage(usage, call_usage)
+                png, width, height = _render_page(page, module, base_rotation, rotation)
+                pages.append({"index": position + 1, "png": png, "width": width, "height": height})
+                orientation.append(
+                    {
+                        "page": position + 1,
+                        "rotation": rotation,
+                        "method": method,
+                        "width": width,
+                        "height": height,
+                    }
+                )
+    except Exception as error:  # noqa: BLE001 - fall back to the document block
+        logger.warning("ptr_vision: page rendering failed for %s: %s", pdf_path.name, error)
+        return None
+    if not pages:
+        return None
+    return pages, orientation, usage
+
+
+def filing_context(filing_year: int | None, filing_date: str | None) -> str:
+    """Per-filing hint appended to the user turn (after the cached prefix)."""
+
+    parts: list[str] = []
+    if filing_date:
+        parts.append(f"This report was filed on {filing_date}.")
+    elif filing_year:
+        parts.append(f"This report was filed in {filing_year}.")
+    if parts:
+        parts.append(
+            "No transaction or notification date on it can be later than that; "
+            "use it to resolve two-digit years, never to fill in a date you cannot read."
+        )
+    return " ".join(parts)
+
+
+def build_image_content(
+    pages: list[dict[str, Any]],
+    filename: str,
+    context: str = "",
+) -> list[dict[str, Any]]:
+    """User content: a label and image per page, then the instruction."""
+
+    total = len(pages)
+    blocks: list[dict[str, Any]] = []
+    for page in pages:
+        blocks.append({"type": "text", "text": f"Page {page['index']} of {total}:"})
+        blocks.append(_image_block(page["png"]))
+    text = f"{USER_INSTRUCTION}\n\n{context}".rstrip() + f"\n\nFile: {filename}"
+    blocks.append({"type": "text", "text": text})
+    return blocks
+
+
+def build_document_content(
     pdf_b64: str,
     filename: str,
+    context: str = "",
+) -> list[dict[str, Any]]:
+    """User content when pymupdf is unavailable: the PDF as a document block."""
+
+    text = f"{USER_INSTRUCTION}\n\n{context}".rstrip() + f"\n\nFile: {filename}"
+    return [
+        {
+            "type": "document",
+            "source": {
+                "type": "base64",
+                "media_type": "application/pdf",
+                "data": pdf_b64,
+            },
+        },
+        {"type": "text", "text": text},
+    ]
+
+
+# -- Request ----------------------------------------------------------------
+
+
+def _request_kwargs(
+    content: list[dict[str, Any]],
     *,
     structured: bool,
     with_output_config: bool = True,
@@ -569,22 +976,7 @@ def _request_kwargs(
             }
         ],
         "thinking": {"type": "adaptive"},
-        "messages": [
-            {
-                "role": "user",
-                "content": [
-                    {
-                        "type": "document",
-                        "source": {
-                            "type": "base64",
-                            "media_type": "application/pdf",
-                            "data": pdf_b64,
-                        },
-                    },
-                    {"type": "text", "text": f"{USER_INSTRUCTION}\n\nFile: {filename}"},
-                ],
-            }
-        ],
+        "messages": [{"role": "user", "content": content}],
     }
     if structured:
         kwargs["output_config"] = {
@@ -597,7 +989,7 @@ def _request_kwargs(
         kwargs["tools"] = [
             {
                 "name": VISION_TOOL_NAME,
-                "description": "Record every transaction row transcribed from the PTR PDF.",
+                "description": "Record every transaction row transcribed from the PTR pages.",
                 "strict": True,
                 "input_schema": PTR_VISION_SCHEMA,
             }
@@ -659,6 +1051,350 @@ def _clean_optional_text(value: Any) -> str | None:
     return text or None
 
 
+class _ReadState:
+    """Structured-output downgrade state shared by the reads of one filing."""
+
+    def __init__(self) -> None:
+        self.structured = True
+        self.with_output_config = True
+        self.downgraded = False
+
+
+def _read_once(
+    client: Any,
+    content: list[dict[str, Any]],
+    state: _ReadState,
+    *,
+    label: str,
+    filename: str,
+) -> dict[str, Any]:
+    """One transcription request with the retry / downgrade ladder.
+
+    Returns ``{"ok", "reason", "payload", "usage", "cost_usd", "attempts",
+    "stop_reason", "structured"}``. Never raises.
+    """
+
+    attempts = 0
+    message: Any = None
+    last_error: Exception | None = None
+
+    while attempts < 2:
+        attempts += 1
+        kwargs = _request_kwargs(
+            content,
+            structured=state.structured,
+            with_output_config=state.with_output_config,
+        )
+        try:
+            message = _invoke(client, kwargs)
+            break
+        except TypeError as error:
+            # The installed SDK does not accept output_config at all -> drop it
+            # and use a single strict tool instead. Does not consume a retry.
+            if not state.downgraded and "output_config" in str(error):
+                logger.warning(
+                    "ptr_vision: SDK rejected output_config; retrying with strict tool use"
+                )
+                state.structured = False
+                state.with_output_config = False
+                state.downgraded = True
+                attempts -= 1
+                continue
+            last_error = error
+            break
+        except Exception as error:  # noqa: BLE001 - classified by _is_retryable
+            last_error = error
+            if not state.downgraded and _rejected_structured_output(error):
+                # The API refused the json_schema format; fall back to the tool
+                # form once before giving up. Does not consume a retry.
+                logger.warning(
+                    "ptr_vision: API rejected structured output (%s); retrying with strict tool use",
+                    error,
+                )
+                state.structured = False
+                state.downgraded = True
+                attempts -= 1
+                continue
+            if attempts >= 2 or not _is_retryable(error):
+                break
+            logger.warning(
+                "ptr_vision: retryable error on %s %s (%s); retrying once",
+                filename,
+                label,
+                type(error).__name__,
+            )
+            time.sleep(RETRY_SLEEP_SECONDS)
+
+    outcome: dict[str, Any] = {
+        "label": label,
+        "ok": False,
+        "reason": None,
+        "payload": None,
+        "usage": dict(_EMPTY_USAGE),
+        "cost_usd": 0.0,
+        "attempts": attempts,
+        "stop_reason": None,
+        "structured": state.structured,
+    }
+    if message is None:
+        logger.error("ptr_vision: %s failed for %s: %s", label, filename, last_error)
+        outcome["reason"] = f"api error: {last_error}"
+        return outcome
+
+    usage = _normalize_usage(getattr(message, "usage", None))
+    outcome["usage"] = usage
+    outcome["cost_usd"] = estimate_cost_usd(usage)
+    stop_reason = getattr(message, "stop_reason", None)
+    outcome["stop_reason"] = stop_reason
+
+    if stop_reason == "refusal":
+        details = getattr(message, "stop_details", None)
+        category = (
+            details.get("category")
+            if isinstance(details, dict)
+            else getattr(details, "category", None)
+        )
+        outcome["reason"] = f"model refused (category={category})"
+        return outcome
+    if stop_reason == "max_tokens":
+        outcome["reason"] = "response truncated at max_tokens"
+        return outcome
+
+    payload = _payload_from_message(message)
+    if payload is None:
+        outcome["reason"] = "no structured payload in response"
+        return outcome
+
+    outcome["ok"] = True
+    outcome["payload"] = payload
+    return outcome
+
+
+# -- Two-read agreement -----------------------------------------------------
+
+
+def normalize_description(text: Any) -> str:
+    """Lower-case, strip punctuation, collapse whitespace."""
+
+    return " ".join(re.sub(r"[^0-9a-z]+", " ", str(text or "").lower()).split())
+
+
+def description_similarity(a: Any, b: Any) -> float:
+    """Similarity between two normalized asset descriptions, 0..1.
+
+    The ``difflib`` character ratio, lifted by token containment so that
+    "AT&T" and "AT&T Inc" (ratio 0.67 on "at t" / "at t inc") still pair up
+    when one read added or dropped a suffix. Containment only counts when the
+    shorter string is at least four characters, so a stray "Inc" cannot match
+    everything.
+    """
+
+    left, right = normalize_description(a), normalize_description(b)
+    if not left or not right:
+        return 0.0
+    if left == right:
+        return 1.0
+    ratio = difflib.SequenceMatcher(None, left, right).ratio()
+    shorter, longer = sorted((left, right), key=len)
+    if len(shorter) >= 4:
+        short_tokens = set(shorter.split())
+        long_tokens = set(longer.split())
+        if short_tokens and short_tokens <= long_tokens:
+            return 1.0
+        containment = len(short_tokens & long_tokens) / max(1, len(short_tokens))
+        ratio = max(ratio, containment)
+    return ratio
+
+
+def _comparable(row: dict[str, Any], field: str) -> Any:
+    """Field value in the form used for agreement checks."""
+
+    if field == "amount":
+        try:
+            low = int(row.get("amount_min") or 0)
+        except (TypeError, ValueError):
+            low = 0
+        try:
+            high = int(row.get("amount_max") or 0)
+        except (TypeError, ValueError):
+            high = 0
+        return (low, high)
+    value = row.get(field)
+    if value is None:
+        return None
+    if isinstance(value, bool):
+        return value
+    text = str(value).strip().lower()
+    return text or None
+
+
+def match_rows(
+    rows_a: list[dict[str, Any]],
+    rows_b: list[dict[str, Any]],
+) -> list[tuple[int, int, float]]:
+    """Pair rows across two reads.
+
+    Candidates need a description similarity of at least
+    :data:`SIMILARITY_THRESHOLD`. Among candidates, a matching transaction type
+    wins, then the higher similarity, then the closer printed position, so two
+    rows for the same asset (a purchase and a sale) pair up with their own
+    counterparts. Greedy, one-to-one.
+    """
+
+    candidates: list[tuple[int, float, int, int, int]] = []
+    for i, row_a in enumerate(rows_a):
+        for j, row_b in enumerate(rows_b):
+            ratio = description_similarity(
+                row_a.get("asset_description"), row_b.get("asset_description")
+            )
+            if ratio < SIMILARITY_THRESHOLD:
+                continue
+            type_a = _comparable(row_a, "transaction_type")
+            type_b = _comparable(row_b, "transaction_type")
+            same_type = 1 if (type_a and type_b and type_a == type_b) else 0
+            candidates.append((same_type, ratio, -abs(i - j), i, j))
+    candidates.sort(reverse=True)
+
+    used_a: set[int] = set()
+    used_b: set[int] = set()
+    pairs: list[tuple[int, int, float]] = []
+    for _same_type, ratio, _distance, i, j in candidates:
+        if i in used_a or j in used_b:
+            continue
+        used_a.add(i)
+        used_b.add(j)
+        pairs.append((i, j, ratio))
+    pairs.sort()
+    return pairs
+
+
+def _worst_legibility(*ratings: Any) -> str:
+    rank = 0
+    for rating in ratings:
+        text = str(rating or "partial").strip().lower()
+        rank = max(rank, _LEGIBILITY_RANK.get(text, 1))
+    return _LEGIBILITY_BY_RANK[rank]
+
+
+def _downgrade(legibility: str, floor: str) -> str:
+    return _LEGIBILITY_BY_RANK[max(_LEGIBILITY_RANK[legibility], _LEGIBILITY_RANK[floor])]
+
+
+def _merge_comment(*comments: Any) -> str | None:
+    texts = [str(c).strip() for c in comments if c is not None and str(c).strip()]
+    if not texts:
+        return None
+    return max(texts, key=len)
+
+
+def merge_matched_rows(row_a: dict[str, Any], row_b: dict[str, Any]) -> tuple[dict[str, Any], list[str]]:
+    """Merge one matched pair, keeping only fields both reads agree on.
+
+    Returns ``(merged_row, disagreements)``. A disagreement on a
+    :data:`CRITICAL_FIELDS` entry nulls the field and marks the row
+    ``illegible``; on a :data:`SOFT_FIELDS` entry it nulls the field and marks
+    the row at least ``partial``. The asset description keeps the reading the
+    model was more confident about (``clear`` over ``partial``), and the longer
+    of the two when it rated both the same.
+    """
+
+    merged: dict[str, Any] = dict(row_a)
+    disagreements: list[str] = []
+
+    desc_a = str(row_a.get("asset_description") or "").strip()
+    desc_b = str(row_b.get("asset_description") or "").strip()
+    rank_a = _LEGIBILITY_RANK.get(str(row_a.get("legibility") or "partial").lower(), 1)
+    rank_b = _LEGIBILITY_RANK.get(str(row_b.get("legibility") or "partial").lower(), 1)
+    if rank_b < rank_a or (rank_b == rank_a and len(desc_b) > len(desc_a)):
+        merged["asset_description"] = desc_b
+    else:
+        merged["asset_description"] = desc_a
+
+    for field in CRITICAL_FIELDS + SOFT_FIELDS:
+        value_a = _comparable(row_a, field)
+        value_b = _comparable(row_b, field)
+        if field == "amount":
+            if value_a != value_b:
+                merged["amount_min"] = None
+                merged["amount_max"] = None
+                disagreements.append("amount")
+            continue
+        if value_a == value_b:
+            merged[field] = row_a.get(field) if row_a.get(field) is not None else row_b.get(field)
+        else:
+            merged[field] = None
+            disagreements.append(field)
+
+    legibility = _worst_legibility(row_a.get("legibility"), row_b.get("legibility"))
+    if any(field in CRITICAL_FIELDS for field in disagreements):
+        legibility = "illegible"
+    elif disagreements:
+        legibility = _downgrade(legibility, "partial")
+    merged["legibility"] = legibility
+
+    comment = _merge_comment(row_a.get("comment"), row_b.get("comment"))
+    if disagreements:
+        note = "two reads disagreed on: " + ", ".join(disagreements)
+        comment = f"{comment}; {note}" if comment else note
+    merged["comment"] = comment
+    return merged, disagreements
+
+
+def _unmatched(row: dict[str, Any], label: str) -> dict[str, Any]:
+    copy = dict(row)
+    copy["legibility"] = "illegible"
+    note = f"seen by only one of two reads ({label})"
+    existing = _merge_comment(copy.get("comment"))
+    copy["comment"] = f"{existing}; {note}" if existing else note
+    return copy
+
+
+def reconcile_reads(
+    rows_a: list[dict[str, Any]],
+    rows_b: list[dict[str, Any]],
+) -> tuple[list[dict[str, Any]], dict[str, Any]]:
+    """Combine two independent reads of the same pages.
+
+    Returns ``(rows, agreement)``. Rows follow read A's printed order with read
+    B's unmatched rows appended. ``agreement`` is the ``readAgreement``
+    metadata block: ``rowsA``, ``rowsB``, ``matched``, ``unmatchedA``,
+    ``unmatchedB``, ``rowCountsAgree`` and per-field disagreement counts.
+    """
+
+    pairs = match_rows(rows_a, rows_b)
+    by_a = {i: (j, ratio) for i, j, ratio in pairs}
+    matched_b = {j for _i, j, _ratio in pairs}
+
+    merged_rows: list[dict[str, Any]] = []
+    disagreement_counts: dict[str, int] = {}
+    for i, row_a in enumerate(rows_a):
+        if i in by_a:
+            j, _ratio = by_a[i]
+            merged, disagreements = merge_matched_rows(row_a, rows_b[j])
+            for field in disagreements:
+                disagreement_counts[field] = disagreement_counts.get(field, 0) + 1
+            merged_rows.append(merged)
+        else:
+            merged_rows.append(_unmatched(row_a, "read A"))
+    for j, row_b in enumerate(rows_b):
+        if j not in matched_b:
+            merged_rows.append(_unmatched(row_b, "read B"))
+
+    agreement: dict[str, Any] = {
+        "rowsA": len(rows_a),
+        "rowsB": len(rows_b),
+        "matched": len(pairs),
+        "unmatchedA": len(rows_a) - len(pairs),
+        "unmatchedB": len(rows_b) - len(pairs),
+        "rowCountsAgree": len(rows_a) == len(rows_b),
+        "fieldDisagreements": disagreement_counts,
+    }
+    return merged_rows, agreement
+
+
+# -- Metadata ---------------------------------------------------------------
+
+
 def build_vision_metadata(report: dict[str, Any]) -> dict[str, Any]:
     """Compact a vision result for ``house_filing_stubs.metadata.visionParse``.
 
@@ -669,8 +1405,13 @@ def build_vision_metadata(report: dict[str, Any]) -> dict[str, Any]:
     """
 
     usage = report.get("usage") or {}
-    return {
-        "model": report.get("model"),
+    model = report.get("model")
+    price_in, price_out = pricing_for_model(model)
+    orientation_model = report.get("orientation_model") or ORIENTATION_MODEL_ID
+    orient_in, orient_out = pricing_for_model(orientation_model)
+    metadata: dict[str, Any] = {
+        "model": model,
+        "orientationModel": orientation_model,
         "parserVersion": report.get("parser_version"),
         "ok": bool(report.get("ok")),
         "skipped": bool(report.get("skipped")),
@@ -686,6 +1427,9 @@ def build_vision_metadata(report: dict[str, Any]) -> dict[str, Any]:
         "filerName": report.get("filer_name"),
         "filingDate": report.get("filing_date"),
         "notes": (report.get("notes") or None),
+        "orientation": report.get("orientation"),
+        "readAgreement": report.get("read_agreement"),
+        "calls": report.get("calls") or [],
         "usage": {
             "inputTokens": int(usage.get("input") or 0),
             "cacheReadTokens": int(usage.get("cache_read") or 0),
@@ -694,23 +1438,66 @@ def build_vision_metadata(report: dict[str, Any]) -> dict[str, Any]:
         },
         "costUsd": report.get("cost_usd", 0.0),
         "pricing": {
-            "inputPerMTok": PRICE_INPUT_PER_MTOK,
-            "outputPerMTok": PRICE_OUTPUT_PER_MTOK,
+            "inputPerMTok": price_in,
+            "outputPerMTok": price_out,
             "cacheReadMultiplier": CACHE_READ_MULTIPLIER,
             "cacheWriteMultiplier": CACHE_WRITE_MULTIPLIER,
+            "orientation": {"inputPerMTok": orient_in, "outputPerMTok": orient_out},
         },
     }
+    scrubs = int(report.get("example_row_scrubs") or 0)
+    if scrubs:
+        metadata["exampleRowScrubs"] = scrubs
+    return metadata
 
 
 # -- Entry point ------------------------------------------------------------
 
 
-def extract_via_vision(pdf_path: Path) -> dict[str, Any]:
-    """Transcribe a House PTR PDF with a Claude vision model.
+def _call_record(label: str, model: str, usage: dict[str, int], cost: float, **extra: Any) -> dict[str, Any]:
+    record: dict[str, Any] = {
+        "label": label,
+        "model": model,
+        "usage": dict(usage),
+        "costUsd": round(float(cost), 6),
+    }
+    record.update(extra)
+    return record
+
+
+def row_summary(row: dict[str, Any]) -> str:
+    """One-line rendering of a raw read row for the stub metadata.
+
+    Lets a reviewer see what each read said before reconciliation without
+    storing the full transcription twice.
+    """
+
+    amount = f"{row.get('amount_min')}-{row.get('amount_max')}"
+    parts = (
+        str(row.get("asset_description") or "").strip(),
+        str(row.get("transaction_type") or "?"),
+        str(row.get("transaction_date") or "?"),
+        str(row.get("notification_date") or "-"),
+        amount,
+        str(row.get("owner") or "-"),
+        str(row.get("legibility") or "?"),
+    )
+    return " | ".join(parts)
+
+
+def extract_via_vision(
+    pdf_path: Path,
+    *,
+    filing_year: int | None = None,
+    filing_date: str | None = None,
+) -> dict[str, Any]:
+    """Transcribe a House PTR PDF with a Claude vision model, twice, and agree.
 
     Always returns a dict. ``ok`` is False and ``reason`` is set whenever the
     filing was skipped or the call failed; the caller then leaves the stub in
-    ``needs_review`` and records ``reason`` in its metadata.
+    ``needs_review`` and records ``reason`` in its metadata. ``filing_year``
+    drives the example-row scrub; ``filing_date`` (YYYY-MM-DD) is passed to the
+    model as a hint for two-digit years.
     """
 
     if vision_disabled():
@@ -747,139 +1534,174 @@ def extract_via_vision(pdf_path: Path) -> dict[str, Any]:
     if page_count is None:
         logger.debug("ptr_vision: no PDF reader available; skipping the page-count guardrail")
 
-    # Base64 with no newlines, as the document content block requires.
-    pdf_b64 = base64.standard_b64encode(pdf_bytes).decode("ascii")
+    client = _client_once()
+    model = resolve_model_id()
+    context = filing_context(filing_year, filing_date)
+    calls: list[dict[str, Any]] = []
 
-    structured = True
-    with_output_config = True
-    downgraded = False
-    attempts = 0
-    message: Any = None
-    last_error: Exception | None = None
-
-    while attempts < 2:
-        attempts += 1
-        kwargs = _request_kwargs(
-            pdf_b64,
-            pdf_path.name,
-            structured=structured,
-            with_output_config=with_output_config,
-        )
-        try:
-            message = _invoke(_client_once(), kwargs)
-            break
-        except TypeError as error:
-            # The installed SDK does not accept output_config at all -> drop it
-            # and use a single strict tool instead. Does not consume a retry.
-            if not downgraded and "output_config" in str(error):
-                logger.warning(
-                    "ptr_vision: SDK rejected output_config; retrying with strict tool use"
-                )
-                structured = False
-                with_output_config = False
-                downgraded = True
-                attempts -= 1
-                continue
-            last_error = error
-            break
-        except Exception as error:  # noqa: BLE001 - classified by _is_retryable
-            last_error = error
-            if not downgraded and _rejected_structured_output(error):
-                # The API refused the json_schema format; fall back to the tool
-                # form once before giving up. Does not consume a retry.
-                logger.warning(
-                    "ptr_vision: API rejected structured output (%s); retrying with strict tool use",
-                    error,
-                )
-                structured = False
-                downgraded = True
-                attempts -= 1
-                continue
-            if attempts >= 2 or not _is_retryable(error):
-                break
-            logger.warning(
-                "ptr_vision: retryable error on %s (%s); retrying once",
-                pdf_path.name,
-                type(error).__name__,
+    # Upright page images when pymupdf can render them, the raw PDF otherwise.
+    orientation: list[dict[str, Any]] | None = None
+    prepared = prepare_page_images(pdf_path, client)
+    if prepared is not None:
+        pages, orientation, orient_usage = prepared
+        orient_cost = estimate_cost_usd(orient_usage, ORIENTATION_MODEL_ID)
+        calls.append(
+            _call_record(
+                "orientation",
+                ORIENTATION_MODEL_ID,
+                orient_usage,
+                orient_cost,
+                pages=len(pages),
             )
-            time.sleep(RETRY_SLEEP_SECONDS)
-
-    if message is None:
-        logger.error("ptr_vision: call failed for %s: %s", pdf_path.name, last_error)
-        return _skip(f"api error: {last_error}", attempts=attempts)
-
-    usage = _normalize_usage(getattr(message, "usage", None))
-    cost = estimate_cost_usd(usage)
-    stop_reason = getattr(message, "stop_reason", None)
-
-    if stop_reason == "refusal":
-        details = getattr(message, "stop_details", None)
-        category = (
-            details.get("category")
-            if isinstance(details, dict)
-            else getattr(details, "category", None)
         )
+        content = build_image_content(pages, pdf_path.name, context)
+        if page_count is None:
+            page_count = len(pages)
+        logger.info(
+            "ptr_vision: %s -> %d upright page image(s) %s",
+            pdf_path.name,
+            len(pages),
+            [(entry["rotation"], entry["method"]) for entry in orientation],
+        )
+    else:
+        # Base64 with no newlines, as the document content block requires.
+        pdf_b64 = base64.standard_b64encode(pdf_bytes).decode("ascii")
+        content = build_document_content(pdf_b64, pdf_path.name, context)
+        logger.info("ptr_vision: %s -> sending the PDF as a document block", pdf_path.name)
+
+    state = _ReadState()
+    reads: list[dict[str, Any]] = []
+    for position in range(READS_PER_FILING):
+        label = f"read {'AB'[position] if position < 2 else position + 1}"
+        outcome = _read_once(client, content, state, label=label, filename=pdf_path.name)
+        raw_rows = _coerce_transactions((outcome["payload"] or {}).get("transactions"))
+        calls.append(
+            _call_record(
+                label,
+                model,
+                outcome["usage"],
+                outcome["cost_usd"],
+                ok=outcome["ok"],
+                reason=outcome["reason"],
+                attempts=outcome["attempts"],
+                stopReason=outcome["stop_reason"],
+                rows=[row_summary(row) for row in raw_rows] if outcome["ok"] else None,
+            )
+        )
+        reads.append(outcome)
+        if position == 0 and not outcome["ok"]:
+            # A first read that refused, truncated, or errored would fail the
+            # same way again; do not pay for the second.
+            break
+
+    usage = sum_usage(*(call["usage"] for call in calls))
+    cost = round(sum(float(call["costUsd"]) for call in calls), 6)
+    attempts = sum(int(read["attempts"]) for read in reads)
+    read_a = reads[0]
+    if not read_a["ok"]:
         return _skip(
-            f"model refused (category={category})",
+            str(read_a["reason"]),
             usage=usage,
             cost_usd=cost,
-            stop_reason=stop_reason,
+            stop_reason=read_a["stop_reason"],
             attempts=attempts,
-        )
-    if stop_reason == "max_tokens":
-        return _skip(
-            "response truncated at max_tokens",
-            usage=usage,
-            cost_usd=cost,
-            stop_reason=stop_reason,
-            attempts=attempts,
+            orientation=orientation,
+            calls=calls,
+            page_count=page_count,
         )
 
-    payload = _payload_from_message(message)
-    if payload is None:
-        return _skip(
-            "no structured payload in response",
-            usage=usage,
-            cost_usd=cost,
-            stop_reason=stop_reason,
-            attempts=attempts,
-        )
+    payload_a = read_a["payload"] or {}
+    rows_a, scrubs_a = scrub_example_row_values(
+        _coerce_transactions(payload_a.get("transactions")), filing_year
+    )
 
-    transactions = _coerce_transactions(payload.get("transactions"))
+    read_b = reads[1] if len(reads) > 1 else None
+    payload_b: dict[str, Any] = {}
+    if read_b is not None and read_b["ok"]:
+        payload_b = read_b["payload"] or {}
+        rows_b, scrubs_b = scrub_example_row_values(
+            _coerce_transactions(payload_b.get("transactions")), filing_year
+        )
+        transactions, agreement = reconcile_reads(rows_a, rows_b)
+    else:
+        # Only one usable read: nothing can be confirmed, so every row goes to
+        # a human. Its values are kept so the reviewer has something to check.
+        scrubs_b = 0
+        transactions = [_unmatched(row, "read A") for row in rows_a]
+        agreement = {
+            "rowsA": len(rows_a),
+            "rowsB": None,
+            "matched": 0,
+            "unmatchedA": len(rows_a),
+            "unmatchedB": 0,
+            "rowCountsAgree": False,
+            "fieldDisagreements": {},
+            "readBFailed": (read_b or {}).get("reason") or "second read not attempted",
+        }
+
     counts = summarize_legibility(transactions)
     confidence = legibility_confidence(counts)
-    needs_review = majority_illegible(counts)
+    review_reasons: list[str] = []
+    if majority_illegible(counts):
+        review_reasons.append("majority illegible")
+    if not agreement.get("rowCountsAgree"):
+        review_reasons.append("reads disagree on row count")
+    critical = {
+        field: count
+        for field, count in (agreement.get("fieldDisagreements") or {}).items()
+        if field in CRITICAL_FIELDS
+    }
+    if critical:
+        review_reasons.append("reads disagree on " + ", ".join(sorted(critical)))
+    needs_review = bool(review_reasons)
 
-    reported_pages = payload.get("page_count")
+    def _header(field: str) -> Any:
+        value = payload_a.get(field)
+        return value if value is not None else payload_b.get(field)
+
+    notes = [
+        _clean_optional_text(payload_a.get("notes")),
+        _clean_optional_text(payload_b.get("notes")),
+    ]
+    unique_notes = [note for index, note in enumerate(notes) if note and note not in notes[:index]]
+
+    reported_pages = _header("page_count")
     result: dict[str, Any] = {
         "ok": bool(transactions),
         "skipped": False,
         "reason": None if transactions else "model returned no transaction rows",
-        "model": resolve_model_id(),
+        "model": model,
+        "orientation_model": ORIENTATION_MODEL_ID,
         "parser_version": VISION_PARSER_VERSION,
-        "filer_name": _clean_optional_text(payload.get("filer_name")),
-        "filing_date": _clean_optional_text(payload.get("filing_date")),
+        "filer_name": _clean_optional_text(_header("filer_name")),
+        "filing_date": _clean_optional_text(_header("filing_date")),
         "page_count": reported_pages if reported_pages is not None else page_count,
-        "notes": _clean_optional_text(payload.get("notes")),
+        "notes": " | ".join(unique_notes) or None,
         "transactions": transactions,
         "legibility": counts,
         "confidence": confidence,
         "needs_review": needs_review,
+        "needs_review_reasons": review_reasons,
         "usage": usage,
         "cost_usd": cost,
-        "stop_reason": stop_reason,
+        "stop_reason": read_a["stop_reason"],
         "attempts": attempts,
-        "structuredOutput": structured,
+        "structuredOutput": state.structured,
+        "orientation": orientation,
+        "read_agreement": agreement,
+        "example_row_scrubs": scrubs_a + scrubs_b,
+        "calls": calls,
     }
 
     logger.info(
-        "ptr_vision: %s -> %d rows (clear=%d partial=%d illegible=%d) "
+        "ptr_vision: %s -> %d rows (clear=%d partial=%d illegible=%d) agreement=%s "
         "confidence=%.2f needsReview=%s cost=$%.4f usage=%s",
         pdf_path.name,
         len(transactions),
         counts["clear"],
         counts["partial"],
         counts["illegible"],
+        {k: agreement.get(k) for k in ("rowsA", "rowsB", "matched")},
         confidence,
         needs_review,
         cost,

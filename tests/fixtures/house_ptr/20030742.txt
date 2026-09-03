@@ -1,0 +1,49 @@
+Periodic Transaction Report
+Clerk of the House of Representatives • Legislative Resource Center • B81 Cannon Building • Washington, DC 20515
+Filer Information
+Name:
+Hon. Max Miller
+Status:
+Member
+State/District: OH07
+Transactions
+ID
+Owner Asset
+Transaction
+Type
+Date
+Notification
+Date
+Amount
+Cap.
+Gains >
+$200?
+AIX Ventures Fund II, LP (GLAS
+Funds, LP) [HN]
+P
+07/15/2025
+07/27/2025
+$647.63
+Filing Status: New
+Subholding Of: 2012 Trust
+Description: Capital Call for AIX Ventures Fund II, LP (GLAS Funds, LP)
+GLAS Funds, LP [HN]
+P
+07/15/2025
+07/27/2025
+$15,001 -
+$50,000
+Filing Status: New
+Subholding Of: 2012 Trust
+Description: Transfer of $25,000 to GLAS Funds, LP to fund capital calls for future investments.
+* For the complete list of asset type abbreviations, please visit https://fd.house.gov/reference/asset-type-codes.aspx.
+Investment Vehicle Details
+2012 Trust
+Initial Public Offerings
+ Yes 
+ No
+Certification and Signature
+ I CERTIFY that the statements I have made on the attached Periodic Transaction Report are true, complete, and correct to the best of
+my knowledge and belief. Further, I CERTIFY that I have disclosed all transactions as required by the STOCK Act.
+Digitally Signed: Hon. Max Miller , 07/27/2025
+Filing ID #20030742

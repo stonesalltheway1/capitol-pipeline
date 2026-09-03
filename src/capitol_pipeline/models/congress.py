@@ -78,6 +78,10 @@ class HousePtrTransaction(BaseModel):
     amount_min: int = 0
     amount_max: int = 0
     owner: Literal["self", "spouse", "joint", "child"] = "self"
+    # Per-row annotations printed under the asset on the House form ("Filing
+    # Status: New", "Subholding Of: <account>", "Description: ...",
+    # "Comments: ..."), joined with " | ". Never part of asset_description.
+    comment: str | None = None
 
 
 class HousePtrParseResult(BaseModel):

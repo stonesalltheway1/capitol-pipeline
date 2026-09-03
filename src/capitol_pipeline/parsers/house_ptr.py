@@ -87,26 +87,121 @@ AMOUNT_RANGES: list[tuple[re.Pattern[str], int, int]] = [
     (re.compile(r"(?:over|>)\s*\$\s*50,?000,?000", re.I), 50000001, 100000000),
 ]
 
+#: The machine-readable tail of a House PTR row: optional ``(TICKER)``,
+#: optional ``[ST]`` asset-type code, the P/S/E transaction code, the
+#: transaction and notification dates, an optional owner code and the amount.
+#: Everything before it on the row is the asset name; everything after it, up
+#: to the next core, is that row's annotation block. Anchoring on the core
+#: (instead of a bounded lazy prefix) is what keeps long per-row comments from
+#: sliding into the next row's asset name.
+_ROW_CORE_SOURCE = (
+    r"(?:\(\s*(?P<ticker>[A-Z.]{1,6})\s*\)\s*)?"
+    r"(?:\[\s*(?P<asset_type>[A-Z]{2,4})\s*\]\s*)?"
+    r"(?<![A-Za-z0-9])(?P<tx_type>P|S(?:\s*\((?i:partial)\))?|E)\s+"
+    r"(?P<date>\d{1,2}/\d{1,2}/\d{4})\s+(?P<notified>\d{1,2}/\d{1,2}/\d{4})\s+"
+    r"(?:(?P<owner>Spouse/DC|JT|DC|SP|TR|XX)\s+)?"
+    r"(?P<amount>\$\s*[\d,]+(?:\.\d+)?\s*[-–—]\s*\$\s*[\d,]+(?:\.\d+)?"
+    r"|(?i:over|>)\s*\$\s*[\d,]+|\$\s*[\d,]+(?:\.\d+)?)"
+)
+
+ROW_CORE_PATTERN = re.compile(_ROW_CORE_SOURCE)
+
+#: Legacy single-row pattern (asset prefix + core). ``parse_transactions`` no
+#: longer uses it; it is kept for callers that match one already-isolated row.
 TRANSACTION_PATTERN = re.compile(
-    r"((?:[A-Z]{1,3}\s+)?[^[]{6,240}?)(?:\s*\(([A-Z.]{1,6})\))?"
-    r"\s*(?:\[([A-Z]{2,4})\]\s*)?(P|S(?:\s*\(partial\))?|E)\s+"
-    r"(\d{1,2}/\d{1,2}/\d{4})\s+(\d{1,2}/\d{1,2}/\d{4})\s+"
-    r"(?:(Spouse/DC|JT|DC|SP|TR|XX)\s+)?"
-    r"(\$[\d,]+\s*[-–—]\s*\$[\d,]+|(?:Over|>)\s*\$[\d,]+)(?:\s+[A-Z])?",
+    r"((?:[A-Z]{1,3}\s+)?[^[]{6,240}?)\s*" + _ROW_CORE_SOURCE,
     re.I,
 )
 
+#: Repeated per-page furniture on the House form. Stripped everywhere before
+#: rows are segmented so a page break never glues a column heading, footer or
+#: filer block onto an asset name.
+_FIRST_COLUMN_HEADER_PATTERN = re.compile(
+    r"^.*?\bCap\.\s*Gains\s*>\s*\$200\?[ \t]*", re.I | re.S
+)
+_COLUMN_HEADER_PATTERN = re.compile(
+    r"(?:\bID\s+)?Owner\s+Asset\s+Transaction\s+Type\s+Date\s+Notification\s+Date\s+"
+    r"Amount\s+Cap\.\s*Gains\s*>\s*\$200\?",
+    re.I,
+)
+_CAP_GAINS_HEADER_PATTERN = re.compile(r"Cap\.\s*Gains\s*>\s*\$200\?", re.I)
+_FILING_ID_FOOTER_PATTERN = re.compile(r"Filing ID\s*#\s*\d+", re.I)
+_REPORT_TITLE_PATTERN = re.compile(
+    r"(?:Periodic Transaction Report|\bP T R\b)"
+    r"(?:\s*Clerk of the House of Representatives.*?Washington,\s*DC\s*20515)?",
+    re.I | re.S,
+)
+_CLERK_LINE_PATTERN = re.compile(
+    r"Clerk of the House of Representatives.*?Washington,\s*DC\s*20515", re.I | re.S
+)
+_FILER_BLOCK_PATTERN = re.compile(
+    r"(?:Filer Information\s*)?(?:\bF\s+I\s+)?Name:\s.*?State/District:\s*[A-Z]{2}\s*\d*"
+    r"(?:\s+Transactions\b)?",
+    re.I | re.S,
+)
+_ASSET_TYPE_FOOTNOTE_PATTERN = re.compile(
+    r"\*\s*For the complete list of asset type abbreviations[^\n]*", re.I
+)
+#: Sections that follow the transactions table. Nothing after the first of
+#: them is a row, so the text is cut there.
+_TRAILING_SECTIONS_PATTERN = re.compile(
+    r"^[ \t]*(?:Investment Vehicle Details|Initial Public Offerings|Certification and Signature"
+    r"|Asset class details)[ \t]*$.*\Z"
+    r"|^[ \t]*(?:I CERTIFY that the statements|Digitally Signed:).*\Z",
+    re.I | re.M | re.S,
+)
 
-def normalize_text(raw: str) -> str:
-    return (
+#: Lines that open a per-row annotation on the House form (plus the legacy
+#: text-layer spellings "F S:", "S O:", "D:" where the lowercase letters were
+#: dropped).
+_ANNOTATION_MARKER_PATTERN = re.compile(
+    r"^(?:Filing\s+Status|Subholding\s+Of|Description|Comments?|Location|F\s+S|S\s+O|[DLCSO])\s*:",
+    re.I,
+)
+#: A bare account number continuing a "Subholding Of:" line.
+_ACCOUNT_NUMBER_LINE_PATTERN = re.compile(r"^[xX*#.-]*\d{3,}[xX*#.-]*$")
+#: The tail of an asset name that pymupdf emitted after the row core (seen when
+#: a row straddles a page break): ends with the ticker and/or type code.
+_ASSET_TAIL_PATTERN = re.compile(
+    r"^(?P<name>.*?)\s*(?:\(\s*(?P<ticker>[A-Z.]{1,6})\s*\))?\s*(?:\[\s*(?P<asset_type>[A-Z]{2,4})\s*\])?$"
+)
+_SENTENCE_END_PATTERN = re.compile(r"[.!?]['\")]?$")
+_NAME_ABBREVIATIONS: frozenset[str] = frozenset(
+    {
+        "inc.", "corp.", "co.", "ltd.", "l.p.", "lp.", "llc.", "plc.", "n.v.", "s.a.", "a.g.",
+        "jr.", "sr.", "st.", "mfg.", "intl.", "int'l.", "bros.", "hldgs.", "tr.", "sec.",
+        "gen.", "oblig.", "ser.", "dtd.", "pct.", "cl.", "fd.", "adr.", "ag.", "sa.", "nv.",
+    }
+)
+
+#: A wrapped body-text line on the House form runs well past this many
+#: characters; asset-name lines wrap at roughly forty.
+_LONG_LINE_CHARS = 80
+#: A line this long that directly follows a long line is a wrapped
+#: continuation, not an asset name.
+_WIDE_CONTINUATION_CHARS = 50
+
+
+def normalize_text(raw: str, *, keep_newlines: bool = False) -> str:
+    """Normalise an extracted text layer.
+
+    ``keep_newlines`` preserves line breaks (collapsing CR/LF variants) so the
+    row segmenter can tell a wrapped comment line from an asset name; the
+    default flattens everything to one line for header parsing and previews.
+    """
+
+    cleaned = (
         raw.replace("\x00", "")
         .replace("\u2019", "'")
         .replace("\u00a0", " ")
-        .replace("\n", " ")
-        .replace("\r", " ")
+        .replace("\r\n", "\n")
+        .replace("\r", "\n")
         .replace("\t", " ")
         .replace("•", " ")
-    ).replace(" )", ")").replace("( ", "(").strip()
+    )
+    if not keep_newlines:
+        cleaned = cleaned.replace("\n", " ")
+    return cleaned.replace(" )", ")").replace("( ", "(").strip()
 
 
 def squeeze_spaces(value: str) -> str:
@@ -130,6 +225,15 @@ def parse_amount_range(raw: str) -> tuple[int, int]:
     for pattern, minimum, maximum in AMOUNT_RANGES:
         if pattern.search(raw):
             return minimum, maximum
+    # Capital calls and similar rows carry an exact figure ("$647.63")
+    # instead of a bracket; keep it as a degenerate range.
+    exact = re.fullmatch(r"\s*\$\s*([\d,]+(?:\.\d+)?)\s*", raw)
+    if exact:
+        try:
+            value = round(float(exact.group(1).replace(",", "")))
+        except ValueError:
+            return 0, 0
+        return value, value
     return 0, 0
 
 
@@ -172,7 +276,9 @@ def clean_asset_description(raw: str, ticker: str | None) -> str:
         )
     )
     cleaned = re.sub(r"^.*?\b[A-Z][a-z]+ Schwab \d+\s*", "", cleaned)
-    cleaned = re.sub(r"^.*?\b\d{3,}\s+", "", cleaned)
+    # A leading (possibly masked) account number left over from a
+    # "Subholding Of:" line. Anchored so "iShares Russell 2000 ETF" survives.
+    cleaned = re.sub(r"^[xX*#]*\d{3,}\s+", "", cleaned)
     cleaned = re.sub(
         r"^.*?\bOwner Asset Transaction Type Date Notification Date Amount\s*",
         "",
@@ -185,7 +291,10 @@ def clean_asset_description(raw: str, ticker: str | None) -> str:
         cleaned,
         flags=re.I,
     )
-    cleaned = re.sub(r"^\s*(?:Spouse/DC|JT|DC|SP|TR|XX|[A-Z])\s+", "", cleaned, flags=re.I)
+    cleaned = re.sub(r"^\s*(?:Spouse/DC|JT|DC|SP|TR|XX)\s+", "", cleaned, flags=re.I)
+    # The legacy text layer prefixed rows with a lone "F" (from "Filing
+    # Status"); a bare capital followed by a real word ("T MOBILE USA") is not that.
+    cleaned = re.sub(r"^\s*F\s+(?=S:)", "", cleaned)
 
     structured_descriptor = re.match(r"^(?:[A-Z]\s+)?S:\s+New\s+S\s+O:\s+.+?\bD:\s+(.+)$", cleaned, flags=re.I)
     if structured_descriptor:
@@ -225,8 +334,11 @@ def clean_asset_description(raw: str, ticker: str | None) -> str:
         )
 
     cleaned = re.sub(r"^\s*(?:Spouse/DC|JT|DC|SP|TR|XX)\s+", "", cleaned, flags=re.I)
+    # An owner code buried after annotation text ("S O: Fidelity Trust JT
+    # Fremont IN ...") marks where the asset starts. Only when the text before
+    # it is an annotation remnant: "Washington DC Water Bonds" keeps its DC.
     owner_marker = re.search(r"\b(JT|DC|SP|TR|Spouse/DC)\s+", cleaned, flags=re.I)
-    if owner_marker and owner_marker.start() > 0:
+    if owner_marker and owner_marker.start() > 0 and ":" in cleaned[: owner_marker.start()]:
         cleaned = cleaned[owner_marker.end():].strip()
 
     if ticker and cleaned.endswith(f"({ticker})"):
@@ -236,13 +348,23 @@ def clean_asset_description(raw: str, ticker: str | None) -> str:
 
 
 def parse_owner(asset_prefix: str, owner_hint: str | None = None) -> str:
-    normalized = f"{asset_prefix} {owner_hint or ''}".upper()
-    if re.search(r"\bSPOUSE/DC\b", normalized) or re.search(r"\bSP\b", normalized):
-        return "spouse"
-    if re.search(r"\bJT\b", normalized):
-        return "joint"
-    if re.search(r"\bDC\b", normalized):
-        return "child"
+    """Resolve the owner code printed in front of the asset or after the dates.
+
+    Only a code at the very start of the asset text counts, so a name such as
+    "Washington DC Water Bonds" is not read as a dependent-child holding.
+    """
+
+    leading = re.match(r"\s*(SPOUSE/DC|JT|DC|SP|TR|XX)(?=\s|$)", asset_prefix.upper())
+    codes = [leading.group(1)] if leading else []
+    if owner_hint:
+        codes.append(owner_hint.strip().upper())
+    for code in codes:
+        if code in {"SPOUSE/DC", "SP"}:
+            return "spouse"
+        if code == "JT":
+            return "joint"
+        if code == "DC":
+            return "child"
     return "self"
 
 
@@ -267,6 +389,9 @@ def dedupe_transactions(
             str(transaction.amount_min),
             str(transaction.amount_max),
             transaction.owner,
+            # Two otherwise identical rows in different sub-accounts
+            # ("Subholding Of: ... (5)" and "(6)") are two trades.
+            squeeze_spaces(transaction.comment or "").lower(),
         )
         if key in seen:
             continue
@@ -309,33 +434,217 @@ def parse_header_state(text: str) -> str | None:
     return match.group(1).upper() if match else None
 
 
+def strip_page_furniture(text: str) -> str:
+    """Remove everything on a House PTR text layer that is not table content.
+
+    Works on newline-preserving text. The first column heading takes the
+    whole page-1 preamble with it; later page headings, "Filing ID" footers,
+    the asset-type footnote and the sections after the table are removed
+    wherever they occur so a page break never lands inside a row.
+    """
+
+    cleaned = fix_font_mojibake(text)
+    cleaned = _TRAILING_SECTIONS_PATTERN.sub("", cleaned)
+    # The asset-type footnote closes the table. Cut there when no row follows
+    # it, so a bare "Comments" section heading cannot trail the last row.
+    footnote = _ASSET_TYPE_FOOTNOTE_PATTERN.search(cleaned)
+    if footnote and not ROW_CORE_PATTERN.search(cleaned, footnote.end()):
+        cleaned = cleaned[: footnote.start()]
+    if _CAP_GAINS_HEADER_PATTERN.search(cleaned):
+        cleaned = _FIRST_COLUMN_HEADER_PATTERN.sub("", cleaned, count=1)
+    else:
+        cleaned = _REPORT_TITLE_PATTERN.sub("\n", cleaned)
+        cleaned = _CLERK_LINE_PATTERN.sub("\n", cleaned)
+        cleaned = _FILER_BLOCK_PATTERN.sub("\n", cleaned)
+    cleaned = _COLUMN_HEADER_PATTERN.sub("\n", cleaned)
+    cleaned = _CAP_GAINS_HEADER_PATTERN.sub("\n", cleaned)
+    cleaned = _FILING_ID_FOOTER_PATTERN.sub("\n", cleaned)
+    cleaned = _ASSET_TYPE_FOOTNOTE_PATTERN.sub("\n", cleaned)
+    return cleaned
+
+
+def _is_annotation_marker(line: str) -> bool:
+    return bool(_ANNOTATION_MARKER_PATTERN.match(line))
+
+
+def _ends_like_sentence(line: str) -> bool:
+    """True for "direction." or "Morgan Stanley.", false for "Alexandria ..., Inc."."""
+
+    if not _SENTENCE_END_PATTERN.search(line):
+        return False
+    last_word = line.split()[-1].lower().strip("'\")")
+    return last_word not in _NAME_ABBREVIATIONS
+
+
+def _is_annotation_line(line: str, previous: str | None) -> bool:
+    """Classify one line of the text between two row cores.
+
+    Annotation lines are the marker lines the House form prints under a row
+    ("Filing Status:", "Subholding Of:", "Description:", "Comments:", ...),
+    their wrapped continuations, and bare account numbers. Everything else is
+    part of the next row's asset name.
+    """
+
+    if _is_annotation_marker(line):
+        return True
+    if _ACCOUNT_NUMBER_LINE_PATTERN.match(line):
+        return True
+    if len(line) >= _LONG_LINE_CHARS:
+        return True
+    if previous is not None and len(previous) >= _LONG_LINE_CHARS:
+        # The line right after a full-width body line is its wrapped tail
+        # unless it clearly starts something new. Lower-case starts
+        # ("direction."), sentence endings and wide lines are tails.
+        if line[0].islower() or len(line) >= _WIDE_CONTINUATION_CHARS:
+            return True
+        if _ends_like_sentence(line):
+            return True
+    return False
+
+
+def split_row_segment(segment: str) -> tuple[list[str], list[str]]:
+    """Split the text between two row cores into (annotation lines, asset lines).
+
+    The asset lines are the trailing run of lines that do not read as
+    annotation; the lines before them belong to the previous row. A segment
+    without line breaks (flattened text) is treated as a single asset line and
+    left to ``clean_asset_description`` to tidy, which is the old behaviour.
+    """
+
+    lines = [squeeze_spaces(line) for line in segment.split("\n")]
+    lines = [line for line in lines if line]
+    if not lines:
+        return [], []
+    split_at = len(lines)
+    while split_at > 0:
+        candidate = lines[split_at - 1]
+        previous = lines[split_at - 2] if split_at >= 2 else None
+        if _is_annotation_line(candidate, previous):
+            break
+        split_at -= 1
+    if split_at == len(lines):
+        # Every line looked like annotation; the last one is still the best
+        # guess at the asset so the row is not lost.
+        split_at = len(lines) - 1
+    return lines[:split_at], lines[split_at:]
+
+
+def _take_asset_tail(lines: list[str]) -> tuple[list[str], str, str | None, str | None]:
+    """Pull a wrapped asset tail that pymupdf emitted after the row core.
+
+    When a row straddles a page break the text layer can order it as
+    ``Motorola Solutions, Inc. Common / P / dates / amount / Stock (MSI) [ST]``.
+    A leading non-annotation line that ends in a ticker and/or type code is
+    that tail. Returns (remaining lines, tail name, ticker, type code); the
+    name is empty and both codes None when there is no tail.
+    """
+
+    if not lines or _is_annotation_line(lines[0], None):
+        return lines, "", None, None
+    match = _ASSET_TAIL_PATTERN.match(lines[0])
+    if not match or not (match.group("ticker") or match.group("asset_type")):
+        return lines, "", None, None
+    return lines[1:], match.group("name").strip(), match.group("ticker"), match.group("asset_type")
+
+
+def _expand_legacy_markers(line: str) -> str:
+    """Spell out the "F S: New S O: Fidelity Trust" text-layer shorthand."""
+
+    if not re.match(r"^(?:F\s+)?S:\s", line):
+        return line
+    expanded = re.sub(r"^(?:F\s+)?S:\s*", "Filing Status: ", line)
+    expanded = re.sub(r"\s+S\s+O:\s*", " | Subholding Of: ", expanded)
+    expanded = re.sub(r"\s+D:\s*", " | Description: ", expanded)
+    expanded = re.sub(r"\s+L:\s*", " | Location: ", expanded)
+    return expanded
+
+
+def format_annotation(lines: list[str]) -> str | None:
+    """Join a row's annotation lines into one comment string.
+
+    Each marker line starts a chunk ("Filing Status: New", "Comments: ...");
+    wrapped continuations are appended to the open chunk; chunks are joined
+    with " | ", the same shape the Senate eFD comments use.
+    """
+
+    chunks: list[str] = []
+    for raw_line in lines:
+        line = _expand_legacy_markers(squeeze_spaces(raw_line))
+        if not line:
+            continue
+        if _is_annotation_marker(line) or not chunks:
+            chunks.append(line)
+        else:
+            chunks[-1] = f"{chunks[-1]} {line}"
+    comment = " | ".join(squeeze_spaces(chunk) for chunk in chunks if chunk.strip())
+    return comment or None
+
+
+def _finish_row(transaction: HousePtrTransaction, lines: list[str]) -> HousePtrTransaction:
+    """Attach the lines that follow a row core to that row.
+
+    A leading asset tail (see ``_take_asset_tail``) completes the asset name,
+    ticker and type code when the core did not carry them; the rest becomes
+    the row's comment.
+    """
+
+    remaining, tail_name, tail_ticker, tail_code = _take_asset_tail(lines)
+    update: dict[str, object] = {}
+    if tail_ticker or tail_code:
+        ticker = transaction.ticker or tail_ticker
+        prefix = " ".join(part for part in (transaction.asset_description, tail_name) if part)
+        update["ticker"] = ticker
+        update["asset_description"] = clean_asset_description(prefix, ticker)
+        if transaction.asset_type == "Asset" and tail_code:
+            update["asset_type"] = infer_asset_type(tail_code)
+    else:
+        remaining = lines
+    update["comment"] = format_annotation(remaining)
+    return transaction.model_copy(update=update)
+
+
 def parse_transactions(text: str) -> list[HousePtrTransaction]:
+    """Segment a House PTR text layer into rows.
+
+    Every row is anchored on its core (type code, dates, amount). The text
+    between two cores is split into the previous row's annotation block and
+    the next row's asset name by line shape, so a 300-character "Comments:"
+    paragraph or a page heading can no longer leak into an asset description.
+    Pass the text with its line breaks intact.
+    """
+
+    prepared = strip_page_furniture(normalize_text(text, keep_newlines=True))
+    cores = list(ROW_CORE_PATTERN.finditer(prepared))
     transactions: list[HousePtrTransaction] = []
-    normalized = squeeze_spaces(normalize_text(text))
-    normalized = re.sub(r"^.*?\bCap\.\s*Gains\s*>\s*\$200\?\s*", "", normalized, flags=re.I)
-    for index, match in enumerate(TRANSACTION_PATTERN.finditer(normalized), start=1):
-        asset_prefix = match.group(1).strip()
-        ticker = match.group(2) or None
-        asset_type = infer_asset_type(match.group(3))
-        transaction_type = parse_transaction_type(match.group(4))
-        transaction_date = normalize_date(match.group(5))
-        notification_date = normalize_date(match.group(6))
-        owner_hint = match.group(7) or None
-        amount_min, amount_max = parse_amount_range(match.group(8))
+    previous_end = 0
+    for index, match in enumerate(cores, start=1):
+        annotation_lines, asset_lines = split_row_segment(prepared[previous_end:match.start()])
+        if transactions:
+            transactions[-1] = _finish_row(transactions[-1], annotation_lines)
+        ticker = match.group("ticker") or None
+        asset_prefix = " ".join(asset_lines)
+        amount_min, amount_max = parse_amount_range(match.group("amount"))
         transactions.append(
             HousePtrTransaction(
                 line_number=index,
                 asset_description=clean_asset_description(asset_prefix, ticker),
                 ticker=ticker,
-                asset_type=asset_type,
-                transaction_type=transaction_type,  # type: ignore[arg-type]
-                transaction_date=transaction_date,
-                notification_date=notification_date,
+                asset_type=infer_asset_type(match.group("asset_type")),
+                transaction_type=parse_transaction_type(match.group("tx_type")),  # type: ignore[arg-type]
+                transaction_date=normalize_date(match.group("date")),
+                notification_date=normalize_date(match.group("notified")),
                 amount_min=amount_min,
                 amount_max=amount_max,
-                owner=parse_owner(asset_prefix, owner_hint),  # type: ignore[arg-type]
+                owner=parse_owner(asset_prefix, match.group("owner") or None),  # type: ignore[arg-type]
             )
         )
+        previous_end = match.end()
+
+    if transactions:
+        # Whatever follows the last core (the trailing sections are already
+        # gone) is the last row's annotation block.
+        trailing = [squeeze_spaces(line) for line in prepared[previous_end:].split("\n")]
+        transactions[-1] = _finish_row(transactions[-1], [line for line in trailing if line])
     return transactions
 
 
@@ -388,10 +697,15 @@ def build_trade_rows_from_house_ptr(
                 amount_min=transaction.amount_min,
                 amount_max=transaction.amount_max,
                 owner=transaction.owner,
-                comment=(
-                    f"Parsed from House PTR {stub.doc_id} at "
-                    f"{round(parsed.parser_confidence * 100)}% confidence "
-                    f"[{parsed.parser_version}]"
+                comment=" | ".join(
+                    part
+                    for part in (
+                        (transaction.comment or "").strip(),
+                        f"Parsed from House PTR {stub.doc_id} at "
+                        f"{round(parsed.parser_confidence * 100)}% confidence "
+                        f"[{parsed.parser_version}]",
+                    )
+                    if part
                 ),
                 parser_confidence=parsed.parser_confidence,
                 parser_version=parsed.parser_version,
@@ -406,7 +720,8 @@ def parse_house_ptr_text(
     stub: FilingStub,
 ) -> tuple[HousePtrParseResult, list[NormalizedTradeRow]]:
     normalized = squeeze_spaces(normalize_text(text))
-    transactions = dedupe_transactions(stub, parse_transactions(normalized))
+    # The segmenter needs the original line breaks; hand it the raw text.
+    transactions = dedupe_transactions(stub, parse_transactions(text))
     valid_transactions = [
         transaction
         for transaction in transactions
@@ -595,6 +910,8 @@ def _vision_to_transactions(payload: list[dict]) -> list[HousePtrTransaction]:
         amount_min, amount_max = _llm_amount_bounds(
             raw_row.get("amount_min"), raw_row.get("amount_max")
         )
+        comment = raw_row.get("comment")
+        comment = squeeze_spaces(comment) if isinstance(comment, str) and comment.strip() else None
         out.append(
             HousePtrTransaction(
                 line_number=index,
@@ -607,6 +924,7 @@ def _vision_to_transactions(payload: list[dict]) -> list[HousePtrTransaction]:
                 amount_min=amount_min,
                 amount_max=amount_max,
                 owner=_vision_owner(raw_row.get("owner")),  # type: ignore[arg-type]
+                comment=comment,
             )
         )
     return out
@@ -625,15 +943,28 @@ def _run_vision_parse(
     """
 
     try:
-        report = extract_via_vision(pdf_path)
+        report = extract_via_vision(
+            pdf_path,
+            filing_year=getattr(stub, "filing_year", None),
+            filing_date=getattr(stub, "filing_date", None),
+        )
     except Exception as exc:  # pragma: no cover - defensive
         logger.exception("house_ptr vision: extract_via_vision raised: %s", exc)
         return None, {"ok": False, "skipped": True, "reason": f"vision parser raised: {exc}"}
 
+    # The vision module already scrubbed each read before reconciling them;
+    # this pass is idempotent and only exists as a belt for the merged rows.
     raw_transactions, example_scrubs = scrub_example_row_values(
         list(report.get("transactions") or []),
         getattr(stub, "filing_year", None),
     )
+    example_scrubs += int(report.get("example_row_scrubs") or 0)
+    # A row whose transaction type the two reads could not agree on would
+    # otherwise default to "purchase" in _vision_to_transactions. Dropping it is
+    # the safe outcome; the row count mismatch already routes the stub to review.
+    typed_transactions = [row for row in raw_transactions if row.get("transaction_type")]
+    dropped_for_type = len(raw_transactions) - len(typed_transactions)
+    raw_transactions = typed_transactions
     report["transactions"] = raw_transactions
     metadata = build_vision_metadata(report)
     if example_scrubs:
@@ -641,6 +972,16 @@ def _run_vision_parse(
         logger.info(
             "house_ptr vision: scrubbed %d row(s) carrying the form's example values for %s",
             example_scrubs,
+            pdf_path.name,
+        )
+    if dropped_for_type:
+        metadata["rowsDroppedForType"] = dropped_for_type
+        metadata["needsReview"] = True
+        if not raw_transactions:
+            metadata["reason"] = "every row dropped: the two reads disagreed on transaction type"
+        logger.info(
+            "house_ptr vision: dropped %d row(s) whose transaction type the reads disagreed on for %s",
+            dropped_for_type,
             pdf_path.name,
         )
 
@@ -653,7 +994,40 @@ def _run_vision_parse(
         )
         return None, metadata
 
-    transactions = dedupe_transactions(stub, _vision_to_transactions(raw_transactions))
+    # clean_asset_description() was written for the text layer, where a run of
+    # three or more digits is a brokerage account number to strip. Handwritten
+    # municipal bonds carry series numbers and coupons in the name ("MINNESOTA
+    # ST BD GRP 160 5%" came back as "5%"), so when cleaning ate most of the
+    # model's transcription, keep the transcription. line_number is the 1-based
+    # index into raw_transactions.
+    def _gutted(cleaned: str, raw: str) -> bool:
+        raw_alnum = sum(1 for char in raw if char.isalnum())
+        cleaned_alnum = sum(1 for char in cleaned if char.isalnum())
+        return raw_alnum >= 6 and cleaned_alnum * 2 < raw_alnum
+
+    converted = _vision_to_transactions(raw_transactions)
+    restored: list[HousePtrTransaction] = []
+    restored_count = 0
+    for transaction in converted:
+        raw_row = raw_transactions[transaction.line_number - 1]
+        raw_description = squeeze_spaces(str(raw_row.get("asset_description") or "").strip())
+        if transaction.ticker:
+            raw_description = re.sub(
+                rf"\s*\(\s*{re.escape(transaction.ticker)}\s*\)\s*$", "", raw_description, flags=re.I
+            ).strip()
+        if raw_description and _gutted(transaction.asset_description, raw_description):
+            transaction = transaction.model_copy(update={"asset_description": raw_description})
+            restored_count += 1
+        restored.append(transaction)
+    if restored_count:
+        metadata["descriptionsRestored"] = restored_count
+        logger.info(
+            "house_ptr vision: restored %d asset description(s) that cleaning gutted for %s",
+            restored_count,
+            pdf_path.name,
+        )
+
+    transactions = dedupe_transactions(stub, restored)
     valid_transactions = [
         transaction
         for transaction in transactions

@@ -1,0 +1,474 @@
+Periodic Transaction Report
+Clerk of the House of Representatives • Legislative Resource Center • B81 Cannon Building • Washington, DC 20515
+Filer Information
+Name:
+Hon. Jared Moskowitz
+Status:
+Member
+State/District: FL23
+Transactions
+ID
+Owner Asset
+Transaction
+Type
+Date
+Notification
+Date
+Amount
+Cap.
+Gains >
+$200?
+DC
+Accenture plc Class A Ordinary
+Shares (ACN) [ST]
+S
+03/23/2026 03/31/2026
+$1,001 - $15,000
+Filing Status: New
+Subholding Of: Morgan Stanley Active Assets (5)
+DC
+Accenture plc Class A Ordinary
+Shares (ACN) [ST]
+S
+03/23/2026 03/31/2026
+$1,001 - $15,000
+Filing Status: New
+Subholding Of: Morgan Stanley Active Assets (6)
+Accenture plc Class A Ordinary
+Shares (ACN) [ST]
+S
+03/23/2026 03/31/2026
+$1,001 - $15,000
+Filing Status: New
+Subholding Of: Morgan Stanley Active Assets (1)
+American Express Company Common
+Stock (AXP) [ST]
+P
+03/31/2026 03/31/2026
+$1,001 - $15,000
+Filing Status: New
+Subholding Of: Morgan Stanley Active Assets (1)
+ASML Holding N.V. - New York
+Registry Shares (ASML) [ST]
+P
+03/31/2026 03/31/2026
+$1,001 - $15,000
+Filing Status: New
+Subholding Of: Morgan Stanley Active Assets (1)
+DC
+ASML Holding N.V. - New York
+Registry Shares (ASML) [ST]
+P
+03/23/2026 03/31/2026
+$1,001 - $15,000
+Filing Status: New
+Subholding Of: Morgan Stanley Active Assets (5)
+Filing ID #20034274
+
+
+ID
+Owner Asset
+Transaction
+Type
+Date
+Notification
+Date
+Amount
+Cap.
+Gains >
+$200?
+DC
+ASML Holding N.V. - New York
+Registry Shares (ASML) [ST]
+P
+03/23/2026 03/31/2026
+$1,001 - $15,000
+Filing Status: New
+Subholding Of: Morgan Stanley Active Assets (6)
+ASML Holding N.V. - New York
+Registry Shares (ASML) [ST]
+P
+03/23/2026 03/31/2026
+$1,001 - $15,000
+Filing Status: New
+Subholding Of: Morgan Stanley Active Assets (1)
+DC
+Automatic Data Processing, Inc. -
+Common Stock (ADP) [ST]
+S
+03/23/2026 03/31/2026
+$1,001 - $15,000
+Filing Status: New
+Subholding Of: Morgan Stanley Active Assets (5)
+DC
+Automatic Data Processing, Inc. -
+Common Stock (ADP) [ST]
+S
+03/23/2026 03/31/2026
+$1,001 - $15,000
+Filing Status: New
+Subholding Of: Morgan Stanley Active Assets (6)
+Automatic Data Processing, Inc. -
+Common Stock (ADP) [ST]
+S
+03/23/2026 03/31/2026
+$1,001 - $15,000
+Filing Status: New
+Subholding Of: Morgan Stanley Active Assets (1)
+Broadcom Inc. - Common Stock
+(AVGO) [ST]
+P
+03/31/2026 03/31/2026
+$1,001 - $15,000
+Filing Status: New
+Subholding Of: Morgan Stanley Active Assets (1)
+DC
+Brown & Brown, Inc. Common Stock
+(BRO) [ST]
+S
+03/23/2026 03/31/2026
+$1,001 - $15,000
+Filing Status: New
+Subholding Of: Morgan Stanley Active Assets (5)
+DC
+Brown & Brown, Inc. Common Stock
+(BRO) [ST]
+S
+03/23/2026 03/31/2026
+$1,001 - $15,000
+Filing Status: New
+Subholding Of: Morgan Stanley Active Assets (6)
+Brown & Brown, Inc. Common Stock
+(BRO) [ST]
+S
+03/23/2026 03/31/2026
+$1,001 - $15,000
+Filing Status: New
+Subholding Of: Morgan Stanley Active Assets (1)
+
+
+ID
+Owner Asset
+Transaction
+Type
+Date
+Notification
+Date
+Amount
+Cap.
+Gains >
+$200?
+Caterpillar, Inc. Common Stock (CAT)
+[ST]
+S (partial)
+03/31/2026 03/31/2026
+$1,001 - $15,000
+Filing Status: New
+Subholding Of: Morgan Stanley Active Assets (1)
+Cencora, Inc. Common Stock (COR)
+[ST]
+P
+03/31/2026 03/31/2026
+$1,001 - $15,000
+Filing Status: New
+Subholding Of: Morgan Stanley Active Assets (1)
+DC
+Cencora, Inc. Common Stock (COR)
+[ST]
+P
+03/23/2026 03/31/2026
+$1,001 - $15,000
+Filing Status: New
+Subholding Of: Morgan Stanley Active Assets (5)
+Cencora, Inc. Common Stock (COR)
+[ST]
+P
+03/23/2026 03/31/2026
+$1,001 - $15,000
+Filing Status: New
+Subholding Of: Morgan Stanley Active Assets (1)
+Chubb Limited Common Stock (CB)
+[ST]
+P
+03/31/2026 03/31/2026
+$1,001 - $15,000
+Filing Status: New
+Subholding Of: Morgan Stanley Active Assets (1)
+Cummins Inc. Common Stock (CMI)
+[ST]
+S (partial)
+03/31/2026 03/31/2026
+$1,001 - $15,000
+Filing Status: New
+Subholding Of: Morgan Stanley Active Assets (1)
+GE Aerospace Common Stock (GE)
+[ST]
+P
+03/31/2026 03/31/2026
+$1,001 - $15,000
+Filing Status: New
+Subholding Of: Morgan Stanley Active Assets (1)
+DC
+GE Aerospace Common Stock (GE)
+[ST]
+P
+03/23/2026 03/31/2026
+$1,001 - $15,000
+Filing Status: New
+Subholding Of: Morgan Stanley Active Assets (5)
+GE Aerospace Common Stock (GE)
+[ST]
+P
+03/23/2026 03/31/2026
+$1,001 - $15,000
+Filing Status: New
+Subholding Of: Morgan Stanley Active Assets (1)
+
+
+ID
+Owner Asset
+Transaction
+Type
+Date
+Notification
+Date
+Amount
+Cap.
+Gains >
+$200?
+General Dynamics Corporation
+Common Stock (GD) [ST]
+P
+03/31/2026 03/31/2026
+$1,001 - $15,000
+Filing Status: New
+Subholding Of: Morgan Stanley Active Assets (1)
+DC
+General Dynamics Corporation
+Common Stock (GD) [ST]
+P
+03/23/2026 03/31/2026
+$1,001 - $15,000
+Filing Status: New
+Subholding Of: Morgan Stanley Active Assets (5)
+General Dynamics Corporation
+Common Stock (GD) [ST]
+P
+03/23/2026 03/31/2026
+$1,001 - $15,000
+Filing Status: New
+Subholding Of: Morgan Stanley Active Assets (1)
+Home Depot, Inc. (HD) [ST]
+P
+03/31/2026 03/31/2026
+$1,001 - $15,000
+Filing Status: New
+Subholding Of: Morgan Stanley Active Assets (1)
+McDonald's Corporation Common
+Stock (MCD) [ST]
+P
+03/31/2026 03/31/2026
+$1,001 - $15,000
+Filing Status: New
+Subholding Of: Morgan Stanley Active Assets (1)
+DC
+Monster Beverage Corporation -
+Common Stock (MNST) [ST]
+P
+03/23/2026 03/31/2026
+$1,001 - $15,000
+Filing Status: New
+Subholding Of: Morgan Stanley Active Assets (5)
+Monster Beverage Corporation -
+Common Stock (MNST) [ST]
+P
+03/23/2026 03/31/2026
+$1,001 - $15,000
+Filing Status: New
+Subholding Of: Morgan Stanley Active Assets (1)
+DC
+Motorola Solutions, Inc. Common
+Stock (MSI) [ST]
+P
+03/23/2026 03/31/2026
+$1,001 - $15,000
+Filing Status: New
+Subholding Of: Morgan Stanley Active Assets (5)
+Motorola Solutions, Inc. Common
+Stock (MSI) [ST]
+P
+03/23/2026 03/31/2026
+$1,001 - $15,000
+Filing Status: New
+Subholding Of: Morgan Stanley Active Assets (1)
+Motorola Solutions, Inc. Common
+P
+03/31/2026 03/31/2026
+$1,001 - $15,000
+
+
+ID
+Owner Asset
+Transaction
+Type
+Date
+Notification
+Date
+Amount
+Cap.
+Gains >
+$200?
+Stock (MSI) [ST]
+Filing Status: New
+Subholding Of: Morgan Stanley Active Assets (1)
+DC
+Oracle Corporation Common Stock
+(ORCL) [ST]
+S
+03/23/2026 03/31/2026
+$1,001 - $15,000
+Filing Status: New
+Subholding Of: Morgan Stanley Active Assets (5)
+DC
+Oracle Corporation Common Stock
+(ORCL) [ST]
+S
+03/23/2026 03/31/2026
+$1,001 - $15,000
+Filing Status: New
+Subholding Of: Morgan Stanley Active Assets (6)
+Oracle Corporation Common Stock
+(ORCL) [ST]
+S
+03/23/2026 03/31/2026
+$15,001 -
+$50,000
+Filing Status: New
+Subholding Of: Morgan Stanley Active Assets (1)
+Palo Alto Networks, Inc. (PANW)
+[ST]
+P
+03/31/2026 03/31/2026
+$1,001 - $15,000
+Filing Status: New
+Subholding Of: Morgan Stanley Active Assets (1)
+DC
+Palo Alto Networks, Inc. (PANW)
+[ST]
+P
+03/23/2026 03/31/2026
+$1,001 - $15,000
+Filing Status: New
+Subholding Of: Morgan Stanley Active Assets (5)
+Palo Alto Networks, Inc. (PANW)
+[ST]
+P
+03/23/2026 03/31/2026
+$1,001 - $15,000
+Filing Status: New
+Subholding Of: Morgan Stanley Active Assets (1)
+DC
+Parker-Hannifin Corporation
+Common Stock (PH) [ST]
+P
+03/23/2026 03/31/2026
+$1,001 - $15,000
+Filing Status: New
+Subholding Of: Morgan Stanley Active Assets (5)
+Parker-Hannifin Corporation
+Common Stock (PH) [ST]
+P
+03/23/2026 03/31/2026
+$1,001 - $15,000
+Filing Status: New
+Subholding Of: Morgan Stanley Active Assets (1)
+Parker-Hannifin Corporation
+P
+03/31/2026 03/31/2026
+$1,001 - $15,000
+
+
+ID
+Owner Asset
+Transaction
+Type
+Date
+Notification
+Date
+Amount
+Cap.
+Gains >
+$200?
+Common Stock (PH) [ST]
+Filing Status: New
+Subholding Of: Morgan Stanley Active Assets (1)
+QUALCOMM Incorporated -
+Common Stock (QCOM) [ST]
+S
+03/31/2026 03/31/2026
+$15,001 -
+$50,000
+Filing Status: New
+Subholding Of: Morgan Stanley Active Assets (1)
+DC
+The Cigna Group Common Stock (CI)
+[ST]
+S
+03/23/2026 03/31/2026
+$1,001 - $15,000
+Filing Status: New
+Subholding Of: Morgan Stanley Active Assets (5)
+The Cigna Group Common Stock (CI)
+[ST]
+S
+03/23/2026 03/31/2026
+$1,001 - $15,000
+Filing Status: New
+Subholding Of: Morgan Stanley Active Assets (1)
+TJX Companies, Inc. (TJX) [ST]
+P
+03/23/2026 03/31/2026
+$1,001 - $15,000
+Filing Status: New
+Subholding Of: Morgan Stanley Active Assets (1)
+DC
+Tractor Supply Company - Common
+Stock (TSCO) [ST]
+S
+03/23/2026 03/31/2026
+$1,001 - $15,000
+Filing Status: New
+Subholding Of: Morgan Stanley Active Assets (5)
+DC
+Tractor Supply Company - Common
+Stock (TSCO) [ST]
+S
+03/23/2026 03/31/2026
+$1,001 - $15,000
+Filing Status: New
+Subholding Of: Morgan Stanley Active Assets (6)
+Tractor Supply Company - Common
+Stock (TSCO) [ST]
+S
+03/23/2026 03/31/2026
+$15,001 -
+$50,000
+Filing Status: New
+Subholding Of: Morgan Stanley Active Assets (1)
+* For the complete list of asset type abbreviations, please visit https://fd.house.gov/reference/asset-type-codes.aspx.
+Investment Vehicle Details
+Morgan Stanley Active Assets (1)
+Location: US
+
+
+Morgan Stanley Active Assets (5) (Owner: DC)
+Location: US
+Morgan Stanley Active Assets (6) (Owner: DC)
+Location: US
+Initial Public Offerings
+ Yes 
+ No
+Certification and Signature
+ I CERTIFY that the statements I have made on the attached Periodic Transaction Report are true, complete, and correct to the best of
+my knowledge and belief. Further, I CERTIFY that I have disclosed all transactions as required by the STOCK Act.
+Digitally Signed: Hon. Jared Moskowitz , 04/30/2026
