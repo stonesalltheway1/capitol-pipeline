@@ -228,7 +228,7 @@ PTR_VISION_SCHEMA: dict[str, Any] = {
 # handwriting they cannot read. The prompt warns about it; this is the belt.
 EXAMPLE_ROW_TRANSACTION_DATE = "2020-02-05"
 EXAMPLE_ROW_NOTIFICATION_DATE = "2020-03-07"
-_EXAMPLE_ROW_DESCRIPTION = re.compile(r"mega\s+corp", re.IGNORECASE)
+_EXAMPLE_ROW_DESCRIPTION = re.compile(r"\bmega\s+corp", re.IGNORECASE)
 
 
 def scrub_example_row_values(
