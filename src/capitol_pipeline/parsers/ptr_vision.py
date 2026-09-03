@@ -26,6 +26,8 @@ Nothing here touches the database. The caller records
 
 from __future__ import annotations
 
+import re
+
 import base64
 import json
 import logging
@@ -220,6 +222,53 @@ PTR_VISION_SCHEMA: dict[str, Any] = {
 # to clear that floor to cache at all, and every filing in the review queue
 # reuses it verbatim.
 
+# The blank House PTR form carries a pre-printed example row in the grid
+# ("Example: Mega Corp. Common Stock", Sale, 02/05/20, 03/07/20,
+# $15,001-$50,000). Vision models copy its dates onto real rows whose
+# handwriting they cannot read. The prompt warns about it; this is the belt.
+EXAMPLE_ROW_TRANSACTION_DATE = "2020-02-05"
+EXAMPLE_ROW_NOTIFICATION_DATE = "2020-03-07"
+_EXAMPLE_ROW_DESCRIPTION = re.compile(r"mega\s+corp", re.IGNORECASE)
+
+
+def scrub_example_row_values(
+    rows: list[dict],
+    filing_year: int | None,
+) -> tuple[list[dict], int]:
+    """Remove the form's example row and neutralise its dates on other rows.
+
+    Returns ``(rows, scrubbed)`` where ``scrubbed`` counts rows that were
+    dropped or had a field nulled. A nulled date downgrades the row's
+    legibility to ``illegible`` so the stub is routed back to review instead of
+    being published with a date that came off the blank form. Filings from 2020
+    and 2021 legitimately contain early-2020 trades, so dates are only nulled
+    when the filing year is unknown or 2022 or later.
+    """
+
+    kept: list[dict] = []
+    scrubbed = 0
+    guard_dates = filing_year is None or filing_year >= 2022
+    for row in rows:
+        if not isinstance(row, dict):
+            continue
+        description = str(row.get("asset_description") or "")
+        if _EXAMPLE_ROW_DESCRIPTION.search(description):
+            scrubbed += 1
+            continue
+        if guard_dates:
+            touched = False
+            for field in ("transaction_date", "notification_date"):
+                value = row.get(field)
+                if value in (EXAMPLE_ROW_TRANSACTION_DATE, EXAMPLE_ROW_NOTIFICATION_DATE):
+                    row[field] = None
+                    touched = True
+            if touched:
+                row["legibility"] = "illegible"
+                scrubbed += 1
+        kept.append(row)
+    return kept, scrubbed
+
+
 SYSTEM_PROMPT = """You are a careful transcriptionist for United States House of Representatives Periodic Transaction Reports (PTRs). You are given the pages of a single filing as a PDF. Most of the filings you will see are photocopies, faxes, phone photographs, or forms completed by hand, which is exactly why they reached you: automated text extraction already failed on them. Your job is to read the transaction grid off the page and return it as structured data, transcribing exactly what is written and never improving on it.
 
 ## The form
@@ -278,6 +327,10 @@ The Amount column is a checkbox or a circle against a printed ladder of ranges. 
 The top three brackets are only available to a spouse or dependent child, so seeing one on a filer-owned row is a signal you may have misread the check mark. If no bucket is marked, or you cannot tell which of two adjacent boxes carries the mark, report 0 for both bounds and say so in that row's comment. Never average two buckets, and never invent a precise dollar figure: the form does not carry one.
 
 ## Dates
+
+The paper form itself carries a PRE-PRINTED EXAMPLE ROW in the transaction grid, typeset in the same place as a real entry: asset "Example: Mega Corp. Common Stock", an x under Sale, transaction date 02/05/20, notification date 03/07/20, and an x in the $15,001-$50,000 column. It is part of the blank form, not a transaction. Never return it as a row, and never let its values leak into the rows above or below it: if you find yourself writing 2020-02-05, 2020-03-07 or the $15,001-$50,000 band for a row whose own handwritten date or check mark you cannot actually read, you have copied the example - report null for that field and mark the row partial or illegible instead. Every real row has its own handwritten date; read each one on its own line, and read the check mark in the amount column on that same line.
+
+Scans are often rotated ninety degrees or upside down; read them in the orientation of the printed text.
 
 Dates are printed on the form as MM/DD/YYYY. Convert every date to YYYY-MM-DD. Two-digit years belong to the reporting period; use the calendar year in the header to resolve them. The Transaction Date is when the trade happened; the Notification Date is when the filer learned of it, and for a self-directed account the two are often identical. The Notification Date is frequently blank on handwritten forms - report null, not a copy of the transaction date. If a date is smudged, cropped, or overwritten so that you cannot read it, report null and mark the row's legibility accordingly. A date you cannot read is never worth guessing: a wrong date silently corrupts the disclosure timeline that this data feeds.
 

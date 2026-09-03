@@ -21,6 +21,7 @@ from capitol_pipeline.parsers.ptr_vision import (
     VISION_PARSER_VERSION,
     build_vision_metadata,
     extract_via_vision,
+    scrub_example_row_values,
 )
 from capitol_pipeline.processors.ocr import fix_font_mojibake, OcrProcessor
 
@@ -629,9 +630,20 @@ def _run_vision_parse(
         logger.exception("house_ptr vision: extract_via_vision raised: %s", exc)
         return None, {"ok": False, "skipped": True, "reason": f"vision parser raised: {exc}"}
 
+    raw_transactions, example_scrubs = scrub_example_row_values(
+        list(report.get("transactions") or []),
+        getattr(stub, "filing_year", None),
+    )
+    report["transactions"] = raw_transactions
     metadata = build_vision_metadata(report)
+    if example_scrubs:
+        metadata["exampleRowScrubs"] = example_scrubs
+        logger.info(
+            "house_ptr vision: scrubbed %d row(s) carrying the form's example values for %s",
+            example_scrubs,
+            pdf_path.name,
+        )
 
-    raw_transactions = report.get("transactions") or []
     if not raw_transactions:
         logger.info(
             "house_ptr vision: no rows recovered for %s (reason=%r cost=$%.4f)",

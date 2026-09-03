@@ -939,3 +939,52 @@ def test_parse_house_ptr_pdf_records_a_skipped_vision_attempt(
     assert isinstance(parsed.vision_report, dict)
     assert parsed.vision_report["ok"] is False
     assert "CAPITOL_PTR_VISION_DISABLED" in str(parsed.vision_report["reason"])
+
+
+def test_scrub_example_row_values_drops_the_form_example_and_nulls_its_dates() -> None:
+    from capitol_pipeline.parsers.ptr_vision import scrub_example_row_values
+
+    rows = [
+        {"asset_description": "Example: Mega Corp. Common Stock", "transaction_date": "2020-02-05"},
+        {
+            "asset_description": "General Electric",
+            "transaction_date": "2020-02-05",
+            "notification_date": "2023-07-22",
+            "legibility": "partial",
+        },
+        {
+            "asset_description": "AT&T",
+            "transaction_date": "2020-03-07",
+            "notification_date": None,
+            "legibility": "clear",
+        },
+        {"asset_description": "Apple Inc", "transaction_date": "2022-01-06", "legibility": "clear"},
+    ]
+    kept, scrubbed = scrub_example_row_values(rows, filing_year=2023)
+
+    assert scrubbed == 3
+    assert [r["asset_description"] for r in kept] == ["General Electric", "AT&T", "Apple Inc"]
+    assert kept[0]["transaction_date"] is None
+    assert kept[0]["notification_date"] == "2023-07-22"
+    assert kept[0]["legibility"] == "illegible"
+    assert kept[1]["transaction_date"] is None
+    assert kept[1]["legibility"] == "illegible"
+    assert kept[2]["transaction_date"] == "2022-01-06"
+    assert kept[2]["legibility"] == "clear"
+
+
+def test_scrub_example_row_values_keeps_early_2020_dates_on_2020_filings() -> None:
+    from capitol_pipeline.parsers.ptr_vision import scrub_example_row_values
+
+    rows = [{"asset_description": "Boeing", "transaction_date": "2020-02-05", "legibility": "clear"}]
+    kept, scrubbed = scrub_example_row_values(rows, filing_year=2020)
+    assert scrubbed == 0
+    assert kept[0]["transaction_date"] == "2020-02-05"
+    assert kept[0]["legibility"] == "clear"
+
+
+def test_system_prompt_warns_about_the_preprinted_example_row() -> None:
+    from capitol_pipeline.parsers.ptr_vision import SYSTEM_PROMPT
+
+    assert "Mega Corp" in SYSTEM_PROMPT
+    assert "02/05/20" in SYSTEM_PROMPT and "03/07/20" in SYSTEM_PROMPT
