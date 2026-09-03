@@ -126,6 +126,12 @@ TEXT_BAND_CELLS = 5
 #: is stray ink -- a rule the mask missed, the tail of a neighbouring row --
 #: and not a row. See :func:`align_rows` for what it costs to keep one.
 RUNT_BAND_RATIO = 0.5
+#: And a band this much taller than the median is not a row either: over the
+#: ladder interior a row is one tick, so its height barely varies, while the
+#: header's letter-and-range block runs several lines. On 8221360 page 3 that
+#: block is 88 px against a median of 31 and it is the reason the page could
+#: not be aligned at all -- which cost two rows their type check.
+GIANT_BAND_RATIO = 2.0
 
 # -- The Type block ---------------------------------------------------------
 #
@@ -763,7 +769,9 @@ def align_rows(bands: list[dict[str, Any]], expected_rows: int) -> list[dict[str
         heights = sorted(band["y1"] - band["y0"] for band in candidates)
         median = heights[len(heights) // 2]
         kept = [
-            band for band in candidates if (band["y1"] - band["y0"]) >= median * RUNT_BAND_RATIO
+            band
+            for band in candidates
+            if median * RUNT_BAND_RATIO <= (band["y1"] - band["y0"]) <= median * GIANT_BAND_RATIO
         ]
         if expected_rows <= len(kept) < len(candidates):
             candidates = kept

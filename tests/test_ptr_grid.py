@@ -253,3 +253,18 @@ def test_a_page_that_does_not_show_the_shape_says_nothing() -> None:
     assert analysis is not None
     columns = analysis["typeColumns"]
     assert columns is None or (len(columns) == 2 and columns[1][1] < analysis["columns"][0][0])
+
+
+def test_a_header_block_does_not_stop_a_page_aligning() -> None:
+    # 8221360 page 3 has six candidate bands for four rows: the amount block's
+    # letter-and-range header (88 px), the pre-printed example row (10 px), and
+    # the four real rows (25-32 px). The example-row rule only ever removed one
+    # extra, so the page did not align at all -- and an unaligned page gets no
+    # type check, which is how Paycom Software and Block Inc Class A came to be
+    # published as purchases off a form that ticks Sale on both.
+    result = detect_page(analyze_amount_grid(_load("8221360_p3")), expected_rows=4)
+    assert result["status"] == "ok"
+    assert [entry["letter"] for entry in result["letters"]] == ["B", "C", "C", "C"]
+    # Paycom and Block Class A are Sales; Take-Two and Block A Class are ticked
+    # under Partial Sale, which leaves both columns this reads empty.
+    assert [entry["kind"] for entry in result["types"]] == ["sale", "sale", "none", "none"]
