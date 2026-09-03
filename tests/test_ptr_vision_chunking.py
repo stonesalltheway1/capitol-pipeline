@@ -23,10 +23,13 @@ from capitol_pipeline.models.congress import FilingStub, HousePtrTransaction, Me
 from capitol_pipeline.parsers import house_ptr, ptr_vision
 from capitol_pipeline.parsers.ptr_vision import (
     AMOUNT_LETTER_BANDS,
+    CANONICAL_TRANSACTION_TYPES,
     DEFAULT_MAX_FILING_COST_USD,
     VISION_PARSER_VERSION,
     apply_amount_letter_check,
+    apply_checkbox_detector,
     build_vision_metadata,
+    canonical_transaction_type,
     chunk_page_list,
     estimate_filing_cost_usd,
     extract_via_vision,
@@ -970,6 +973,7 @@ def test_detector_confirms_and_contradicts_the_model_letter() -> None:
             "agreed": 2,
             "disagreed": 1,
             "ambiguous": 0,
+            "resolved": 0,
         }
     ]
 
@@ -1068,3 +1072,396 @@ def test_page_range_knob_reads_only_those_pages(monkeypatch: pytest.MonkeyPatch,
     assert "pages 3 to 4" in _user_text(fake.reads[0])
     monkeypatch.setenv("CAPITOL_PTR_VISION_PAGE_RANGE", "nonsense")
     assert ptr_vision.resolve_page_range() is None
+
+
+# ---------------------------------------------------------------------------
+# Type-column vocabulary, and the detector settling an amount the reads could not
+#
+# The fixtures below are the real readings of two production filings, taken
+# from ``house_filing_stubs.metadata.visionParse.calls[].rows`` for the run of
+# 2026-09-03 and checked against the source PDFs:
+#
+#   McCaul 9116141 page 5   -- gemini-3.8-flash read the amount ladder one
+#                              column to the right on all 25 rows; the ticks
+#                              are in B, C and D, as gemini-3.5-flash and the
+#                              checkbox detector both say.
+#   McCaul 9116141 page 6   -- the Vanguard Total Stock Market row is ticked in
+#                              column F ($500,001-$1,000,000). Read A said G,
+#                              read B said E: the detector is the only one of
+#                              the three that read that row correctly.
+#   Khanna 8221322 page 49  -- every row is ticked "Sale"; gemini-3.5-flash
+#                              read the whole page as "purchase". That is a
+#                              real disagreement and must still null.
+# ---------------------------------------------------------------------------
+
+
+def test_the_vocabulary_both_production_models_emit_is_already_canonical() -> None:
+    # Measured over the nine filings read on 2026-09-03: between them
+    # gemini-3.8-flash and gemini-3.5-flash emitted exactly these four strings
+    # and nothing else, because the structured-output enum holds.
+    observed = ["purchase", "sale", "sale_partial", "exchange"]
+    assert sorted(observed) == sorted(CANONICAL_TRANSACTION_TYPES)
+    assert [canonical_transaction_type(value) for value in observed] == observed
+
+
+def test_the_type_column_as_printed_normalises_to_the_canonical_set() -> None:
+    # The belt for the free-text path: _ReadState.structured goes False when
+    # the API rejects the schema, and the model then writes the column as the
+    # form prints it.
+    assert canonical_transaction_type("P") == "purchase"
+    assert canonical_transaction_type("S") == "sale"
+    assert canonical_transaction_type("E") == "exchange"
+    assert canonical_transaction_type("Sale") == "sale"
+    assert canonical_transaction_type("S (partial)") == "sale_partial"
+    assert canonical_transaction_type("Sale (Partial)") == "sale_partial"
+    assert canonical_transaction_type("partial sale") == "sale_partial"
+    assert canonical_transaction_type("sale_partial") == "sale_partial"
+    assert canonical_transaction_type(None) is None
+    assert canonical_transaction_type("   ") is None
+    # Anything unrecognised keeps its own text, so two reads of the same odd
+    # string still agree and two different ones still disagree.
+    assert canonical_transaction_type("Gift") == "gift"
+
+
+def test_two_spellings_of_one_reading_agree_instead_of_nulling_each_other() -> None:
+    rows, agreement = reconcile_reads(
+        [_row("Visa Inc", transaction_type="S")],
+        [_row("Visa Inc", transaction_type="Sale")],
+    )
+    assert agreement["fieldDisagreements"] == {}
+    # Canonical, not the raw "S": house_ptr._VISION_TRANSACTION_TYPE_MAP maps
+    # anything it does not recognise to "purchase", so a raw "S" surviving the
+    # merge would publish a sale as a purchase.
+    assert rows[0]["transaction_type"] == "sale"
+    assert rows[0]["legibility"] == "clear"
+    assert "read as 'S' and 'Sale'" in rows[0]["comment"]
+
+    rows, agreement = reconcile_reads(
+        [_row("Visa Inc", transaction_type="S (partial)")],
+        [_row("Visa Inc", transaction_type="sale_partial")],
+    )
+    assert agreement["fieldDisagreements"] == {}
+    assert rows[0]["transaction_type"] == "sale_partial"
+
+
+def test_a_whole_page_read_as_the_wrong_column_is_still_a_real_disagreement() -> None:
+    # Khanna 8221322 page 49: read A "sale", read B "purchase", on all 60 rows.
+    # No normalisation can rescue that, and it must not be published.
+    rows, agreement = reconcile_reads(
+        [_row("BALL CORPORATION CMN", transaction_type="sale")],
+        [_row("BALL CORPORATION CMN", transaction_type="purchase")],
+    )
+    assert agreement["fieldDisagreements"] == {"transaction_type": 1}
+    assert rows[0]["transaction_type"] is None
+    assert rows[0]["legibility"] == "illegible"
+
+
+def _mccaul_page_five_pair() -> tuple[dict[str, Any], dict[str, Any]]:
+    """One row of McCaul 9116141 page 5, as each model actually read it."""
+
+    read_a = _row(
+        "WHITE MTNS INS GROUP LTD",
+        page_number=1,
+        transaction_type="sale",
+        amount_column_letter="C",
+        amount_min=50001,
+        amount_max=100000,
+    )
+    read_b = _row(
+        "WHITE MTNS INS GROUP LTD",
+        page_number=1,
+        transaction_type="sale",
+        amount_column_letter="B",
+        amount_min=15001,
+        amount_max=50000,
+    )
+    return read_a, read_b
+
+
+def test_the_detector_settles_an_amount_the_two_reads_could_not() -> None:
+    read_a, read_b = _mccaul_page_five_pair()
+    merged, agreement = reconcile_reads([read_a], [read_b])
+    assert merged[0]["amount_min"] is None  # the conservative outcome, first
+    assert agreement["fieldDisagreements"] == {"amount_column_letter": 1}
+
+    # The tick is in B, which is what the page says and what read B said.
+    pages = [{"index": 1, "grid": _grid_with({0: 1})}]
+    rows, summaries = apply_checkbox_detector(merged, pages)
+
+    assert rows[0]["detectorStatus"] == "resolved"
+    assert rows[0]["amount_column_letter"] == "B"
+    assert (rows[0]["amount_min"], rows[0]["amount_max"]) == AMOUNT_LETTER_BANDS["B"]
+    assert rows[0]["legibility"] == "partial"  # never promoted back to clear
+    assert "ticked column B by the checkbox detector" in rows[0]["comment"]
+    assert "reported B and C" in rows[0]["comment"]  # both readings kept
+    assert summaries[0]["resolved"] == 1
+    assert "_amount_unresolved" not in rows[0]
+
+
+def test_the_detector_wins_even_where_it_agrees_with_neither_read() -> None:
+    # McCaul 9116141 page 6, the Vanguard Total Stock Market row: read A said
+    # G, read B said E, the form is ticked in F. Verified against the PDF.
+    read_a = _row(
+        "VANGUARD TOTAL STK MKT ETF",
+        page_number=1,
+        amount_column_letter="G",
+        amount_min=1000001,
+        amount_max=5000000,
+    )
+    read_b = _row(
+        "VANGUARD TOTAL STK MKT ETF",
+        page_number=1,
+        amount_column_letter="E",
+        amount_min=250001,
+        amount_max=500000,
+    )
+    merged, _ = reconcile_reads([read_a], [read_b])
+    rows, _summaries = apply_checkbox_detector(merged, [{"index": 1, "grid": _grid_with({0: 5})}])
+
+    assert rows[0]["detectorStatus"] == "resolved"
+    assert (rows[0]["amount_min"], rows[0]["amount_max"]) == AMOUNT_LETTER_BANDS["F"]
+
+
+def test_the_detector_settles_a_letter_band_conflict_inside_one_read() -> None:
+    # apply_amount_letter_check nulls a read that contradicts itself. That null
+    # is provisional: the detector reads the ink and can still settle the row.
+    read_a, conflicts = apply_amount_letter_check(
+        [_row("Amgen", page_number=1, amount_column_letter="B", amount_min=1001, amount_max=15000)]
+    )
+    assert conflicts == 1
+    read_b = [
+        _row("Amgen", page_number=1, amount_column_letter="B", amount_min=15001, amount_max=50000)
+    ]
+    merged, agreement = reconcile_reads(read_a, read_b)
+    assert merged[0]["amount_min"] is None
+    assert agreement["fieldDisagreements"] == {"amount_column_letter": 1}
+
+    rows, summaries = apply_checkbox_detector(merged, [{"index": 1, "grid": _grid_with({0: 1})}])
+    assert rows[0]["detectorStatus"] == "resolved"
+    assert (rows[0]["amount_min"], rows[0]["amount_max"]) == AMOUNT_LETTER_BANDS["B"]
+    assert summaries[0]["resolved"] == 1
+
+
+def test_a_disagreement_the_detector_cannot_confirm_still_nulls() -> None:
+    from capitol_pipeline.parsers.ptr_grid import analyze_amount_grid, draw_synthetic_grid
+
+    read_a, read_b = _mccaul_page_five_pair()
+    merged, _ = reconcile_reads([read_a], [read_b])
+    ambiguous = analyze_amount_grid(draw_synthetic_grid(marks={}, rows=5, ambiguous_rows=(0,)))
+    rows, summaries = apply_checkbox_detector(merged, [{"index": 1, "grid": ambiguous}])
+
+    assert rows[0]["detectorStatus"] == "ambiguous"
+    assert rows[0]["amount_min"] is None and rows[0]["amount_max"] is None
+    assert rows[0]["amount_column_letter"] is None
+    assert rows[0]["legibility"] == "partial"
+    assert summaries[0]["resolved"] == 0
+
+    # And with no grid at all the row simply keeps nothing.
+    merged, _ = reconcile_reads([dict(read_a)], [dict(read_b)])
+    rows, summaries = apply_checkbox_detector(merged, [{"index": 1, "grid": None}])
+    assert rows[0]["detectorStatus"] == "no-grid"
+    assert rows[0]["amount_min"] is None
+    assert summaries[0]["resolved"] == 0
+
+
+def test_the_detector_never_overwrites_an_amount_the_reads_agreed_on() -> None:
+    # Both reads say B and the detector reads A: that is the old contradiction,
+    # and it still nulls rather than either side winning.
+    agreed = _row("Ford", page_number=1, amount_column_letter="B", amount_min=15001, amount_max=50000)
+    merged, agreement = reconcile_reads([agreed], [dict(agreed)])
+    assert agreement["fieldDisagreements"] == {}
+    rows, summaries = apply_checkbox_detector(merged, [{"index": 1, "grid": _grid_with({0: 0})}])
+    assert rows[0]["detectorStatus"] == "disagree"
+    assert rows[0]["amount_min"] is None
+    assert summaries[0]["resolved"] == 0
+
+
+def test_column_k_is_a_flag_and_can_never_stand_in_for_a_band() -> None:
+    read_a, read_b = _mccaul_page_five_pair()
+    merged, _ = reconcile_reads([read_a], [read_b])
+    rows, summaries = apply_checkbox_detector(merged, [{"index": 1, "grid": _grid_with({0: 10})}])
+    assert rows[0]["detectorLetter"] == "K"
+    assert rows[0]["detectorStatus"] == "unchecked"
+    assert rows[0]["amount_min"] is None
+    assert summaries[0]["resolved"] == 0
+
+
+def test_a_settled_letter_conflict_no_longer_withholds_the_filing(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    _enable(monkeypatch)
+    pdf = _write_real_pdf(tmp_path, pages=1, portrait=False)
+    monkeypatch.setattr(ptr_vision, "_analyze_page_grid", lambda _page, _module: _grid_with({0: 1}))
+    read_a, read_b = _mccaul_page_five_pair()
+    _install(monkeypatch, [_payload(read_a), _payload(read_b)])
+
+    result = extract_via_vision(pdf)
+
+    row = result["transactions"][0]
+    assert (row["amount_min"], row["amount_max"]) == AMOUNT_LETTER_BANDS["B"]
+    assert result["detector"]["resolved"] == 1
+    assert result["amount_letter_issues"] == 1  # the conflict is still recorded
+    assert result["amounts_unresolved"] == 0
+    assert result["needs_review_reasons"] == []
+    assert result["needs_review"] is False
+    metadata = build_vision_metadata(result)
+    assert metadata["amountsUnresolved"] == 0
+    assert metadata["detector"]["resolved"] == 1
+    assert any("det:B/resolved" in line for line in metadata["rows"])
+    assert "_amount_unresolved" not in row and "_amount_letters" not in row
+
+
+def test_an_unsettled_letter_conflict_still_withholds_the_filing(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    from capitol_pipeline.parsers.ptr_grid import analyze_amount_grid, draw_synthetic_grid
+
+    _enable(monkeypatch)
+    pdf = _write_real_pdf(tmp_path, pages=1, portrait=False)
+    ambiguous = analyze_amount_grid(draw_synthetic_grid(marks={}, rows=5, ambiguous_rows=(0,)))
+    monkeypatch.setattr(ptr_vision, "_analyze_page_grid", lambda _page, _module: ambiguous)
+    read_a, read_b = _mccaul_page_five_pair()
+    _install(monkeypatch, [_payload(read_a), _payload(read_b)])
+
+    result = extract_via_vision(pdf)
+
+    assert result["transactions"][0]["amount_min"] is None
+    assert "checkbox detector ambiguous on 1 row(s)" in result["needs_review_reasons"]
+    assert result["needs_review"] is True
+
+
+# ---------------------------------------------------------------------------
+# Reconciling a stored transcription, for nothing and with no model
+# ---------------------------------------------------------------------------
+
+
+def test_the_whole_merged_transcription_is_stored_for_a_later_reconcile(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    _enable(monkeypatch)
+    pdf = _write_real_pdf(tmp_path, pages=1, portrait=False)
+    monkeypatch.setattr(ptr_vision, "_analyze_page_grid", lambda _page, _module: _grid_with({0: 1, 1: 1}))
+    kept = _row("Ford", page_number=1, amount_column_letter="B", amount_min=15001, amount_max=50000)
+    disputed_a = _row("Amgen", page_number=1, transaction_type="sale", amount_column_letter="B",
+                      amount_min=15001, amount_max=50000)
+    disputed_b = {**disputed_a, "transaction_type": "purchase"}
+    _install(monkeypatch, [_payload(kept, disputed_a), _payload(dict(kept), disputed_b)])
+
+    parsed, metadata = house_ptr._run_vision_parse(pdf, _stub(), "text")
+
+    assert parsed is not None
+    assert metadata["rowsDroppedForType"] == 1
+    # The published row is summarised; the transcription keeps both, because a
+    # page the detector has to align has to be whole.
+    assert len(metadata["rows"]) == 1
+    transcription = metadata["transcription"]
+    assert [row["asset_description"] for row in transcription] == ["Ford", "Amgen"]
+    assert metadata["transcriptionComplete"] is True
+    # line_number is the key back into metadata.parsedTransactions.
+    assert transcription[0]["line_number"] == 1
+    assert transcription[1].get("line_number") is None
+    assert [t.line_number for t in parsed[0].transactions] == [1]
+
+
+def test_a_row_summary_reads_back_into_the_row_it_came_from() -> None:
+    row = _row(
+        "NORTHERN INTERMED TAX EXEMPT FUND",
+        page_number=5,
+        owner="spouse",
+        transaction_type="sale",
+        transaction_date="2026-05-22",
+        notification_date="2026-06-05",
+        amount_column_letter="C",
+        amount_min=50001,
+        amount_max=100000,
+        legibility="clear",
+        detectorLetter="C",
+        detectorStatus="agree",
+    )
+    back = ptr_vision.parse_row_summary(ptr_vision.row_summary(row))
+    assert back is not None
+    for field in (
+        "page_number",
+        "asset_description",
+        "owner",
+        "transaction_type",
+        "transaction_date",
+        "notification_date",
+        "amount_min",
+        "amount_max",
+        "amount_column_letter",
+        "legibility",
+        "detectorLetter",
+        "detectorStatus",
+    ):
+        assert back[field] == row[field], field
+
+    # A nulled amount and a missing type come back as None, not as "?" text.
+    nulled = _row("X", page_number=1, transaction_type=None, amount_min=None, amount_max=None,
+                  amount_column_letter=None, notification_date=None, legibility="illegible")
+    back = ptr_vision.parse_row_summary(ptr_vision.row_summary(nulled))
+    assert back is not None
+    assert back["transaction_type"] is None
+    assert back["amount_min"] is None and back["amount_max"] is None
+    assert back["notification_date"] is None
+    # The truncation marker is not a row.
+    assert ptr_vision.parse_row_summary("... 43 more row(s)") is None
+
+
+def test_transcription_from_metadata_prefers_stored_rows_and_flags_truncation() -> None:
+    row = _row("Ford", page_number=1)
+    stored = ptr_vision.stored_transcription([row])
+    rows, complete = ptr_vision.transcription_from_metadata(
+        {"transcription": stored, "transcriptionComplete": True}
+    )
+    assert [entry["asset_description"] for entry in rows] == ["Ford"]
+    assert complete is True
+
+    _rows, complete = ptr_vision.transcription_from_metadata(
+        {"transcription": stored, "transcriptionComplete": False}
+    )
+    assert complete is False
+
+    # Falls back to the summaries a filing read before that was kept.
+    rows, complete = ptr_vision.transcription_from_metadata(
+        {"rows": [ptr_vision.row_summary(row), "... 12 more row(s)"]}
+    )
+    assert [entry["asset_description"] for entry in rows] == ["Ford"]
+    assert complete is False
+    assert ptr_vision.transcription_from_metadata({}) == ([], False)
+
+
+def test_reconcile_stored_transcription_settles_an_amount_with_no_model(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    pdf = _write_real_pdf(tmp_path, pages=1, portrait=False)
+    monkeypatch.setattr(ptr_vision, "_analyze_page_grid", lambda _page, _module: _grid_with({0: 1}))
+    # No provider is available at all: a reconcile that reached for one would
+    # fail here rather than quietly spend.
+    monkeypatch.setattr(ptr_vision, "_client_once", lambda: pytest.fail("a model was called"))
+    withheld = _row(
+        "WHITE MTNS INS GROUP LTD",
+        page_number=1,
+        amount_min=None,
+        amount_max=None,
+        amount_column_letter=None,
+        legibility="partial",
+    )
+
+    outcome = ptr_vision.reconcile_stored_transcription(pdf, [withheld])
+
+    assert outcome is not None
+    rows, detector = outcome
+    assert rows[0]["detectorStatus"] == "resolved"
+    assert (rows[0]["amount_min"], rows[0]["amount_max"]) == AMOUNT_LETTER_BANDS["B"]
+    assert detector["resolved"] == 1
+    assert detector["unalignedPages"] == []
+    # The caller's rows are not mutated behind its back.
+    assert withheld["amount_min"] is None
+
+    # A page named in skip_pages is left exactly as it was.
+    rows, detector = ptr_vision.reconcile_stored_transcription(
+        pdf, [dict(withheld)], skip_pages=frozenset({1})
+    )
+    assert rows[0]["amount_min"] is None
+    assert detector["resolved"] == 0

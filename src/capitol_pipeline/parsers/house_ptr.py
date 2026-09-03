@@ -1105,6 +1105,15 @@ def _run_vision_parse(
     # the safe outcome; the row count mismatch already routes the stub to review.
     typed_transactions = [row for row in raw_transactions if row.get("transaction_type")]
     dropped_for_type = len(raw_transactions) - len(typed_transactions)
+    # The whole merged transcription is what a later reconcile has to work
+    # from: the checkbox detector counts bands against every row printed on a
+    # page, so a page missing the rows dropped here would no longer align.
+    # line_number is the key back from metadata.parsedTransactions, and it is
+    # the 1-based index into the kept rows, which is what
+    # _vision_to_transactions numbers them by.
+    report["merged_transactions"] = list(raw_transactions)
+    for line_number, row in enumerate(typed_transactions, start=1):
+        row["line_number"] = line_number
     raw_transactions = typed_transactions
     report["transactions"] = raw_transactions
     metadata = build_vision_metadata(report)

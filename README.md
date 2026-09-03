@@ -268,13 +268,46 @@ dropped); a detector letter that agrees confirms the band, a disagreement or
 an ambiguous cell nulls the amount, marks the row `partial` and routes the
 filing to review. Per-row `detectorLetter`/`detectorStatus` and a per-page
 `visionParse.detector` block (`columns`, `rowsAligned`, `agreed`, `disagreed`,
-`ambiguous`, `status`) record the outcome.
+`ambiguous`, `resolved`, `status`) record the outcome.
+
+Where the two reads name **different** columns, neither is trusted and the
+amount is nulled -- but the detector then gets the last word rather than the
+row simply losing its amount. On a row with no band left, a confident detector
+letter is adopted (`detectorStatus: resolved`), the row is marked `partial`,
+and both rejected readings are kept in the comment. Where the detector is
+ambiguous, or the page could not be aligned, the row keeps nothing and the
+filing stays in review. Measured on McCaul 9116141: `gemini-3.8-flash` read
+page 5's ladder a column to the right on all 25 rows and the merge threw away
+25 amounts the detector had read correctly; on page 6 both reads were wrong
+about the Vanguard row (G and E) and only the detector read the ticked column
+(F). Column K is the spouse/dependent flag, not a band, so it can never stand
+in for one.
+
+The whole merged transcription is kept on the stub as
+`visionParse.transcription` (`transcriptionComplete` says whether it survived
+whole), which is what lets a filing be reconciled again later without paying
+for a second read:
+
+```bash
+# Re-run the free checkbox detector over what the stub already holds.
+# No model is called -- not for the rows, not for the page orientation --
+# and nothing is spent.
+capitol-pipeline reconcile-house-vision --doc-id 9116141 --dry-run
+capitol-pipeline reconcile-house-vision --doc-id 9116141 --apply
+```
+
+A filing transcribed before `transcription` was stored falls back to reading
+`visionParse.rows` back into rows; that list is capped at 500, and a page
+holding fewer rows than the read saw on it is skipped rather than aligned
+against a short list.
 
 A vision-parsed filing publishes trade rows only when it resolves to `parsed`;
 while it is `needs_review` the transcription stays on the stub
 (`parsedTransactions`, `visionParse.rows`) and nothing is written to `trades`
 (`visionParse.withheldTrades`). The text path is unchanged.
-`process-house-review --doc-id <id>` (repeatable) targets specific stubs.
+`process-house-review --doc-id <id>` (repeatable) targets specific stubs, and
+`reconcile-house-vision --doc-id <id>` settles withheld amounts from the stored
+transcription for nothing.
 
 Vision rows are normalized through exactly the same helpers as text rows
 (`clean_asset_description`, `infer_asset_type`, `normalize_date`, the crypto

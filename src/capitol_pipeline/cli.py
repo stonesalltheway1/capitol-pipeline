@@ -124,7 +124,15 @@ from capitol_pipeline.parsers.house_ptr import (
     parse_house_ptr_pdf,
     strip_form_annotation,
 )
-from capitol_pipeline.parsers.ptr_vision import is_vision_parser_version
+from capitol_pipeline.parsers.ptr_vision import (
+    MAX_ROW_SUMMARIES_IN_METADATA,
+    detector_review_reasons,
+    is_vision_parser_version,
+    reconcile_stored_transcription,
+    row_summary,
+    stored_transcription,
+    transcription_from_metadata,
+)
 from capitol_pipeline.processors.chunking import build_search_chunks
 from capitol_pipeline.processors.embeddings import get_embedder
 from capitol_pipeline.processors.headshots import (
@@ -3658,6 +3666,282 @@ def sync_member_headshots_command(
             indent=2,
         )
     )
+
+
+# ---------------------------------------------------------------------------
+# Reconciling a stored transcription
+#
+# The two reads of a scanned filing disagree on which amount box is ticked far
+# more often than they disagree on anything else -- one of them counts the
+# ladder from the wrong end and is a whole column out for a page at a time --
+# and the merge nulls the amount rather than pick a side. The checkbox
+# detector reads the same boxes off the pixels, for nothing, and can settle
+# most of them. It runs during the read; this runs it again afterwards over
+# what the stub already holds, so a filing withheld under the old behaviour
+# can be released without a second read.
+# ---------------------------------------------------------------------------
+
+#: The review reason the letter conflict raises; dropped once nothing is left
+#: unresolved. Keep in step with ``ptr_vision.extract_via_vision``.
+AMOUNT_LETTER_REVIEW_REASON = "amount nulled after column-letter conflict"
+
+
+def _short_pages(vision: dict[str, object], rows: list[dict[str, object]]) -> frozenset[int]:
+    """Pages holding fewer rows now than the read saw on them.
+
+    The stored ``detector`` block counted every merged row on each page. A page
+    that no longer has that many cannot be aligned safely.
+    """
+
+    detector = vision.get("detector")
+    pages = (detector or {}).get("pages") if isinstance(detector, dict) else None
+    if not isinstance(pages, list):
+        return frozenset()
+    counts: dict[int, int] = {}
+    for entry in rows:
+        page = entry.get("page_number")
+        if isinstance(page, int):
+            counts[page] = counts.get(page, 0) + 1
+    return frozenset(
+        int(page["page"])
+        for page in pages
+        if isinstance(page, dict) and counts.get(int(page["page"]), 0) != int(page.get("rows") or 0)
+    )
+
+
+def _amount_from_row(row: dict[str, object]) -> tuple[int, int] | None:
+    try:
+        low = int(row.get("amount_min") or 0)
+        high = int(row.get("amount_max") or 0)
+    except (TypeError, ValueError):
+        return None
+    return (low, high) if low and high else None
+
+
+def reconcile_stored_house_vision(
+    settings: Settings,
+    row: dict[str, object],
+) -> dict[str, object]:
+    """Settle a stub's withheld amounts from what it already stores.
+
+    Downloads the filing's PDF, checks it is byte-for-byte the one that was
+    read, and re-runs the free numpy checkbox detector over the stored
+    transcription. No model is called and nothing is spent.
+
+    Mutates ``row["metadata"]`` in place and returns a report. ``changed`` is
+    False whenever nothing could be settled, in which case the caller has
+    nothing to write.
+    """
+
+    doc_id = str(row.get("doc_id") or "")
+    metadata = row.get("metadata")
+    report: dict[str, object] = {"docId": doc_id, "changed": False}
+    if not isinstance(metadata, dict):
+        return {**report, "skipped": "stub metadata is not an object"}
+    vision = metadata.get("visionParse")
+    if not isinstance(vision, dict) or not vision.get("ok"):
+        return {**report, "skipped": "no usable visionParse on the stub"}
+
+    transcription, complete = transcription_from_metadata(vision)
+    if not transcription:
+        return {**report, "skipped": "no stored transcription to reconcile"}
+
+    keyed = any(str(entry.get("line_number") or "").isdigit() for entry in transcription)
+    # A transcription stored before line numbers were kept holds only the rows
+    # that were published: any page that lost a row to a disputed transaction
+    # type is now short, and the detector's bands would line up against the
+    # wrong rows. Those pages are left alone rather than guessed at.
+    skip_pages = frozenset() if keyed else _short_pages(vision, transcription)
+
+    stub = build_stub_from_queue_row(row)
+    with TemporaryDirectory(prefix="capitol-reconcile-") as temp_dir:
+        pdf_path = Path(temp_dir) / f"{doc_id}.pdf"
+        download_house_pdf(stub, settings, pdf_path)
+        digest = hashlib.sha256(pdf_path.read_bytes()).hexdigest()
+        expected = str(vision.get("pdfSha256") or "")
+        if expected and digest != expected:
+            # A different PDF is a different filing; reconciling one against
+            # the other would move amounts onto the wrong rows.
+            return {**report, "skipped": f"pdf changed since the read ({digest[:12]}...)"}
+        outcome = reconcile_stored_transcription(pdf_path, transcription, skip_pages=skip_pages)
+
+    if outcome is None:
+        return {**report, "skipped": "the pages could not be rendered"}
+    rows, detector = outcome
+    resolved = [row_ for row_ in rows if row_.get("detectorStatus") == "resolved"]
+    report.update(
+        {
+            "rows": len(rows),
+            "transcriptionComplete": complete,
+            "skippedPages": sorted(skip_pages),
+            "resolved": len(resolved),
+            "detector": {key: value for key, value in detector.items() if key != "pages"},
+        }
+    )
+    if not resolved:
+        return {**report, "skipped": "the detector settled nothing new"}
+
+    # Carry the settled amounts onto the published rows. line_number is the
+    # 1-based index into this very list, assigned by _vision_to_transactions.
+    published = metadata.get("parsedTransactions")
+    published = published if isinstance(published, list) else []
+    by_line = {
+        int(entry["line_number"]): entry
+        for entry in published
+        if isinstance(entry, dict) and str(entry.get("line_number") or "").isdigit()
+    }
+    republished = 0
+    for index, transcribed in enumerate(rows, start=1):
+        if transcribed.get("detectorStatus") != "resolved":
+            continue
+        line = transcribed.get("line_number") if keyed else index
+        if not str(line or "").isdigit():
+            continue
+        entry = by_line.get(int(line))
+        band = _amount_from_row(transcribed)
+        if entry is None or band is None or _amount_from_row(entry) is not None:
+            continue
+        entry["amount_min"], entry["amount_max"] = band
+        entry["comment"] = transcribed.get("comment") or entry.get("comment")
+        republished += 1
+
+    unresolved = sum(
+        1
+        for transcribed in rows
+        if _amount_from_row(transcribed) is None and transcribed.get("transaction_type")
+    )
+    reasons = [
+        reason
+        for reason in (vision.get("needsReviewReasons") or [])
+        if reason != AMOUNT_LETTER_REVIEW_REASON and not str(reason).startswith("checkbox detector")
+    ]
+    if unresolved and complete:
+        reasons.append(AMOUNT_LETTER_REVIEW_REASON)
+    elif not complete:
+        # Only part of the transcription survived on the stub, so the rows past
+        # the cap were never looked at. Releasing the filing on that basis
+        # would be a guess; the amounts recovered here are not.
+        reasons.append("stored transcription is truncated; not all rows were reconciled")
+    reasons.extend(detector_review_reasons(detector))
+
+    vision["detector"] = detector
+    vision["transcription"] = stored_transcription(rows)
+    published_rows = [entry for entry in rows if entry.get("transaction_type")]
+    vision["rows"] = [row_summary(entry) for entry in published_rows[:MAX_ROW_SUMMARIES_IN_METADATA]]
+    vision["amountsUnresolved"] = unresolved
+    vision["needsReviewReasons"] = reasons
+    vision["needsReview"] = bool(reasons)
+    vision["reconciledAt"] = datetime.now(timezone.utc).isoformat()
+    vision["reconcileCostUsd"] = 0.0
+    report.update(
+        {
+            "changed": True,
+            "amountsRestored": republished,
+            "amountsUnresolved": unresolved,
+            "needsReview": bool(reasons),
+            "needsReviewReasons": reasons,
+        }
+    )
+    return report
+
+
+def reconcile_house_stub_rows(
+    settings: Settings,
+    rows: list[dict[str, object]],
+    *,
+    registry: MemberRegistry | None = None,
+    dry_run: bool = True,
+) -> dict[str, object]:
+    """Reconcile a batch of stubs and, unless dry running, publish what clears."""
+
+    summary: dict[str, object] = {
+        "candidates": len(rows),
+        "reconciled": 0,
+        "skipped": 0,
+        "failed": 0,
+        "amountsRestored": 0,
+        "published": 0,
+        "tradeRowsUpserted": 0,
+        "dryRun": dry_run,
+        "costUsd": 0.0,
+        "stubs": [],
+    }
+    for row in rows:
+        doc_id = str(row.get("doc_id") or "")
+        try:
+            report = reconcile_stored_house_vision(settings, row)
+        except Exception as error:  # noqa: BLE001 - one bad filing must not stop the batch
+            logger.exception("reconcile: %s failed: %s", doc_id, error)
+            summary["failed"] = int(summary["failed"]) + 1
+            summary["stubs"].append({"docId": doc_id, "status": "failed", "error": str(error)[:500]})  # type: ignore[union-attr]
+            continue
+        if not report.get("changed"):
+            summary["skipped"] = int(summary["skipped"]) + 1
+            summary["stubs"].append({**report, "status": "skipped"})  # type: ignore[union-attr]
+            continue
+        summary["reconciled"] = int(summary["reconciled"]) + 1
+        summary["amountsRestored"] = int(summary["amountsRestored"]) + int(report["amountsRestored"])  # type: ignore[arg-type]
+        entry = {**report, "status": "reconciled"}
+        if dry_run:
+            summary["stubs"].append({**entry, "status": "would reconcile"})  # type: ignore[union-attr]
+            continue
+        stub, parsed, trades, skip_reason = rebuild_parsed_house_stub(row, registry=registry)
+        if parsed is None:
+            entry["publish"] = skip_reason
+            summary["stubs"].append(entry)  # type: ignore[union-attr]
+            continue
+        result = persist_parsed_house_stub(settings, stub, parsed, trades)
+        upserted = int((result.get("trades") or {}).get("upserted", 0))  # type: ignore[union-attr]
+        summary["published"] = int(summary["published"]) + 1
+        summary["tradeRowsUpserted"] = int(summary["tradeRowsUpserted"]) + upserted
+        entry["stubStatus"] = result.get("stubStatus")
+        entry["tradeRowsUpserted"] = upserted
+        summary["stubs"].append(entry)  # type: ignore[union-attr]
+    return summary
+
+
+@cli.command("reconcile-house-vision")
+@click.option(
+    "--doc-id",
+    "doc_ids",
+    multiple=True,
+    help="Only these filings (repeatable).",
+)
+@click.option("--limit", type=int, default=10, show_default=True)
+@click.option(
+    "--dry-run/--apply",
+    default=True,
+    show_default=True,
+    help="Dry run reports what would be settled and writes nothing.",
+)
+@click.option("--export-registry/--no-export-registry", default=True, show_default=True)
+def reconcile_house_vision_command(
+    doc_ids: tuple[str, ...],
+    limit: int,
+    dry_run: bool,
+    export_registry: bool,
+) -> None:
+    """Settle withheld amounts from a stored transcription. No model, no cost.
+
+    A scanned filing is read twice, and where the two reads name different
+    amount columns the merge keeps neither. The checkbox detector reads the
+    ticked box off the page itself with numpy, for nothing; this re-runs it
+    over the rows the stub already holds and fills in what it can settle.
+    Nothing here calls a model -- not for the transcription, not for the page
+    orientation -- and nothing is spent. A row the detector cannot settle keeps
+    no amount, and a filing with any left keeps its place in the review queue.
+    """
+
+    settings = Settings()
+    registry = load_registry_if_available(settings, export_cache=export_registry)
+    queue_rows = fetch_house_stub_queue(
+        settings,
+        limit=limit,
+        only_needs_review=True,
+        doc_ids=[doc_id.strip() for doc_id in doc_ids if doc_id.strip()] or None,
+    )
+    summary = reconcile_house_stub_rows(settings, queue_rows, registry=registry, dry_run=dry_run)
+    click.echo(json.dumps(summary, indent=2))
 
 
 if __name__ == "__main__":

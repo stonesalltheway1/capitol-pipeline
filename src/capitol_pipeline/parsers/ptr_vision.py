@@ -291,6 +291,75 @@ SOFT_FIELDS: tuple[str, ...] = (
     "cap_gains_over_200",
 )
 
+#: The Type column as the schema names it.
+CANONICAL_TRANSACTION_TYPES: tuple[str, ...] = (
+    "purchase",
+    "sale",
+    "sale_partial",
+    "exchange",
+)
+
+#: Every spelling of the Type column that means one of the canonical four.
+#:
+#: The structured-output enum normally does this for us -- measured across the
+#: nine filings read on 2026-09-03, ``gemini-3.8-flash`` and
+#: ``gemini-3.5-flash`` between them emitted only ``purchase``, ``sale``,
+#: ``sale_partial`` and ``exchange``, so nothing here fires on that data. It is
+#: the belt for the paths where no enum is enforced: ``_ReadState.structured``
+#: goes False when the API rejects the schema, and a provider added later may
+#: honour the enum loosely. Two spellings of the same fact must agree rather
+#: than null each other.
+TRANSACTION_TYPE_ALIASES: dict[str, str] = {
+    "p": "purchase",
+    "purchase": "purchase",
+    "purchased": "purchase",
+    "buy": "purchase",
+    "bought": "purchase",
+    "s": "sale",
+    "sale": "sale",
+    "sold": "sale",
+    "sell": "sale",
+    "s partial": "sale_partial",
+    "sale partial": "sale_partial",
+    "partial sale": "sale_partial",
+    "partial": "sale_partial",
+    "sale_partial": "sale_partial",
+    "e": "exchange",
+    "exchange": "exchange",
+    "exchanged": "exchange",
+}
+
+_TRANSACTION_TYPE_PUNCTUATION = re.compile(r"[^a-z0-9]+")
+
+
+def canonical_transaction_type(value: Any) -> str | None:
+    """The canonical name of a Type column reading, or None when it is blank.
+
+    Punctuation and case are dropped, so ``"S (partial)"``, ``"S-Partial"`` and
+    ``"sale_partial"`` are one value. A string that is not a spelling of any of
+    :data:`CANONICAL_TRANSACTION_TYPES` comes back lower-cased and squeezed
+    rather than as None: two reads of the same unrecognised text still agree,
+    and two different ones still disagree.
+    """
+
+    if value is None:
+        return None
+    text = " ".join(_TRANSACTION_TYPE_PUNCTUATION.sub(" ", str(value).strip().lower()).split())
+    if not text:
+        return None
+    return TRANSACTION_TYPE_ALIASES.get(text, text)
+
+
+def _type_for_agreement(value: Any) -> str | None:
+    """The Type column reading as the two reads are compared on it.
+
+    The attachment form ticks "Sale" and "Partial Sale" together, and the site
+    collapses both to "sale": the two readings agree on the trade.
+    """
+
+    canonical = canonical_transaction_type(value)
+    return "sale" if canonical == "sale_partial" else canonical
+
 
 # -- Output schema ----------------------------------------------------------
 # Structured outputs reject ``maxItems`` / ``minItems`` / ``minLength`` /
@@ -1289,6 +1358,8 @@ def plan_orientations(
 def prepare_page_images(
     pdf_path: Path,
     provider: Any,
+    *,
+    orientation_mode: str | None = None,
 ) -> tuple[list[dict[str, Any]], list[dict[str, Any]], dict[str, int], int] | None:
     """Render every page upright.
 
@@ -1316,7 +1387,8 @@ def prepare_page_images(
     usage = dict(_EMPTY_USAGE)
     grid_zoom = resolve_grid_zoom()
     page_range = resolve_page_range()
-    mode = resolve_orientation_mode()
+    # Pinned by a caller that must not reach a model even for orientation.
+    mode = orientation_mode or resolve_orientation_mode()
     total_pages = 0
     try:
         with document:
@@ -1463,6 +1535,37 @@ def _null_amount(row: dict[str, Any], note: str) -> None:
     row["comment"] = f"{existing}; {note}" if existing else note
 
 
+def _has_amount(row: dict[str, Any]) -> bool:
+    """Whether the row still carries a usable dollar band."""
+
+    low, high = _comparable(row, "amount")
+    return bool(low) and bool(high)
+
+
+def _adopt_detector_amount(row: dict[str, Any], letter: str) -> None:
+    """Take the amount from the box the detector says is ticked.
+
+    Only ever called on a row that has no amount left: either the two reads
+    reported different ladder columns, or one of them contradicted itself and
+    :func:`apply_amount_letter_check` nulled it. The detector measures the ink
+    on the page instead of counting boxes in a picture of it, so where it is
+    confident it is the better witness -- but the row is still marked
+    ``partial``, never ``clear``, and the rejected readings stay in the
+    comment.
+    """
+
+    row["amount_min"], row["amount_max"] = AMOUNT_LETTER_BANDS[letter]
+    row["amount_column_letter"] = letter
+    row["legibility"] = _downgrade(_worst_legibility(row.get("legibility")), "partial")
+    rejected = [candidate for candidate in (row.get("_amount_letters") or []) if candidate]
+    note = f"amount read from the ticked column {letter} by the checkbox detector"
+    if rejected:
+        note = f"{note} after the two reads reported {' and '.join(sorted(set(rejected)))}"
+    existing = _merge_comment(row.get("comment"))
+    row["comment"] = f"{existing}; {note}" if existing else note
+    row.pop("_amount_unresolved", None)
+
+
 def apply_checkbox_detector(
     rows: list[dict[str, Any]],
     pages: list[dict[str, Any]] | None,
@@ -1474,7 +1577,12 @@ def apply_checkbox_detector(
     saw are left out of the alignment: they are already illegible). Per row:
     the detector's letter agreeing with the model's confirms the band; a
     disagreement or an ambiguous cell nulls the amount and marks the row
-    ``partial``. Returns ``(rows, page_summaries)``.
+    ``partial``; and a row that has no amount left at all -- because the two
+    reads named different ladder columns, or one contradicted itself -- takes
+    the detector's letter when the detector is confident, rather than being
+    published with no amount. Where the detector is silent the row keeps the
+    conservative outcome and stays without one. Returns
+    ``(rows, page_summaries)``.
     """
 
     summaries: list[dict[str, Any]] = []
@@ -1499,6 +1607,7 @@ def apply_checkbox_detector(
             "agreed": 0,
             "disagreed": 0,
             "ambiguous": 0,
+            "resolved": 0,
         }
         if result["status"] != "ok":
             for row in page_rows:
@@ -1514,7 +1623,16 @@ def apply_checkbox_detector(
                 summary["ambiguous"] += 1
                 _null_amount(row, "checkbox detector could not tell which amount box is ticked")
             elif model_letter is None:
-                row["detectorStatus"] = "unchecked"
+                # No model letter survived. When the row also has no band left
+                # (the two reads named different columns, or one contradicted
+                # itself) the detector is the only witness there is, and column
+                # K is a flag rather than a band, so it cannot stand in for one.
+                if found["letter"] in AMOUNT_LETTER_BANDS and not _has_amount(row):
+                    _adopt_detector_amount(row, str(found["letter"]))
+                    row["detectorStatus"] = "resolved"
+                    summary["resolved"] += 1
+                else:
+                    row["detectorStatus"] = "unchecked"
             elif found["letter"] == model_letter:
                 row["detectorStatus"] = "agree"
                 summary["agreed"] += 1
@@ -1827,12 +1945,9 @@ def _comparable(row: dict[str, Any], field: str) -> Any:
         return None
     if isinstance(value, bool):
         return value
-    text = str(value).strip().lower()
-    if field == "transaction_type" and text == "sale_partial":
-        # The attachment form ticks "Sale" and "Partial Sale" together, and the
-        # site collapses both to "sale": the two readings agree on the trade.
-        return "sale"
-    return text or None
+    if field == "transaction_type":
+        return _type_for_agreement(value)
+    return str(value).strip().lower() or None
 
 
 def match_rows(
@@ -1892,6 +2007,32 @@ def _merge_comment(*comments: Any) -> str | None:
     if not texts:
         return None
     return max(texts, key=len)
+
+
+def _merged_transaction_type(
+    row_a: dict[str, Any], row_b: dict[str, Any]
+) -> tuple[str | None, str | None]:
+    """The Type value two agreeing reads should carry, plus a note if asked twice.
+
+    Returns ``(value, note)``. The value is canonical: two reads that spelled
+    the same fact differently ("S" and "Sale") must not leave a raw "S" on the
+    row, because ``house_ptr._VISION_TRANSACTION_TYPE_MAP`` maps anything it
+    does not recognise to "purchase". ``note`` records the two raw spellings
+    whenever they differed, so the reading is still auditable.
+    """
+
+    raw_a, raw_b = row_a.get("transaction_type"), row_b.get("transaction_type")
+    canonical_a = canonical_transaction_type(raw_a)
+    canonical_b = canonical_transaction_type(raw_b)
+    if "sale_partial" in (canonical_a, canonical_b):
+        value = "sale_partial"  # keep the more specific reading
+    else:
+        value = canonical_a if canonical_a is not None else canonical_b
+    note = None
+    text_a, text_b = str(raw_a or "").strip(), str(raw_b or "").strip()
+    if text_a and text_b and text_a != text_b:
+        note = f"transaction type read as {text_a!r} and {text_b!r}"
+    return value, note
 
 
 def _letter(row: dict[str, Any]) -> str | None:
@@ -1967,9 +2108,12 @@ def merge_matched_rows(row_a: dict[str, Any], row_b: dict[str, Any]) -> tuple[di
     ``illegible``; on a :data:`SOFT_FIELDS` entry it nulls the field and marks
     the row at least ``partial``. A disagreement on the amount column letter,
     or a letter/band conflict inside either read, nulls the amount and marks
-    the row ``partial``. The asset description keeps the reading the model was
-    more confident about (``clear`` over ``partial``), and the longer of the
-    two when it rated both the same.
+    the row ``partial`` -- and flags it ``_amount_unresolved`` so that
+    :func:`apply_checkbox_detector`, which runs afterwards and reads the ticked
+    box off the page itself, can settle it instead of the row losing its amount
+    to two guesses. The asset description keeps the reading the model was more
+    confident about (``clear`` over ``partial``), and the longer of the two
+    when it rated both the same.
     """
 
     merged: dict[str, Any] = dict(row_a)
@@ -1977,6 +2121,7 @@ def merge_matched_rows(row_a: dict[str, Any], row_b: dict[str, Any]) -> tuple[di
     if merged.get("page_number") is None:
         merged["page_number"] = row_b.get("page_number")
     disagreements: list[str] = []
+    notes: list[str] = []
 
     desc_a = str(row_a.get("asset_description") or "").strip()
     desc_b = str(row_b.get("asset_description") or "").strip()
@@ -2001,22 +2146,25 @@ def merge_matched_rows(row_a: dict[str, Any], row_b: dict[str, Any]) -> tuple[di
                 merged["amount_min"] = None
                 merged["amount_max"] = None
                 merged["amount_column_letter"] = None
+                merged["_amount_unresolved"] = "amount_column_letter"
+                merged["_amount_letters"] = [letter_a, letter_b]
                 disagreements.append("amount_column_letter")
             elif value_a != value_b:
                 merged["amount_min"] = None
                 merged["amount_max"] = None
                 merged["amount_column_letter"] = None
+                merged["_amount_unresolved"] = "amount"
+                merged["_amount_letters"] = [letter_a, letter_b]
                 disagreements.append("amount")
             else:
                 merged["amount_column_letter"] = letter_a or letter_b
             continue
         if value_a == value_b:
             merged[field] = row_a.get(field) if row_a.get(field) is not None else row_b.get(field)
-            if field == "transaction_type" and "sale_partial" in (
-                str(row_a.get(field) or "").lower(),
-                str(row_b.get(field) or "").lower(),
-            ):
-                merged[field] = "sale_partial"  # keep the more specific reading
+            if field == "transaction_type":
+                merged[field], spelling_note = _merged_transaction_type(row_a, row_b)
+                if spelling_note:
+                    notes.append(spelling_note)
         else:
             merged[field] = None
             disagreements.append(field)
@@ -2030,7 +2178,8 @@ def merge_matched_rows(row_a: dict[str, Any], row_b: dict[str, Any]) -> tuple[di
 
     comment = _merge_comment(row_a.get("comment"), row_b.get("comment"))
     if disagreements:
-        note = "two reads disagreed on: " + ", ".join(disagreements)
+        notes.append("two reads disagreed on: " + ", ".join(disagreements))
+    for note in notes:
         comment = f"{comment}; {note}" if comment else note
     merged["comment"] = comment
     return merged, disagreements
@@ -2159,6 +2308,8 @@ def build_vision_metadata(report: dict[str, Any]) -> dict[str, Any]:
         "orientation": report.get("orientation"),
         "readAgreement": report.get("read_agreement"),
         "amountLetterConflicts": int(report.get("amount_letter_conflicts") or 0),
+        "amountLetterIssues": int(report.get("amount_letter_issues") or 0),
+        "amountsUnresolved": int(report.get("amounts_unresolved") or 0),
         "detector": report.get("detector"),
         "rows": _row_summaries(list(report.get("transactions") or []), limit=MAX_ROW_SUMMARIES_IN_METADATA),
         "calls": report.get("calls") or [],
@@ -2179,6 +2330,14 @@ def build_vision_metadata(report: dict[str, Any]) -> dict[str, Any]:
             "orientation": {"inputPerMTok": orient_in, "outputPerMTok": orient_out},
         },
     }
+    # Kept verbatim so the filing can be reconciled again later without paying
+    # for a second read; the summaries above are for a human. Every merged row
+    # is kept, including any the caller drops afterwards, because the checkbox
+    # detector aligns its bands against the whole page, not against a subset.
+    merged = report.get("merged_transactions")
+    merged = merged if isinstance(merged, list) else list(report.get("transactions") or [])
+    metadata["transcription"] = stored_transcription(merged)
+    metadata["transcriptionComplete"] = len(merged) <= MAX_TRANSCRIPTION_ROWS
     scrubs = int(report.get("example_row_scrubs") or 0)
     if scrubs:
         metadata["exampleRowScrubs"] = scrubs
@@ -2707,31 +2866,18 @@ def extract_via_vision(
     }
     if critical:
         review_reasons.append("reads disagree on " + ", ".join(sorted(critical)))
+    # Only rows the detector could not settle still cost the filing its amount.
+    unresolved_amounts = sum(1 for row in transactions if row.get("_amount_unresolved"))
     letter_issues = letter_conflicts_total + int(disagreement_totals.get("amount_column_letter") or 0)
-    if letter_issues:
+    if unresolved_amounts:
         review_reasons.append("amount nulled after column-letter conflict")
-    detector_summary = {
-        "pages": detector_pages,
-        "rowsAligned": sum(int(page["rowsAligned"]) for page in detector_pages),
-        "agreed": sum(int(page["agreed"]) for page in detector_pages),
-        "disagreed": sum(int(page["disagreed"]) for page in detector_pages),
-        "ambiguous": sum(int(page["ambiguous"]) for page in detector_pages),
-        "unalignedPages": [
-            int(page["page"]) for page in detector_pages if page["status"] == "unaligned" and page["rows"]
-        ],
-    }
-    if detector_summary["disagreed"]:
-        review_reasons.append(f"checkbox detector disagreed on {detector_summary['disagreed']} row(s)")
-    if detector_summary["ambiguous"]:
-        review_reasons.append(f"checkbox detector ambiguous on {detector_summary['ambiguous']} row(s)")
-    if detector_summary["unalignedPages"]:
-        review_reasons.append(
-            "checkbox detector could not align rows on page(s) "
-            + ", ".join(str(page) for page in detector_summary["unalignedPages"])
-        )
+    detector_summary = detector_totals(detector_pages)
+    review_reasons.extend(detector_review_reasons(detector_summary))
     for row in transactions:
         row.pop("_unmatched", None)
         row.pop("_amount_letter_conflict", None)
+        row.pop("_amount_unresolved", None)
+        row.pop("_amount_letters", None)
     needs_review = bool(review_reasons)
 
     notes = [_clean_optional_text(payload.get("notes")) for payload in payloads]
@@ -2784,6 +2930,8 @@ def extract_via_vision(
         "chunk_pages": chunk_pages,
         "example_row_scrubs": scrubs_total,
         "amount_letter_conflicts": letter_conflicts_total,
+        "amount_letter_issues": letter_issues,
+        "amounts_unresolved": unresolved_amounts,
         "detector": detector_summary,
         "calls": calls,
     }
@@ -2806,3 +2954,175 @@ def extract_via_vision(
         result["usage"],
     )
     return result
+
+
+# -- Reconciling a stored transcription -------------------------------------
+# Nothing below calls a model or spends anything. The two reads are gone by
+# the time a filing is on the stub, but the checkbox detector is a local numpy
+# pass over the rendered page, so the one thing the reads could not settle --
+# which amount box is ticked -- can still be settled later for free.
+
+#: Fields of a merged row that are worth keeping on the stub.
+TRANSCRIPTION_FIELDS: tuple[str, ...] = tuple(TRANSACTION_ITEM_SCHEMA["required"]) + (
+    "line_number",
+    "detectorLetter",
+    "detectorStatus",
+)
+
+#: Merged rows stored verbatim on ``visionParse.transcription``. Generous: the
+#: longest filing measured (Khanna 8221322) carries 593 of them, and a
+#: transcription that does not survive whole cannot be reconciled later.
+MAX_TRANSCRIPTION_ROWS = 2000
+
+
+def stored_transcription(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """The merged rows as they are kept on the stub for a later reconcile."""
+
+    return [
+        {field: row.get(field) for field in TRANSCRIPTION_FIELDS if field in row}
+        for row in rows[:MAX_TRANSCRIPTION_ROWS]
+    ]
+
+
+def parse_row_summary(line: str) -> dict[str, Any] | None:
+    """Read one :func:`row_summary` line back into a row.
+
+    A compatibility shim, and only that. Filings transcribed before
+    ``visionParse.transcription`` existed kept nothing but these one-line
+    summaries, so this is the only way to reconcile them without paying for a
+    second read. Returns None for a line it cannot parse, including the
+    ``"... N more row(s)"`` marker that says the list was truncated.
+    """
+
+    parts = [part.strip() for part in str(line or "").split(" | ")]
+    if not parts or parts[0].startswith("..."):
+        return None
+    page: int | None = None
+    if parts[0].startswith("p") and parts[0][1:].isdigit():
+        page = int(parts[0][1:])
+        parts = parts[1:]
+    if len(parts) < 7:
+        return None
+    description, type_text, transaction, notification, amount, owner, legibility = parts[:7]
+    letter: str | None = None
+    if amount.endswith(")") and " (" in amount:
+        amount, tail = amount.rsplit(" (", 1)
+        letter = tail[:-1] or None
+    low, _, high = amount.partition("-")
+
+    def _number(text: str) -> int | None:
+        text = text.strip()
+        return int(text) if text.lstrip("-").isdigit() else None
+
+    row: dict[str, Any] = {
+        "page_number": page,
+        "asset_description": description,
+        "owner": None if owner == "-" else owner,
+        "ticker": None,
+        "asset_type_code": None,
+        "transaction_type": None if type_text == "?" else type_text,
+        "transaction_date": None if transaction == "?" else transaction,
+        "notification_date": None if notification in {"-", "?"} else notification,
+        "amount_min": _number(low),
+        "amount_max": _number(high),
+        "amount_column_letter": letter if letter in AMOUNT_LETTERS else None,
+        "cap_gains_over_200": None,
+        "comment": None,
+        "legibility": legibility if legibility in _LEGIBILITY_RANK else "partial",
+    }
+    for part in parts[7:]:
+        if part.startswith("det:"):
+            found, _, status = part[4:].partition("/")
+            row["detectorLetter"] = found if found in AMOUNT_LETTERS else None
+            row["detectorStatus"] = status or "unchecked"
+    return row
+
+
+def transcription_from_metadata(vision: dict[str, Any]) -> tuple[list[dict[str, Any]], bool]:
+    """The merged rows of a stored ``visionParse``, and whether they are all there.
+
+    Prefers ``transcription`` (kept verbatim). Falls back to re-reading the
+    ``rows`` summaries for filings read before that was stored, where the list
+    is capped at :data:`MAX_ROW_SUMMARIES_IN_METADATA` -- a filing longer than
+    that cannot be reconciled whole, and the caller is told so rather than
+    being handed a silently short list.
+    """
+
+    rows = vision.get("transcription")
+    if isinstance(rows, list) and rows:
+        complete = bool(vision.get("transcriptionComplete", True))
+        return [dict(row) for row in rows if isinstance(row, dict)], complete
+    summaries = vision.get("rows")
+    if not isinstance(summaries, list) or not summaries:
+        return [], False
+    complete = not any(str(line).startswith("...") for line in summaries)
+    parsed = [parse_row_summary(str(line)) for line in summaries]
+    return [row for row in parsed if row is not None], complete
+
+
+def detector_totals(page_summaries: list[dict[str, Any]]) -> dict[str, Any]:
+    """The ``detector`` block of a vision report, from its per-page summaries."""
+
+    return {
+        "pages": page_summaries,
+        "rowsAligned": sum(int(page["rowsAligned"]) for page in page_summaries),
+        "agreed": sum(int(page["agreed"]) for page in page_summaries),
+        "disagreed": sum(int(page["disagreed"]) for page in page_summaries),
+        "ambiguous": sum(int(page["ambiguous"]) for page in page_summaries),
+        "resolved": sum(int(page.get("resolved") or 0) for page in page_summaries),
+        "unalignedPages": [
+            int(page["page"])
+            for page in page_summaries
+            if page["status"] == "unaligned" and page["rows"]
+        ],
+    }
+
+
+def detector_review_reasons(detector: dict[str, Any]) -> list[str]:
+    """The review reasons the checkbox detector is responsible for."""
+
+    reasons: list[str] = []
+    if detector["disagreed"]:
+        reasons.append(f"checkbox detector disagreed on {detector['disagreed']} row(s)")
+    if detector["ambiguous"]:
+        reasons.append(f"checkbox detector ambiguous on {detector['ambiguous']} row(s)")
+    if detector["unalignedPages"]:
+        reasons.append(
+            "checkbox detector could not align rows on page(s) "
+            + ", ".join(str(page) for page in detector["unalignedPages"])
+        )
+    return reasons
+
+
+def reconcile_stored_transcription(
+    pdf_path: Path,
+    rows: list[dict[str, Any]],
+    *,
+    skip_pages: frozenset[int] = frozenset(),
+) -> tuple[list[dict[str, Any]], dict[str, Any]] | None:
+    """Re-run the checkbox detector over rows transcribed in an earlier run.
+
+    Free and offline: the pages are rendered locally, the orientation is
+    decided by the same numpy pass that decided it during the read, and
+    :mod:`~capitol_pipeline.parsers.ptr_grid` reads the ticked amount boxes off
+    the pixels. No model is called on any path, including orientation.
+
+    A row that already carries an amount is left exactly as it is. A row that
+    lost its amount to two disagreeing reads takes the detector's letter where
+    the detector is confident, and keeps nothing where it is not. ``skip_pages``
+    names pages whose row list is known to be incomplete, where a band could
+    line up against the wrong row; they are left untouched. Returns
+    ``(rows, detector)`` or None when the PDF cannot be rendered.
+    """
+
+    prepared = prepare_page_images(pdf_path, None, orientation_mode="grid")
+    if prepared is None:
+        return None
+    pages = [page for page in prepared[0] if int(page["index"]) not in skip_pages]
+    rows = [dict(row) for row in rows]
+    for row in rows:
+        # The detector's earlier verdict must not be mistaken for this one.
+        row.pop("detectorLetter", None)
+        row.pop("detectorStatus", None)
+    rows, page_summaries = apply_checkbox_detector(rows, pages)
+    return rows, detector_totals(page_summaries)
