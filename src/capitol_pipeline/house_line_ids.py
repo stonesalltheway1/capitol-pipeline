@@ -105,8 +105,15 @@ def _tokens(value: str | None) -> set[str]:
     return {token for token in re.findall(r"[a-z0-9]+", text) if token not in _STOP_TOKENS}
 
 
+#: A ticker in parentheses inside a name. Not one straight after a digit: the
+#: "(k)" of "401(k)" and the "(b)" of "403(b)" in an account name are not
+#: tickers, and reading "(k)" as K kept doc 20033916's JPM row from matching
+#: its own earlier transcription ("... 401(k) - Dave JP Morgan Chase & Co.").
+_TICKER_IN_NAME = re.compile(r"(?<!\d)\(\s*([A-Za-z][A-Za-z.\-]{0,7})\s*\)")
+
+
 def _ticker_in(value: str | None) -> str | None:
-    found = re.findall(r"\(\s*([A-Za-z][A-Za-z.\-]{0,7})\s*\)", value or "")
+    found = _TICKER_IN_NAME.findall(value or "")
     return found[-1].upper() if found else None
 
 

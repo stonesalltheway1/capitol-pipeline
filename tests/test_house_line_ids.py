@@ -365,3 +365,38 @@ def test_persisting_keeps_a_represented_row_out_and_marks_it(exporter: _Calls, m
     assert mark["metadata_extra"]["lineIds"]["withheld"] == [
         {"line": 2, "reason": "represented by tr-house-20016961-1"}
     ]
+
+
+def test_a_401k_account_name_is_not_a_ticker() -> None:
+    """Doc 20033916: an earlier parse lost the JPM ticker and left the account
+    name in the asset ("... Sardinia Ready Mix 401(k) - Dave JP Morgan Chase &
+    Co. Common"). The "(k)" read as ticker K kept the row from matching itself,
+    so a re-read would have published it a second time under a new id."""
+
+    row = HousePtrTransaction(
+        line_number=16,
+        asset_description="JP Morgan Chase & Co. Common Stock",
+        ticker="JPM",
+        asset_type="Stock",
+        transaction_type="purchase",
+        transaction_date="2026-01-16",
+        amount_min=1001,
+        amount_max=15000,
+        owner="self",
+    )
+    reference = LineReference(
+        line_number=16,
+        transaction_date="2026-01-16",
+        transaction_type="purchase",
+        amount_min=1001,
+        amount_max=15000,
+        ticker=None,
+        asset_description="David Taylor Trust > Sardinia Ready Mix 401(k) - Dave JP Morgan Chase & Co. Common",
+        owner="self",
+        origin="stored",
+    )
+    assert score_line(row, reference, position=16) is not None
+    assert assign_line_numbers([row], [reference]).numbers == {16: 16}
+    # A real one-letter ticker still counts.
+    visa = reference.__class__(**{**reference.__dict__, "asset_description": "Visa Inc. (V)"})
+    assert score_line(row, visa, position=16) is None
