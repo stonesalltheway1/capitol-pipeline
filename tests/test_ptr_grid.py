@@ -374,3 +374,13 @@ def test_typed_ticks_are_never_taken_for_the_example(name: str) -> None:
 
 def test_the_detector_version_moves_with_this_change() -> None:
     assert ptr_grid.DETECTOR_VERSION >= 3
+
+
+def test_a_partial_ladder_never_says_the_page_has_no_tick() -> None:
+    # Rogers 9115808: Buy St Str Spdr ETF, Purchase, ticked in A -- both reads
+    # and a 2x render agree. The run found eight of the eleven columns, left
+    # edge missing (find_ladder's known limitation), so the tick sat outside
+    # them. That is a page the detector cannot read, not a page with no tick.
+    analysis = analyze_amount_grid(_load("9115808_p1"))
+    assert analysis is not None and len(analysis["columns"]) < ptr_grid.COMPLETE_LADDER_COLUMNS
+    assert detect_page(analysis, expected_rows=1)["status"] == "unaligned"

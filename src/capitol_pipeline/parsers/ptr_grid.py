@@ -93,6 +93,9 @@ MIN_LADDER_RULES = 9
 #: At most this many rules are the ladder (A-K plus a border); a longer run
 #: keeps its rightmost rules.
 MAX_LADDER_RULES = 12
+#: A ladder of fewer columns than this (A-J, the older form) is a partial run
+#: and cannot say that a page carries no tick.
+COMPLETE_LADDER_COLUMNS = 10
 #: A rule just past the run within this many pitches is the wide K column.
 TRAILING_COLUMN_MAX_PITCHES = 3.5
 #: A horizontal rule (or a row of box edges) covers at least this much of the
@@ -1013,8 +1016,12 @@ def detect_page(analysis: dict[str, Any] | None, expected_rows: int) -> dict[str
         # The ladder is there and nothing on it is ticked (the example's x
         # aside). That is a finding, not a failure to align: no row on this
         # page has an amount box the detector can see, and it will not lend
-        # one any row.
-        return {"status": "no-ticks", **base}
+        # one any row. Only a whole ladder can say so: on 9115808 the run
+        # found eight of the eleven columns (find_ladder's known limitation)
+        # and the tick in A sat outside them.
+        if len(analysis["columns"]) >= COMPLETE_LADDER_COLUMNS:
+            return {"status": "no-ticks", **base}
+        return {"status": "unaligned", **base}
     aligned = align_rows(classified, expected_rows, float(analysis.get("pitch") or 0.0))
     if aligned is None:
         return {"status": "unaligned", **base}
