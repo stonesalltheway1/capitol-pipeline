@@ -188,6 +188,7 @@ from capitol_pipeline.sources.senate_efd import (
     fetch_paper_ptr_pages,
     list_ptr_reports,
     normalize_efd_transaction,
+    resolve_efd_filer,
 )
 from capitol_pipeline.sources.senate_ethics import (
     build_quiver_bulk_reconcile_dates,
@@ -625,7 +626,7 @@ def rebuild_parsed_house_stub(
 
     if not stub.member.id and registry is not None:
         resolved = registry.resolve_feed_member(
-            stub.first_name or "", stub.last_name or "", stub.member.state
+            stub.first_name or "", stub.last_name or "", stub.member.state, stub.filing_date
         )
         if resolved is not None:
             stub = stub.model_copy(update={"member": resolved})
@@ -1445,6 +1446,7 @@ def senate_ingest_command(
         "electronicParsed": 0,
         "paperDeferred": 0,
         "paperDeferredReports": [],
+        "unresolvedReports": [],
         "errors": [],
         "processedSample": [],
     }
@@ -1521,6 +1523,19 @@ def senate_ingest_command(
 
                 summary["electronicParsed"] = int(summary["electronicParsed"]) + 1
                 summary["fetched"] = int(summary["fetched"]) + len(transactions)
+                if transactions and resolve_efd_filer(report, registry) is None:
+                    # Not a senator we carry around that date, or more than one
+                    # candidate. Its rows are skipped, not guessed at; listed
+                    # here so the filer can be added to members and re-run.
+                    summary["unresolvedReports"].append(  # type: ignore[union-attr]
+                        {
+                            "reportId": report.report_id,
+                            "filer": report.senator_name,
+                            "submittedDate": report.submitted_date,
+                            "transactions": len(transactions),
+                            "url": report.url,
+                        }
+                    )
                 for transaction in transactions:
                     stop = handle_normalized_row(
                         normalize_efd_transaction(report, transaction, registry),

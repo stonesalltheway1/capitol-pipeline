@@ -45,6 +45,7 @@ from capitol_pipeline.normalizers.crypto_assets import (
     DIRECT_CRYPTO_SYMBOLS,
     classify_crypto_asset,
 )
+from capitol_pipeline.registries.legislator_service import load_legislator_service
 from capitol_pipeline.registries.members import MemberRegistry
 
 try:
@@ -232,21 +233,29 @@ def load_member_registry_from_neon(
     settings: Settings,
     *,
     export_cache: bool = False,
+    with_service: bool = True,
 ) -> MemberRegistry:
-    """Load the CapitolExposed members table into a local registry."""
+    """Load the CapitolExposed members table into a local registry.
+
+    ``with_service`` attaches the congress-legislators roster (every term, in
+    either chamber, of everyone who served since 2008), which is what lets a
+    filing be tied only to someone who sat in its chamber on its date.
+    """
 
     with neon_connection(settings) as connection:
         with connection.cursor() as cursor:
             cursor.execute(
                 """
-                SELECT id, bioguide_id, name, slug, party, state, district, first_name, last_name
+                SELECT id, bioguide_id, name, slug, party, state, district, first_name, last_name,
+                       chamber, in_office, term_start, term_end
                 FROM members
                 ORDER BY in_office DESC NULLS LAST, name ASC
                 """
             )
             rows = cursor.fetchall()
 
-    registry = MemberRegistry.from_rows(rows)
+    service = load_legislator_service(settings) if with_service else None
+    registry = MemberRegistry.from_rows(rows, service=service)
     if export_cache:
         registry.save_json(settings.members_registry_path)
     return registry

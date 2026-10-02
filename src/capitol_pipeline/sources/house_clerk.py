@@ -10,7 +10,9 @@ import httpx
 from capitol_pipeline.config import Settings
 from capitol_pipeline.models.congress import FilingStub, MemberMatch
 
-MemberResolver = Callable[[str, str, str | None], MemberMatch | None]
+#: ``(first_name, last_name, state, filing_date) -> member``. The filing date
+#: lets the resolver consider only people who sat in the House at the time.
+MemberResolver = Callable[[str, str, str | None, str | None], MemberMatch | None]
 
 
 def normalize_date(value: str | None) -> str | None:
@@ -68,8 +70,9 @@ def parse_house_feed(
         last_name = (member_node.findtext("Last") or "").strip() or None
         state_district = (member_node.findtext("StateDst") or "").strip() or None
         state, district = parse_state_district(state_district)
+        filing_date = normalize_date(member_node.findtext("FilingDate"))
         matched = (
-            resolver(first_name or "", last_name or "", state)
+            resolver(first_name or "", last_name or "", state, filing_date)
             if resolver and (first_name or last_name)
             else None
         )
@@ -81,7 +84,7 @@ def parse_house_feed(
                 doc_id=doc_id,
                 filing_year=year,
                 filing_type=filing_type or "PTR",
-                filing_date=normalize_date(member_node.findtext("FilingDate")),
+                filing_date=filing_date,
                 first_name=first_name,
                 last_name=last_name,
                 member=matched

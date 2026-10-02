@@ -284,7 +284,9 @@ def normalize_senate_watcher_trade(
     if not senator_name or not transaction_date:
         return None
 
-    member = registry.resolve(name=senator_name)
+    # The watcher feed has no filing date; a trade is reported by whoever
+    # held the seat when it was made.
+    member = registry.resolve(name=senator_name, chamber="senate", as_of=transaction_date)
     if not member or not member.id:
         return None
 
@@ -334,10 +336,14 @@ def normalize_quiver_senate_trade(
     if not member_name or not transaction_date:
         return None
 
+    # Quiver's "Filed" falls back to its own upload time for old rows, so the
+    # transaction date is the reliable anchor for who held the seat.
     member = registry.resolve(
         bioguide_id=(trade.bioguide_id or "").strip().upper() or None,
         name=member_name,
         state=(trade.state or "").strip().upper() or None,
+        chamber="senate",
+        as_of=transaction_date,
     )
     if not member or not member.id:
         return None

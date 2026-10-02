@@ -9,6 +9,7 @@ no PDF is downloaded and no model is called.
 
 from __future__ import annotations
 
+from datetime import date
 from typing import Any
 
 import pytest
@@ -16,6 +17,7 @@ import pytest
 from capitol_pipeline import cli
 from capitol_pipeline.config import Settings
 from capitol_pipeline.models.congress import FilingStub, MemberMatch
+from capitol_pipeline.registries.legislator_service import ServiceTerm
 from capitol_pipeline.registries.members import MemberRegistry
 
 MANNING_ROW: dict[str, Any] = {
@@ -132,7 +134,10 @@ def test_the_registry_resolves_a_member_the_stub_never_had() -> None:
                 state="NC",
                 district="6",
             )
-        ]
+        ],
+        fallback_terms={
+            "m-M001135": (ServiceTerm("house", date(2021, 1, 3), date(2025, 1, 3), "NC"),),
+        },
     )
     row = _row(memberId="")
     stub, parsed, trades, reason = cli.rebuild_parsed_house_stub(row, registry=registry)

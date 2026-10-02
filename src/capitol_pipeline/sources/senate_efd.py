@@ -39,7 +39,7 @@ from pydantic import BaseModel
 
 from capitol_pipeline.bridges.capitol_exposed import build_canonical_senate_trade_id
 from capitol_pipeline.config import Settings
-from capitol_pipeline.models.congress import NormalizedTradeRow
+from capitol_pipeline.models.congress import MemberMatch, NormalizedTradeRow
 from capitol_pipeline.normalizers.crypto_assets import classify_crypto_asset
 from capitol_pipeline.registries.members import MemberRegistry
 from capitol_pipeline.sources.senate_ethics import (
@@ -875,6 +875,32 @@ def build_paper_report_stub(report: EfdReport, page_images: list[str] | None = N
 # ---------------------------------------------------------------------------
 
 
+def resolve_efd_filer(
+    report: EfdReport,
+    registry: MemberRegistry,
+    fallback_date: str | None = None,
+) -> MemberMatch | None:
+    """Resolve the senator who filed ``report``, or ``None`` if that is not certain.
+
+    A Senate PTR can only be a senator's, so only people who sat in the Senate
+    around the submission date are candidates. Without that, Sen. James M.
+    Inhofe's filings matched Rep. John James on "James", and a 2026 appointee
+    missing from ``members`` (Alan Armstrong) matched former Rep. Kelly
+    Armstrong on the surname.
+    """
+
+    member = registry.resolve(
+        name=report.senator_name or None,
+        first_name=report.first_name or None,
+        last_name=report.last_name or None,
+        chamber="senate",
+        as_of=report.submitted_date or fallback_date,
+    )
+    if member is None or not member.id:
+        return None
+    return member
+
+
 def normalize_efd_transaction(
     report: EfdReport,
     transaction: EfdTransaction,
@@ -886,12 +912,8 @@ def normalize_efd_transaction(
     if not transaction_date:
         return None
 
-    member = registry.resolve(
-        name=report.senator_name or None,
-        first_name=report.first_name or None,
-        last_name=report.last_name or None,
-    )
-    if not member or not member.id:
+    member = resolve_efd_filer(report, registry, fallback_date=transaction_date)
+    if member is None:
         return None
 
     ticker = transaction.ticker

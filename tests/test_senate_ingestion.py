@@ -30,6 +30,10 @@ def test_normalize_senate_watcher_trade_resolves_member_and_crypto_asset() -> No
                 "slug": "cynthia-m-lummis",
                 "party": "R",
                 "state": "WY",
+                "chamber": "senate",
+                "term_start": "2021-01-03",
+                "term_end": "2027-01-03",
+                "in_office": True,
             }
         ]
     )
@@ -70,6 +74,10 @@ def test_build_senate_trade_search_document_captures_trade_metadata() -> None:
                 "slug": "cynthia-m-lummis",
                 "party": "R",
                 "state": "WY",
+                "chamber": "senate",
+                "term_start": "2021-01-03",
+                "term_end": "2027-01-03",
+                "in_office": True,
             }
         ]
     )
@@ -105,6 +113,10 @@ def test_normalize_quiver_senate_trade_prefers_bioguide_resolution() -> None:
                 "slug": "john-boozman",
                 "party": "R",
                 "state": "AR",
+                "chamber": "senate",
+                "term_start": "2023-01-03",
+                "term_end": "2029-01-03",
+                "in_office": True,
             }
         ]
     )
@@ -142,6 +154,10 @@ def test_normalize_quiver_live_senate_trade_maps_live_payload_fields() -> None:
                 "slug": "markwayne-mullin",
                 "party": "R",
                 "state": "OK",
+                "chamber": "senate",
+                "term_start": "2023-01-03",
+                "term_end": "2026-03-23",
+                "in_office": False,
             }
         ]
     )

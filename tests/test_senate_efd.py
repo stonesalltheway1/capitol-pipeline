@@ -68,6 +68,10 @@ def senate_registry() -> MemberRegistry:
                 "slug": "sheldon-whitehouse",
                 "party": "D",
                 "state": "RI",
+                "chamber": "senate",
+                "term_start": "2007-01-04",
+                "term_end": "2031-01-03",
+                "in_office": True,
             },
             {
                 "id": "m-B001277",
@@ -76,6 +80,10 @@ def senate_registry() -> MemberRegistry:
                 "slug": "richard-blumenthal",
                 "party": "D",
                 "state": "CT",
+                "chamber": "senate",
+                "term_start": "2011-01-05",
+                "term_end": "2029-01-03",
+                "in_office": True,
             },
         ]
     )

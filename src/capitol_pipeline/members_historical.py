@@ -47,6 +47,11 @@ import httpx
 from capitol_pipeline.config import Settings
 from capitol_pipeline.exporters.neon import Jsonb, ensure_neon_available, neon_connection
 from capitol_pipeline.models.congress import MemberMatch
+from capitol_pipeline.registries.legislator_service import (
+    parse_legislator_entries,
+    service_cache_path,
+    write_service_cache,
+)
 from capitol_pipeline.registries.members import MemberRegistry
 from capitol_pipeline.sources.congress_legislators import _coerce_text, _wikipedia_slug
 
@@ -170,6 +175,10 @@ class MemberRow:
             "party": self.party,
             "state": self.state,
             "district": self.district,
+            "chamber": self.chamber,
+            "in_office": self.in_office,
+            "term_start": self.term_start,
+            "term_end": self.term_end,
         }
 
 
@@ -415,7 +424,8 @@ def fetch_existing_members(settings: Settings) -> list[dict[str, object]]:
         with connection.cursor() as cursor:
             cursor.execute(
                 """
-                SELECT id, bioguide_id, name, slug, party, state, district, in_office
+                SELECT id, bioguide_id, name, slug, party, state, district, in_office,
+                       chamber, term_start, term_end
                 FROM members
                 ORDER BY in_office DESC NULLS LAST, name ASC
                 """
@@ -529,12 +539,23 @@ def resolve_stub_member(registry: MemberRegistry, metadata: Mapping[str, object]
     last = _coerce_text(metadata.get("lastName"))
     name = _coerce_text(metadata.get("memberName"))
     state = _stub_state(metadata)
+    # A House PTR is a House member's: only people who sat in the House around
+    # the filing date are candidates.
+    filing_date = _coerce_text(metadata.get("filingDate"))
 
     attempts: list[dict[str, str | None]] = []
     if first or last:
-        attempts.append({"first_name": first, "last_name": last, "state": state})
+        attempts.append(
+            {
+                "first_name": first,
+                "last_name": last,
+                "state": state,
+                "chamber": "house",
+                "as_of": filing_date,
+            }
+        )
     if name:
-        attempts.append({"name": name, "state": state})
+        attempts.append({"name": name, "state": state, "chamber": "house", "as_of": filing_date})
 
     for kwargs in attempts:
         match = registry.resolve(**kwargs)
@@ -645,11 +666,20 @@ def run(
     }
     taken_slugs = {str(row.get("slug")) for row in existing if row.get("slug")}
 
-    candidates = build_member_rows(fetch_legislators(settings, historical_url), since=since)
+    historical_entries = fetch_legislators(settings, historical_url)
+    current_entries = fetch_legislators(settings, current_url)
+    candidates = build_member_rows(historical_entries, since=since)
     if include_current:
-        candidates += build_member_rows(
-            fetch_legislators(settings, current_url), since=since, in_office=True
-        )
+        candidates += build_member_rows(current_entries, since=since, in_office=True)
+
+    # Every term of everyone, so a stub resolves only to someone who sat in the
+    # House on its filing date. Refresh the shared cache while we have it.
+    service = parse_legislator_entries([*current_entries, *historical_entries])
+    if service:
+        try:
+            write_service_cache(service_cache_path(settings), service)
+        except OSError:
+            pass
 
     new_rows = [row for row in candidates if row.bioguide_id.upper() not in existing_by_bioguide]
     present_rows = [row for row in candidates if row.bioguide_id.upper() in existing_by_bioguide]
@@ -670,7 +700,8 @@ def run(
         filled = fill_member_nulls(settings, present_rows, table_columns)
 
     registry = MemberRegistry.from_rows(
-        [*existing, *(row.as_registry_row() for row in new_rows)]
+        [*existing, *(row.as_registry_row() for row in new_rows)],
+        service=service,
     )
 
     stubs = fetch_unresolved_stubs(settings)
