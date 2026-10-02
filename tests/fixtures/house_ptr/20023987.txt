@@ -1,0 +1,123 @@
+Periodic Transaction Report
+Clerk of the House of Representatives • Legislative Resource Center • 135 Cannon Building • Washington, DC 20515
+Filer Information
+Name:
+Hon. Doris O. Matsui
+Status:
+Member
+State/District: CA07
+Transactions
+ID
+Owner Asset
+Transaction
+Type
+Date
+Notification
+Date
+Amount
+Cap.
+Gains >
+$200?
+SP
+U.S. Treasury Note due 02/28/2027
+[GS]
+P
+11/06/2023
+11/07/2023
+Spouse/DC Over
+$1,000,000
+Filing Status: New
+SP
+U.S. Treasury Note due 02/29/2028
+[GS]
+P
+11/06/2023
+11/07/2023
+Spouse/DC Over
+$1,000,000
+Filing Status: New
+SP
+U.S. Treasury Note due 03/31/2024
+[GS]
+S (partial)
+11/06/2023
+11/07/2023
+Spouse/DC Over
+$1,000,000
+Filing Status: New
+SP
+U.S. Treasury Note due 05/31/2027
+[GS]
+P
+11/06/2023
+11/07/2023
+Spouse/DC Over
+$1,000,000
+Filing Status: New
+SP
+U.S. Treasury Note due 05/31/2028
+[GS]
+P
+11/06/2023
+11/07/2023
+Spouse/DC Over
+$1,000,000
+Filing Status: New
+SP
+U.S. Treasury Note due 08/31/2027
+[GS]
+P
+11/06/2023
+11/07/2023
+Spouse/DC Over
+$1,000,000
+Filing Status: New
+SP
+U.S. Treasury Note due 08/31/2028
+[GS]
+P
+11/06/2023
+11/07/2023
+Spouse/DC Over
+$1,000,000
+Filing Status: New
+SP
+U.S. Treasury Note due 11/30/2027
+P
+11/06/2023
+11/07/2023
+Spouse/DC Over
+Filing ID #20023987
+
+
+ID
+Owner Asset
+Transaction
+Type
+Date
+Notification
+Date
+Amount
+Cap.
+Gains >
+$200?
+[GS]
+$1,000,000
+Filing Status: New
+SP
+U.S. Treasury Note due 11/30/2028
+[GS]
+P
+11/06/2023
+11/07/2023
+Spouse/DC Over
+$1,000,000
+Filing Status: New
+* For the complete list of asset type abbreviations, please visit https://fd.house.gov/reference/asset-type-codes.aspx.
+Initial Public Offerings
+ Yes 
+ No
+Certification and Signature
+ I CERTIFY that the statements I have made on the attached Periodic Transaction Report are true, complete, and correct to the best of
+my knowledge and belief. Further, I CERTIFY that I have disclosed all transactions as required by the STOCK Act.
+Digitally Signed: Hon. Doris O. Matsui , 11/20/2023

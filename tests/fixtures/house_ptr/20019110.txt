@@ -1,0 +1,189 @@
+PerIODIC TrANSACTION rePOrT
+Clerk of the House of Representatives • Legislative Resource Center • 135 Cannon Building • Washington, DC 20515
+fIler INfOrmATION
+Name:
+Hon. Donald Sternoff Honorable Beyer Jr
+Status:
+Member
+State/District: VA08
+TrANSACTIONS
+ID
+Owner Asset
+Transaction
+Type
+Date
+Notification
+Date
+Amount
+Cap.
+Gains >
+$200?
+JT
+BLF FedFund TDDXX [CS]
+S
+07/07/2021 07/18/2021
+$1,001 - $15,000
+g
+f
+e
+d
+c
+FILING STATUS: New
+SUBHOLDING OF: Stocks, Bonds, & Mutual Funds
+DESCRIPTION: sweep sale of Blackrock Lig FDS Fed
+JT
+BLF FedFund TDDXX [CS]
+S
+07/02/2021 07/18/2021
+$1,001 - $15,000
+g
+f
+e
+d
+c
+FILING STATUS: New
+SUBHOLDING OF: Stocks, Bonds, & Mutual Funds
+DESCRIPTION: sweep sale of Blackrock Lig FDS Fed
+JT
+BLF FedFund TDDXX [CS]
+S
+07/15/2021 07/18/2021
+$1,001 - $15,000
+g
+f
+e
+d
+c
+FILING STATUS: New
+SUBHOLDING OF: Stocks, Bonds, & Mutual Funds
+DESCRIPTION: sweep sale of Blackrock Lig FDS Fed
+JT
+BLF FedFund TDDXX [CS]
+S
+07/21/2021 07/25/2021
+$1,001 - $15,000
+g
+f
+e
+d
+c
+FILING STATUS: New
+SUBHOLDING OF: Stocks, Bonds, & Mutual Funds
+DESCRIPTION: Sweep sale Blackrock Liq FDS Fed
+JT
+Intellia Therapeutics, Inc. (NTLA)
+[ST]
+S
+07/21/2021 07/25/2021
+$1,001 - $15,000
+g
+f
+e
+d
+c
+b
+FILING STATUS: New
+SUBHOLDING OF: Stocks, Bonds, & Mutual Funds
+DESCRIPTION: sale 65 units Intellia Therapeutics
+JT
+NextEra Energy, Inc. (NEE) [ST]
+S
+07/21/2021 07/25/2021
+$15,001 -
+g
+f
+e
+d
+c
+b
+Filing ID #20019110
+
+
+$50,000
+g
+f
+e
+d
+c
+FILING STATUS: New
+SUBHOLDING OF: Stocks, Bonds, & Mutual Funds
+DESCRIPTION: sale of 300 units NextEra Energy Inc
+JT
+Regeneron Pharmaceuticals, Inc.
+(REGN) [ST]
+P
+07/21/2021 07/25/2021
+$1,001 - $15,000
+g
+f
+e
+d
+c
+FILING STATUS: New
+SUBHOLDING OF: Stocks, Bonds, & Mutual Funds
+DESCRIPTION: 4 units Regeneron Pharmaceuticals
+JT
+Roanoke Cnty VA Economic 3.25%
+10/15/31 [GS]
+P
+07/21/2021 07/25/2021
+$15,001 -
+$50,000
+g
+f
+e
+d
+c
+FILING STATUS: New
+SUBHOLDING OF: Stocks, Bonds, & Mutual Funds
+DESCRIPTION: 40,000 units Roanoke County VA Economic 3.25% 10/15/31
+JT
+VGP N.V. NPV common [PS]
+P
+07/15/2021 07/18/2021
+$1,001 - $15,000
+g
+f
+e
+d
+c
+FILING STATUS: New
+SUBHOLDING OF: Stocks, Bonds, & Mutual Funds
+LOCATION: BE
+DESCRIPTION: 15 units VGP N.V. NPV common
+* For the complete list of asset type abbreviations, please visit https://fd.house.gov/reference/asset-type-codes.aspx.
+ASSeT ClASS DeTAIlS
+Stocks, Bonds, & Mutual Funds (Owner: JT)
+LOCATION: VA, US
+COmmeNTS
+INITIAl PublIC OfferINGS
+n
+m
+l
+k
+j Yes n
+m
+l
+k
+j
+i No
+CerTIfICATION AND SIGNATure
+g
+f
+e
+d
+c
+b I CERTIFY that the statements I have made on the attached Periodic Transaction Report are true, complete, and correct to the
+best of my knowledge and belief. Further, I CERTIFY that I have disclosed all transactions as required by the STOCK Act.
+Digitally Signed: Hon. Donald Sternoff Honorable Beyer Jr, 08/07/2021
+ID
+Owner Asset
+Transaction
+Type
+Date
+Notification
+Date
+Amount
+Cap.
+Gains >
+$200?

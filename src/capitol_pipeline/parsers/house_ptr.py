@@ -35,7 +35,10 @@ logger = logging.getLogger(__name__)
 #: v2 (2026-10-02) reads the row codes in any case -- the small-capital fonts
 #: print Sale as "s" and tickers as "(AAPl)" -- and starts a row at its owner
 #: code line. Rows written by v1 keep their label.
-REGEX_PARSER_VERSION = "regex-v2"
+#: v3 (2026-10-02) keeps identical printed rows (two lines, two transactions),
+#: rejoins amount bands the text layer split ("$15,001 -" ... "$50,000") and
+#: reads "Spouse/DC Over $1,000,000", which v2 stored as $0.
+REGEX_PARSER_VERSION = "regex-v3"
 
 #: Rows published from a stub's stored transcription in a later run, where the
 #: original parse predates :func:`mark_house_stub_processed` recording which
@@ -89,7 +92,89 @@ AMOUNT_RANGES: list[tuple[re.Pattern[str], int, int]] = [
     (_range_pattern("5,000,001", "25,000,000"), 5000001, 25000000),
     (_range_pattern("25,000,001", "50,000,000"), 25000001, 50000000),
     (re.compile(r"(?:over|>)\s*\$\s*50,?000,?000", re.I), 50000001, 100000000),
+    # "Spouse/DC Over $1,000,000": the form's option for a spouse's or
+    # dependent child's asset worth more than $1,000,000, which need not be
+    # banded further. Open-ended, so it is stored the way the open top band
+    # "Over $50,000,000" is: one dollar over the threshold up to twice it.
+    # The row's comment says what was printed (OVER_ONE_MILLION_NOTE).
+    (re.compile(r"(?:over|>)\s*\$\s*1,?000,?000(?![\d,])", re.I), 1000001, 2000000),
 ]
+
+#: Appended to the comment of a row whose amount is the open-ended "Spouse/DC
+#: Over $1,000,000", so a reader can tell the stored ceiling is a convention.
+OVER_ONE_MILLION_NOTE = "Amount: Spouse/DC Over $1,000,000"
+
+#: Floor -> ceiling of every closed band the form prints as "$floor - $ceiling".
+_CLOSED_BANDS: dict[int, int] = {
+    1001: 15000,
+    1000: 15000,
+    15001: 50000,
+    50001: 100000,
+    100001: 250000,
+    250001: 500000,
+    500001: 1000000,
+    1000001: 5000000,
+    5000001: 25000000,
+    25000001: 50000000,
+}
+
+#: A band whose two halves the text layer pulled apart: "$15,001 -", then the
+#: Cap. Gains checkbox glyphs ("g", "f", ...) and/or the wrapped end of the
+#: asset name ("Common Stock (VZ) [ST]"), then "$50,000" on a line of its own.
+#: The amount column wraps after the dash and pymupdf emits the cells in
+#: between first. The row core only saw "$15,001" and stored it as an exact
+#: figure, losing the band's upper bound (102 rows on 2026-10-02).
+_SPLIT_AMOUNT_PATTERN = re.compile(
+    r"(?P<low>\$[ \t]*[\d,]+)[ \t]*[-–—][ \t]*\n"
+    r"(?P<between>(?:[^\n$]*\n){0,14}?)"
+    r"[ \t]*(?P<high>\$[ \t]*[\d,]+)[ \t]*(?=\n|\Z)"
+)
+#: The same for an open-ended amount: "Spouse/DC Over" ends the line after the
+#: notification date and "$1,000,000" comes after whatever pymupdf put between
+#: them (on 20023987 a page break and the row's "[GS]"), so no core matched and
+#: the row was lost.
+_SPLIT_OVER_PATTERN = re.compile(
+    r"(?P<date>\d{1,2}/\d{1,2}/\d{4})[ \t]*\n[ \t]*(?P<low>(?:Spouse/DC[ \t]+)?(?i:over))[ \t]*\n"
+    r"(?P<between>(?:[^\n$]*\n){1,14}?)"
+    r"[ \t]*(?P<high>\$[ \t]*[\d,]+)[ \t]*(?=\n|\Z)"
+)
+_OPEN_THRESHOLDS: frozenset[int] = frozenset({1000000, 50000000})
+#: A type code and two dates: the start of another row's core.
+_CORE_START_PATTERN = re.compile(
+    r"(?<![A-Za-z0-9])[PSEpse](?:\s*\((?i:partial)\))?\s+\d{1,2}/\d{1,2}/\d{4}\s+\d{1,2}/\d{1,2}/\d{4}"
+)
+
+
+def _dollars(raw: str) -> int | None:
+    digits = re.sub(r"[^\d]", "", raw)
+    return int(digits) if digits else None
+
+
+def join_split_amounts(prepared: str) -> str:
+    """Put the two halves of a split amount band back together.
+
+    ``$15,001 -`` / glyphs and asset tail / ``$50,000`` becomes
+    ``$15,001 - $50,000`` followed by the lines that sat between, so the row
+    core reads the whole band and the asset tail is left where
+    :func:`_take_asset_tail` finds it; likewise ``Spouse/DC Over`` / ... /
+    ``$1,000,000``. Only a pair that is one of the form's bands is joined,
+    and never across another row's type code and dates.
+    """
+
+    def join(match: re.Match[str]) -> str:
+        low, high = _dollars(match.group("low")), _dollars(match.group("high"))
+        between = match.group("between")
+        if low is None or _CLOSED_BANDS.get(low) != high or _CORE_START_PATTERN.search(between):
+            return match.group(0)
+        return f"{match.group('low')} - {match.group('high')}\n{between}"
+
+    def join_over(match: re.Match[str]) -> str:
+        between = match.group("between")
+        if _dollars(match.group("high")) not in _OPEN_THRESHOLDS or _CORE_START_PATTERN.search(between):
+            return match.group(0)
+        return f"{match.group('date')}\n{match.group('low')} {match.group('high')}\n{between}"
+
+    return _SPLIT_OVER_PATTERN.sub(join_over, _SPLIT_AMOUNT_PATTERN.sub(join, prepared))
 
 #: The machine-readable tail of a House PTR row: optional ``(TICKER)``,
 #: optional ``[ST]`` asset-type code, the P/S/E transaction code, the
@@ -189,6 +274,10 @@ _ASSET_TAIL_PATTERN = re.compile(
 #: Clerk's transaction id ("JT", "2000090459 SP", and "sP" in the small-capital
 #: fonts). It opens a row: it is the first thing printed for it.
 _OWNER_LINE_PATTERN = re.compile(r"^(?:\d{6,}\s+)?(?:Spouse/DC|SP|JT|DC)$", re.I)
+#: One Cap. Gains checkbox as the text layer spells it: a lone glyph letter.
+_CHECKBOX_GLYPH_PATTERN = re.compile(r"^[a-g]$")
+#: A line holding nothing but an asset-type code ("[ST]").
+_BARE_TYPE_CODE_PATTERN = re.compile(r"^\[\s*([A-Za-z]{2,4})\s*\]$")
 _SENTENCE_END_PATTERN = re.compile(r"[.!?]['\")]?$")
 _NAME_ABBREVIATIONS: frozenset[str] = frozenset(
     {
@@ -653,13 +742,34 @@ def _take_asset_tail(lines: list[str]) -> tuple[list[str], str, str | None, str 
     name is empty and both codes None when there is no tail.
     """
 
+    # The Cap. Gains checkboxes come out as single glyph letters ("g", "f",
+    # "e", ...). When a split amount band put the asset tail after them they
+    # sit in front of it; they stay in the comment where they always were.
+    glyphs = 0
+    while glyphs < len(lines) and _CHECKBOX_GLYPH_PATTERN.match(lines[glyphs]):
+        glyphs += 1
+    leading, lines = lines[:glyphs], lines[glyphs:]
     if not lines or _is_annotation_line(lines[0], None):
-        return lines, "", None, None
-    match = _ASSET_TAIL_PATTERN.match(lines[0])
-    if not match or not (match.group("ticker") or match.group("asset_type")):
-        return lines, "", None, None
-    ticker = match.group("ticker")
-    return lines[1:], match.group("name").strip(), ticker.upper() if ticker else None, match.group("asset_type")
+        return leading + lines, "", None, None
+    # A wrapped tail can take more than one line ("units representing
+    # limited" / "Partner Interests (EPD) [ST]"): up to three plain lines
+    # whose last one ends in the ticker and/or type code.
+    for end in range(min(3, len(lines))):
+        if end and _is_annotation_line(lines[end], lines[end - 1]):
+            break
+        match = _ASSET_TAIL_PATTERN.match(lines[end])
+        if match and (match.group("ticker") or match.group("asset_type")):
+            name = " ".join([*lines[:end], match.group("name").strip()]).strip()
+            ticker = match.group("ticker")
+            code = match.group("asset_type")
+            rest = lines[end + 1:]
+            # "... Interests (NGL)" / "[ST]": the type code on the next line.
+            if not code and rest:
+                bare_code = _BARE_TYPE_CODE_PATTERN.match(rest[0])
+                if bare_code:
+                    code, rest = bare_code.group(1), rest[1:]
+            return leading + rest, name, ticker.upper() if ticker else None, code
+    return leading + lines, "", None, None
 
 
 def _expand_legacy_markers(line: str) -> str:
@@ -730,9 +840,10 @@ def parse_transactions(text: str) -> list[HousePtrTransaction]:
     Pass the text with its line breaks intact.
     """
 
-    prepared = strip_page_furniture(normalize_text(text, keep_newlines=True))
+    prepared = join_split_amounts(strip_page_furniture(normalize_text(text, keep_newlines=True)))
     cores = list(ROW_CORE_PATTERN.finditer(prepared))
     transactions: list[HousePtrTransaction] = []
+    over_one_million: set[int] = set()
     previous_end = 0
     for index, match in enumerate(cores, start=1):
         annotation_lines, asset_lines = split_row_segment(prepared[previous_end:match.start()])
@@ -745,6 +856,10 @@ def parse_transactions(text: str) -> list[HousePtrTransaction]:
         # parse_owner, which only honours a code at the very start.
         filing_id, asset_prefix = split_filing_id(" ".join(asset_lines))
         amount_min, amount_max = parse_amount_range(match.group("amount"))
+        if (amount_min, amount_max) == (1000001, 2000000) and re.match(
+            r"(?i)\s*(?:over|>)", match.group("amount")
+        ):
+            over_one_million.add(index)
         transactions.append(
             HousePtrTransaction(
                 line_number=index,
@@ -767,6 +882,10 @@ def parse_transactions(text: str) -> list[HousePtrTransaction]:
         # gone) is the last row's annotation block.
         trailing = [squeeze_spaces(line) for line in prepared[previous_end:].split("\n")]
         transactions[-1] = _finish_row(transactions[-1], [line for line in trailing if line])
+    for index in over_one_million:
+        row = transactions[index - 1]
+        comment = " | ".join(part for part in (row.comment, OVER_ONE_MILLION_NOTE) if part)
+        transactions[index - 1] = row.model_copy(update={"comment": comment})
     return transactions
 
 
@@ -858,7 +977,15 @@ def parse_house_ptr_text(
 ) -> tuple[HousePtrParseResult, list[NormalizedTradeRow]]:
     normalized = squeeze_spaces(normalize_text(text))
     # The segmenter needs the original line breaks; hand it the raw text.
-    transactions = dedupe_transactions(stub, parse_transactions(text))
+    # No dedupe here: every row is anchored on its own core in the text
+    # layer, so two identical rows are two printed lines, and on a PTR two
+    # printed lines are two transactions (separate lots, fills or accounts:
+    # three NVDA purchases of 07/17/2025 at $100,001 - $250,000 on one page
+    # of 20030803). Checked against the PDFs on 2026-10-02: the 578 lines the
+    # old filter dropped each sit on their own line of the page, and no date
+    # in those 258 filings is overprinted. ``dedupe_transactions`` stays for
+    # the vision path, where a model can report one row twice.
+    transactions = parse_transactions(text)
     valid_transactions = [
         transaction
         for transaction in transactions

@@ -112,13 +112,14 @@ def test_parse_house_ptr_crypto_row() -> None:
     assert trades[0].asset_type == "Cryptocurrency"
 
 
-def test_parse_house_ptr_dedupes_duplicate_rows_and_filters_invalid_dates() -> None:
+def test_parse_house_ptr_keeps_identical_printed_rows_and_filters_invalid_dates() -> None:
+    """Two identical printed rows are two transactions (separate lots or
+    fills); only the row dated after the filing is dropped."""
+
     parsed, trades = parse_house_ptr_text(
         DUPLICATE_AND_INVALID_PREVIEW,
         build_stub("20038888", "Example Member", "TX", filing_date="2026-02-10"),
     )
-    assert len(parsed.transactions) == 1
-    assert parsed.transactions[0].ticker == "ACME"
-    assert parsed.transactions[0].line_number == 1
-    assert len(trades) == 1
-    assert trades[0].source_id == "20038888:1"
+    assert [t.ticker for t in parsed.transactions] == ["ACME", "ACME"]
+    assert [t.line_number for t in parsed.transactions] == [1, 2]
+    assert [trade.source_id for trade in trades] == ["20038888:1", "20038888:2"]

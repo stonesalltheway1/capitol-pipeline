@@ -125,7 +125,7 @@ def test_pelosi_20015042_carries_both_amazon_sales() -> None:
     ]
     assert "$1,700" in (sales[0].comment or "") and "$1,600" in (sales[1].comment or "")
     assert len(trades) == 5
-    assert trades[1].parser_version == REGEX_PARSER_VERSION == "regex-v2"
+    assert trades[1].parser_version == REGEX_PARSER_VERSION == "regex-v3"
 
 
 def test_a_row_with_a_sub_dollar_amount_is_kept() -> None:

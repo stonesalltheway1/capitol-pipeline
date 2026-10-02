@@ -10,9 +10,11 @@ import pytest
 from capitol_pipeline.models.congress import FilingStub, MemberMatch
 from capitol_pipeline.parsers.house_ptr import (
     AMOUNT_RANGES,
+    OVER_ONE_MILLION_NOTE,
     ROW_CORE_PATTERN,
     TRANSACTION_PATTERN,
     format_annotation,
+    join_split_amounts,
     parse_amount_range,
     parse_house_ptr_text,
     parse_owner,
@@ -224,10 +226,13 @@ def test_torres_long_comments_never_leak_into_asset_names(torres) -> None:
     parsed, trades = torres
     assert parsed.member_name == "Ritchie John Torres"
     assert parsed.state == "NY"
-    # 156 rows on the form; one is an exact duplicate (ASML purchase) that dedupe drops.
+    # 156 rows on the form. Two are identical ASML purchases of 09/26/2024,
+    # printed as two rows on page 4: two transactions, both kept.
     assert len(parse_transactions(load_fixture("20030930.txt"))) == 156
-    assert len(parsed.transactions) == 155
-    assert len(trades) == 155
+    assert len(parsed.transactions) == 156
+    assert len(trades) == 156
+    asml = [t for t in parsed.transactions if t.ticker == "ASML" and t.transaction_date == "2024-09-26"]
+    assert len(asml) == 2
     leaked = [t.asset_description for t in parsed.transactions if LEAKED_TEXT.search(t.asset_description)]
     assert leaked == []
     assert all(t.amount_min == 1001 and t.amount_max == 15000 for t in parsed.transactions)
@@ -256,7 +261,7 @@ def test_torres_first_rows_and_comment(torres) -> None:
     assert first.comment.endswith("without my input or direction.")
     assert trades[0].comment is not None
     assert trades[0].comment.startswith(first.comment)
-    assert trades[0].comment.endswith("[regex-v2]")
+    assert trades[0].comment.endswith("[regex-v3]")
 
 
 def test_torres_row_across_page_break(torres) -> None:
@@ -317,7 +322,7 @@ def test_morrison_descriptions_go_to_comment_not_asset() -> None:
     assert page_break.comment.endswith("Description: Energy infrastructure in space, Jacksonville, FL")
     assert trades[1].comment == (
         "Filing Status: New | Subholding Of: Investment Fund 1 | Description: Sports Software, London, UK"
-        " | Parsed from House PTR 20034300 at 95% confidence [regex-v2]"
+        " | Parsed from House PTR 20034300 at 95% confidence [regex-v3]"
     )
 
 
@@ -369,3 +374,93 @@ def test_miller_exact_amount_and_multiline_asset_name() -> None:
     assert (second.amount_min, second.amount_max) == (15001, 50000)
     assert second.comment is not None
     assert second.comment.endswith("to fund capital calls for future investments.")
+
+
+def test_identical_printed_rows_are_two_transactions() -> None:
+    """Doc 20000037 (Hinojosa): two Green Mountain Coffee rows, two Roadrunner
+    rows and two of three Susser rows are identical in every printed field.
+    Each is its own row of the table; the old duplicate filter kept one."""
+
+    parsed, trades = parse_house_ptr_text(
+        load_fixture("20000037.txt"),
+        build_stub("20000037", "Ruben Hinojosa", "TX", "2014-01-08"),
+    )
+    assert len(parsed.transactions) == 14
+    gmcr = [t for t in parsed.transactions if t.ticker == "GMCR"]
+    assert [t.line_number for t in gmcr] == [8, 9]
+    assert {(t.transaction_type, t.transaction_date, t.amount_min, t.amount_max, t.owner) for t in gmcr} == {
+        ("sale", "2013-12-20", 1001, 15000, "spouse")
+    }
+    assert len({trade.source_id for trade in trades}) == 14
+
+
+def test_split_amount_band_with_asset_tail() -> None:
+    """Doc 20034034: the Verizon row's amount wraps after "$15,001 -" and the
+    text layer puts the end of the asset name ("Common Stock (VZ) [ST]")
+    before "$50,000". The band, ticker and type code all belong to the row."""
+
+    parsed, _ = parse_house_ptr_text(
+        load_fixture("20034034.txt"),
+        build_stub("20034034", "Example Member", "TX", "2026-02-11"),
+    )
+    verizon = [t for t in parsed.transactions if t.ticker == "VZ"]
+    assert len(verizon) == 1
+    row = verizon[0]
+    assert (row.amount_min, row.amount_max) == (15001, 50000)
+    assert row.asset_description == "Verizon Communications Inc. Common Stock"
+    assert row.asset_type == "Stock"
+    assert row.comment == "Filing Status: New"
+    assert all(t.amount_max > t.amount_min for t in parsed.transactions)
+
+
+def test_split_amount_band_between_checkbox_glyphs() -> None:
+    """Doc 20019110: "$15,001 -", the Cap. Gains checkbox glyphs, "$50,000".
+    Also four identical BLF FedFund rows, each printed on its own line."""
+
+    parsed, _ = parse_house_ptr_text(
+        load_fixture("20019110.txt"),
+        build_stub("20019110", "Example Member", "IL", "2021-07-26"),
+    )
+    nextera = [t for t in parsed.transactions if t.ticker == "NEE"]
+    assert len(nextera) == 1
+    assert (nextera[0].amount_min, nextera[0].amount_max) == (15001, 50000)
+    assert "$50,000" not in (nextera[0].comment or "")
+    assert len([t for t in parsed.transactions if t.asset_description.startswith("BLF FedFund")]) == 4
+
+
+def test_spouse_dc_over_one_million() -> None:
+    """Doc 20023987: every row is "Spouse/DC Over $1,000,000", which used to
+    parse as $0. Row 8 straddles a page break with its "[GS]" between "Over"
+    and "$1,000,000", and was not found at all."""
+
+    parsed, _ = parse_house_ptr_text(
+        load_fixture("20023987.txt"),
+        build_stub("20023987", "Example Member", "TX", "2023-11-08"),
+    )
+    assert len(parsed.transactions) == 9
+    for row in parsed.transactions:
+        assert (row.amount_min, row.amount_max) == (1000001, 2000000)
+        assert row.owner == "spouse"
+        assert row.comment == f"Filing Status: New | {OVER_ONE_MILLION_NOTE}"
+    straddling = parsed.transactions[7]
+    assert straddling.asset_description == "U.S. Treasury Note due 11/30/2027"
+    assert straddling.asset_type == "Government Security"
+    assert straddling.transaction_date == "2023-11-06"
+
+
+def test_parse_amount_range_over_one_million() -> None:
+    assert parse_amount_range("Over\n$1,000,000") == (1000001, 2000000)
+    assert parse_amount_range("Spouse/DC Over $1,000,000") == (1000001, 2000000)
+    assert parse_amount_range("Over $50,000,000") == (50000001, 100000000)
+    assert parse_amount_range("$500,001 - $1,000,000") == (500001, 1000000)
+
+
+def test_join_split_amounts_only_joins_a_real_band() -> None:
+    split = "$100,001 -\ng\nf\ne\n\n\nCommon Stock (UNH) [ST]\n$250,000\nFiling Status: New"
+    assert join_split_amounts(split).startswith("$100,001 - $250,000\ng\nf\ne\n")
+    # Not a band: a bare figure followed later by an unrelated exact amount.
+    not_a_band = "$15,001 -\nsomething\n$75,000\n"
+    assert join_split_amounts(not_a_band) == not_a_band
+    # Never across another row's type code and dates.
+    across = "$15,001 -\nAcme (ACME) [ST]\nP\n01/02/2026 01/05/2026\n$50,000\n"
+    assert join_split_amounts(across) == across
