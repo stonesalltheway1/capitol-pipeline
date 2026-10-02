@@ -270,14 +270,51 @@ def infer_asset_type(raw: str | None) -> str:
 #: routinely swept into it by the text layer. The leading "F" is optional
 #: because some subset fonts drop it.
 FORM_ANNOTATION_PREFIX = re.compile(
-    r"^\s*F?iling Status:\s*(?:New|Amended)\b\s*", re.IGNORECASE
+    r"^\s*F?iling Status:\s*(?:New|Amended|Deleted)\b\s*", re.IGNORECASE
 )
+
+#: "Filing Status: New | Amended | Deleted" anywhere in a row's annotation.
+#: Subset fonts print it in mixed case ("FIlINg STATuS: amended"), so the
+#: match ignores case and the parser rewrites it in one spelling.
+FILING_STATUS_PATTERN = re.compile(r"F?iling\s+Status\s*:\s*(New|Amended|Deleted)\b", re.IGNORECASE)
+
+#: The Clerk's transaction id that amended and deleted rows print in front of
+#: the owner code ("2000060675 SP Amazon.com, Inc."). Ten digits in practice.
+_FILING_ID_PREFIX = re.compile(r"^\s*(\d{6,})(?=\s|$)")
 
 
 def strip_form_annotation(description: str) -> str:
     """Remove a leading "Filing Status: New" annotation from an asset name."""
 
     return FORM_ANNOTATION_PREFIX.sub("", description or "").strip()
+
+
+def parse_filing_status(annotation: str | None) -> str | None:
+    """The row's own filing status, lower-cased, from its annotation.
+
+    The first status wins: a row's annotation begins with its own status, and
+    a second one can only be a neighbour's swept in by the segmenter.
+    """
+
+    match = FILING_STATUS_PATTERN.search(annotation or "")
+    return match.group(1).lower() if match else None
+
+
+def canonical_filing_status(annotation: str | None) -> str | None:
+    """Rewrite every filing-status chunk as "Filing Status: New|Amended|Deleted"."""
+
+    if not annotation:
+        return annotation
+    return FILING_STATUS_PATTERN.sub(lambda m: f"Filing Status: {m.group(1).capitalize()}", annotation)
+
+
+def split_filing_id(asset_prefix: str) -> tuple[str | None, str]:
+    """Split the Clerk's transaction id off the front of a row's asset text."""
+
+    match = _FILING_ID_PREFIX.match(asset_prefix or "")
+    if not match:
+        return None, asset_prefix
+    return match.group(1), asset_prefix[match.end():].lstrip()
 
 
 def cleaning_gutted_description(cleaned: str, raw: str) -> bool:
@@ -326,7 +363,9 @@ def clean_asset_description(raw: str, ticker: str | None) -> str:
     # Status"); a bare capital followed by a real word ("T MOBILE USA") is not that.
     cleaned = re.sub(r"^\s*F\s+(?=S:)", "", cleaned)
 
-    structured_descriptor = re.match(r"^(?:[A-Z]\s+)?S:\s+New\s+S\s+O:\s+.+?\bD:\s+(.+)$", cleaned, flags=re.I)
+    structured_descriptor = re.match(
+        r"^(?:[A-Z]\s+)?S:\s+(?:New|Amended|Deleted)\s+S\s+O:\s+.+?\bD:\s+(.+)$", cleaned, flags=re.I
+    )
     if structured_descriptor:
         cleaned = structured_descriptor.group(1).strip()
     else:
@@ -343,8 +382,8 @@ def clean_asset_description(raw: str, ticker: str | None) -> str:
             rest = subholding.group(1).strip()
             after_account = re.search(r"\(\d+\)\s*(\S.*)$", rest)
             cleaned = (after_account.group(1) if after_account else rest).strip()
-    cleaned = re.sub(r"^\s*F?iling Status:\s*New\s*", "", cleaned, flags=re.I)
-    cleaned = re.sub(r"^(?:F\s+)?S:\s+New\s+", "", cleaned, flags=re.I)
+    cleaned = re.sub(r"^\s*F?iling Status:\s*(?:New|Amended|Deleted)\s*", "", cleaned, flags=re.I)
+    cleaned = re.sub(r"^(?:F\s+)?S:\s+(?:New|Amended|Deleted)\s+", "", cleaned, flags=re.I)
     cleaned = re.sub(r"^S\s+O:\s+", "", cleaned, flags=re.I)
     cleaned = re.sub(r"^Trust\s+", "", cleaned, flags=re.I)
     cleaned = re.sub(r"^Capital Call\b", "Capital call", cleaned, flags=re.I)
@@ -629,7 +668,9 @@ def _finish_row(transaction: HousePtrTransaction, lines: list[str]) -> HousePtrT
             update["asset_type"] = infer_asset_type(tail_code)
     else:
         remaining = lines
-    update["comment"] = format_annotation(remaining)
+    comment = canonical_filing_status(format_annotation(remaining))
+    update["comment"] = comment
+    update["filing_status"] = parse_filing_status(comment)
     return transaction.model_copy(update=update)
 
 
@@ -652,7 +693,10 @@ def parse_transactions(text: str) -> list[HousePtrTransaction]:
         if transactions:
             transactions[-1] = _finish_row(transactions[-1], annotation_lines)
         ticker = match.group("ticker") or None
-        asset_prefix = " ".join(asset_lines)
+        # Amended and deleted rows print the Clerk's transaction id before the
+        # owner code; it is not part of the asset and hides the owner from
+        # parse_owner, which only honours a code at the very start.
+        filing_id, asset_prefix = split_filing_id(" ".join(asset_lines))
         amount_min, amount_max = parse_amount_range(match.group("amount"))
         transactions.append(
             HousePtrTransaction(
@@ -666,6 +710,7 @@ def parse_transactions(text: str) -> list[HousePtrTransaction]:
                 amount_min=amount_min,
                 amount_max=amount_max,
                 owner=parse_owner(asset_prefix, match.group("owner") or None),  # type: ignore[arg-type]
+                filing_id=filing_id,
             )
         )
         previous_end = match.end()
@@ -752,6 +797,9 @@ def build_trade_rows_from_house_ptr(
                 parser_confidence=parsed.parser_confidence,
                 parser_version=parsed.parser_version,
                 normalized_asset=normalized_asset,
+                # Transcriptions stored before the field existed still carry
+                # the status in their comment.
+                filing_status=transaction.filing_status or parse_filing_status(transaction.comment),
             )
         )
     return rows

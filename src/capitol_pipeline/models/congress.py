@@ -91,6 +91,15 @@ class HousePtrTransaction(BaseModel):
     # where the question does not arise. It decides whether the row publishes
     # while its filing is under review -- see split_scanned_trades.
     legibility: str | None = None
+    # The form's own "Filing Status" for the row: "new" (first disclosure),
+    # "amended" (restates a transaction an earlier PTR disclosed) or
+    # "deleted" (withdraws one). None where the form prints none (paper
+    # filings, the vision path). An amended or deleted row is not a new trade:
+    # see capitol_pipeline.house_amendments.
+    filing_status: Literal["new", "amended", "deleted"] | None = None
+    # The Clerk's id for the transaction being amended or deleted, printed in
+    # front of the owner code on those rows ("2000060675 SP"). Informational.
+    filing_id: str | None = None
 
 
 class HousePtrParseResult(BaseModel):
@@ -151,3 +160,7 @@ class NormalizedTradeRow(BaseModel):
     parser_confidence: float | None = None
     parser_version: str | None = None
     normalized_asset: NormalizedAsset | None = None
+    # House PTR rows only: the row's "Filing Status" (new/amended/deleted).
+    # Not a trades column; persist_parsed_house_stub reads it to decide whether
+    # the row is a trade at all (capitol_pipeline.house_amendments).
+    filing_status: str | None = None

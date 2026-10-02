@@ -36,6 +36,7 @@ from capitol_pipeline.config import OcrBackend, Settings
 from capitol_pipeline.exporters.members_bio_schema import ensure_members_bio_schema
 from capitol_pipeline.exporters.neon import (
     DEFAULT_SENATE_DEDUPE_SOURCES,
+    apply_house_amendment_changes,
     backfill_crypto_trade_classification,
     delete_duplicate_senate_trades,
     ensure_congress_schema,
@@ -44,6 +45,7 @@ from capitol_pipeline.exporters.neon import (
     ensure_search_schema,
     ensure_usaspending_schema,
     fetch_existing_trade_ids,
+    fetch_house_amendment_priors,
     fetch_latest_trade_disclosure_date,
     fetch_existing_fara_registration_numbers,
     fetch_alerts_for_search,
@@ -86,6 +88,11 @@ from capitol_pipeline.exporters.neon import (
     upsert_search_chunks,
     upsert_search_document,
     upsert_trade_rows_to_neon,
+)
+from capitol_pipeline.house_amendments import (
+    plan_house_amendments,
+    prior_from_trade,
+    priors_from_transcription,
 )
 from capitol_pipeline.models.congress import (
     FilingStub,
@@ -553,6 +560,47 @@ def split_scanned_trades(
     return publishable, withheld
 
 
+def reconcile_house_amendments(
+    settings: Settings,
+    stub: FilingStub,
+    trades: list[NormalizedTradeRow],
+) -> tuple[list[NormalizedTradeRow], dict[str, object] | None]:
+    """Fold a filing's "Filing Status: Amended/Deleted" rows into what they restate.
+
+    Returns the rows still to upsert and a report for the stub metadata (None
+    when the filing has no amended or deleted rows). An amended row whose
+    original is in ``trades`` updates that row and is not inserted; a deleted
+    row deletes its original and is never inserted. See
+    capitol_pipeline.house_amendments for the rules and the matching.
+    """
+
+    if not stub.member.id or not any(
+        (getattr(row, "filing_status", None) or "").lower() in ("amended", "deleted") for row in trades
+    ):
+        return trades, None
+    trade_rows, stub_rows = fetch_house_amendment_priors(
+        settings, member_id=stub.member.id, doc_id=stub.doc_id, filing_date=stub.filing_date
+    )
+    transcribed = [
+        prior
+        for row in stub_rows
+        for prior in priors_from_transcription(
+            str(row.get("doc_id") or ""),
+            str(row["filing_date"]) if row.get("filing_date") else None,
+            row.get("parsed_transactions") or [],  # type: ignore[arg-type]
+        )
+    ]
+    plan = plan_house_amendments(
+        trades,
+        doc_id=stub.doc_id,
+        filing_date=stub.filing_date,
+        trade_priors=[prior_from_trade(row) for row in trade_rows],
+        transcribed_priors=transcribed,
+    )
+    applied = apply_house_amendment_changes(settings, updates=plan.updates, deletes=plan.deletes)
+    return plan.rows, {**plan.summary(), "applied": applied}
+
+
 def persist_parsed_house_stub(
     settings: Settings,
     stub: FilingStub,
@@ -571,6 +619,7 @@ def persist_parsed_house_stub(
 
     sync_house_stubs_to_neon(settings, [stub])
     status = resolve_house_stub_status(stub, parsed, trades)
+    amendment_report: dict[str, object] | None = None
     scanned_under_review = bool(trades) and is_scanned_read(parsed) and status != "parsed"
     if scanned_under_review:
         publishable, withheld = split_scanned_trades(parsed, trades)
@@ -595,8 +644,13 @@ def persist_parsed_house_stub(
             parsed.vision_report["rowsWithheldTotal"] = len(withheld) + dropped_for_type
             parsed.vision_report["withheldReasons"] = reasons
     else:
+        # An amended or deleted row is not a new trade. The stub status above
+        # was decided on every row the filing carries, as before.
+        trades, amendment_report = reconcile_house_amendments(settings, stub, trades)
         trade_summary = upsert_trade_rows_to_neon(settings, trades)
     metadata_extra = build_house_stub_metadata_extra(parsed)
+    if amendment_report:
+        metadata_extra = {**(metadata_extra or {}), "amendments": amendment_report}
     mark_house_stub_processed(
         settings,
         stub,

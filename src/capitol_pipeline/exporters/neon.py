@@ -3875,6 +3875,99 @@ def upsert_trade_rows_to_neon(
     }
 
 
+def fetch_house_amendment_priors(
+    settings: Settings,
+    *,
+    member_id: str,
+    doc_id: str,
+    filing_date: str | None,
+) -> tuple[list[dict[str, object]], list[dict[str, object]]]:
+    """What a member's earlier House filings disclosed, for amendment matching.
+
+    Returns (trade rows, stub transcriptions): the member's House rows in
+    ``trades`` from other filings disclosed on or before ``filing_date``, and
+    the stored ``parsedTransactions`` of the member's other stubs filed on or
+    before it. See capitol_pipeline.house_amendments.
+    """
+
+    with neon_connection(settings) as connection:
+        with connection.cursor() as cursor:
+            cursor.execute(
+                """
+                SELECT id, ticker, asset_description, transaction_type,
+                       transaction_date::text AS transaction_date,
+                       disclosure_date::text AS disclosure_date,
+                       amount_min, amount_max, owner, comment, source_url
+                FROM trades
+                WHERE member_id = %s
+                  AND source IN ('house_clerk', 'house_ptr')
+                  AND id NOT LIKE %s AND id <> %s
+                  AND (%s::date IS NULL OR disclosure_date IS NULL OR disclosure_date <= %s::date)
+                """,
+                (member_id, f"tr-house-{doc_id}-%", f"tr-house-{doc_id}", filing_date, filing_date),
+            )
+            trades = list(cursor.fetchall())
+            cursor.execute(
+                """
+                SELECT doc_id, metadata->>'filingDate' AS filing_date,
+                       metadata->'parsedTransactions' AS parsed_transactions
+                FROM house_filing_stubs
+                WHERE metadata->>'memberId' = %s
+                  AND doc_id <> %s
+                  AND jsonb_typeof(metadata->'parsedTransactions') = 'array'
+                  AND (%s::text IS NULL OR metadata->>'filingDate' <= %s::text)
+                """,
+                (member_id, doc_id, filing_date, filing_date),
+            )
+            stubs = list(cursor.fetchall())
+    return trades, stubs
+
+
+def apply_house_amendment_changes(
+    settings: Settings,
+    *,
+    updates: dict[str, dict[str, object]],
+    deletes: list[str],
+) -> dict[str, int]:
+    """Fold amended values into original rows and delete withdrawn ones, atomically.
+
+    ``updates`` maps a trade id to the fields to set; the special key
+    ``comment_note`` is appended to the row's comment once. Rows changed or
+    deleted here are logged by the trades trigger (trade_changes), which is
+    how API subscribers hear about trade.corrected / trade.withdrawn.
+    """
+
+    allowed = ("amount_min", "amount_max", "transaction_type", "owner", "transaction_date", "disclosure_date")
+    updated = deleted = 0
+    if not updates and not deletes:
+        return {"updated": 0, "deleted": 0}
+    with neon_connection(settings) as connection:
+        with connection.cursor() as cursor:
+            for trade_id, changes in updates.items():
+                fields = [name for name in allowed if name in changes]
+                note = changes.get("comment_note")
+                assignments = [f"{name} = %s" for name in fields]
+                params: list[object] = [changes[name] for name in fields]
+                if note:
+                    assignments.append(
+                        "comment = CASE WHEN COALESCE(comment, '') = '' THEN %s "
+                        "WHEN position(%s IN comment) > 0 THEN comment ELSE comment || ' | ' || %s END"
+                    )
+                    params.extend([note, note, note])
+                if not assignments:
+                    continue
+                cursor.execute(
+                    f"UPDATE trades SET {', '.join(assignments)} WHERE id = %s",
+                    (*params, trade_id),
+                )
+                updated += cursor.rowcount or 0
+            if deletes:
+                cursor.execute("DELETE FROM trades WHERE id = ANY(%s)", (list(deletes),))
+                deleted = cursor.rowcount or 0
+        connection.commit()
+    return {"updated": updated, "deleted": deleted}
+
+
 def update_house_stub_state(
     settings: Settings,
     *,
