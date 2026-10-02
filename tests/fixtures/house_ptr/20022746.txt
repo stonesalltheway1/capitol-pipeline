@@ -1,0 +1,43 @@
+Periodic Transaction Report
+Clerk of the House of Representatives • Legislative Resource Center • 135 Cannon Building • Washington, DC 20515
+Filer Information
+Name:
+Hon. Robert J. Wittman
+Status:
+Member
+State/District: VA01
+Transactions
+ID
+Owner Asset
+Transaction
+Type
+Date
+Notification
+Date
+Amount
+Cap.
+Gains >
+$200?
+Cisco Systems, Inc. (CSCO) [ST]
+S
+04/20/2023 04/24/2023
+$1,001 - $15,000
+Filing Status: New
+Subholding Of: Morgan Stanley (JT)
+Exxon Mobil Corporation (XOM) [ST] P
+04/20/2023 04/24/2023
+$1,001 - $15,000
+Filing Status: New
+Subholding Of: Morgan Stanley (JT)
+* For the complete list of asset type abbreviations, please visit https://fd.house.gov/reference/asset-type-codes.aspx.
+Asset Class Details
+Morgan Stanley (JT)
+Location: US
+Initial Public Offerings
+ Yes 
+ No
+Certification and Signature
+ I CERTIFY that the statements I have made on the attached Periodic Transaction Report are true, complete, and correct to the best of
+my knowledge and belief. Further, I CERTIFY that I have disclosed all transactions as required by the STOCK Act.
+Digitally Signed: Hon. Robert J. Wittman , 05/07/2023
+Filing ID #20022746

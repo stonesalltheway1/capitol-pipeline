@@ -1,0 +1,198 @@
+Periodic Transaction Report
+Clerk of the House of Representatives • Legislative Resource Center • B81 Cannon Building • Washington, DC 20515
+Filer Information
+Name:
+Hon. Thomas H. Kean Jr.
+Status:
+Member
+State/District: NJ07
+Transactions
+ID
+Owner Asset
+Transaction
+Type
+Date
+Notification
+Date
+Amount
+Cap.
+Gains >
+$200?
+Amentum Holdings, Inc. Common
+Stock (AMTM) [ST]
+E
+09/30/2024 10/02/2024
+$1,001 - $15,000
+Filing Status: New
+Subholding Of: State Street Bank & Trust Co.
+Description: Holdings in J exchanged out for receipt of new holdings in J and AMTM through a corporate action.
+Amentum Holdings, Inc. Common
+Stock (AMTM) [ST]
+E
+09/30/2024 10/02/2024
+$1,001 - $15,000
+Filing Status: New
+Subholding Of: State Street Bank & Trust Co. SP
+Description: Holdings in J exchanged out for receipt of new holdings in J and AMTM through a corporate action.
+Amentum Holdings, Inc. Common
+Stock (AMTM) [ST]
+E
+09/30/2024 10/02/2024
+$1,001 - $15,000
+Filing Status: New
+Subholding Of: State Street Bank & Trust Co. DC1
+Description: Holdings in J exchanged out for receipt of new holdings in J and AMTM through a corporate action.
+Amentum Holdings, Inc. Common
+Stock (AMTM) [ST]
+E
+09/30/2024 10/02/2024
+$1,001 - $15,000
+Filing Status: New
+Subholding Of: State Street Bank & Trust Co. DC2
+Description: Holdings in J exchanged out for receipt of new holdings in J and AMTM through a corporate action.
+Jacobs Solutions Inc. Common Stock
+(J) [ST]
+E
+09/30/2024 10/02/2024
+$15,001 -
+$50,000
+Filing Status: New
+Subholding Of: State Street Bank & Trust Co. DC2
+Description: Holdings in J exchanged out for receipt of new holdings in J and AMTM through a corporate action.
+Filing ID #20026021
+
+
+ID
+Owner Asset
+Transaction
+Type
+Date
+Notification
+Date
+Amount
+Cap.
+Gains >
+$200?
+Jacobs Solutions Inc. Common Stock
+(J) [ST]
+E
+09/30/2024 10/02/2024
+$15,001 -
+$50,000
+Filing Status: New
+Subholding Of: State Street Bank & Trust Co. DC2
+Description: Holdings in J exchanged out for receipt of new holdings in J and AMTM through a corporate action.
+Jacobs Solutions Inc. Common Stock
+(J) [ST]
+E
+09/30/2024 10/02/2024
+$15,001 -
+$50,000
+Filing Status: New
+Subholding Of: State Street Bank & Trust Co. DC1
+Description: Holdings in J exchanged out for receipt of new holdings in J and AMTM through a corporate action.
+Jacobs Solutions Inc. Common Stock
+(J) [ST]
+E
+09/30/2024 10/02/2024
+$15,001 -
+$50,000
+Filing Status: New
+Subholding Of: State Street Bank & Trust Co. DC1
+Description: Holdings in J exchanged out for receipt of new holdings in J and AMTM through a corporate action.
+Jacobs Solutions Inc. Common Stock
+(J) [ST]
+E
+09/30/2024 10/02/2024
+$15,001 -
+$50,000
+Filing Status: New
+Subholding Of: State Street Bank & Trust Co. SP
+Description: Holdings in J exchanged out for receipt of new holdings in J and AMTM through a corporate action.
+Jacobs Solutions Inc. Common Stock
+(J) [ST]
+E
+09/30/2024 10/02/2024
+$15,001 -
+$50,000
+Filing Status: New
+Subholding Of: State Street Bank & Trust Co. SP
+Description: Holdings in J exchanged out for receipt of new holdings in J and AMTM through a corporate action.
+Jacobs Solutions Inc. Common Stock
+(J) [ST]
+E
+09/30/2024 10/02/2024
+$15,001 -
+$50,000
+Filing Status: New
+Subholding Of: State Street Bank & Trust Co.
+Description: Holdings in J exchanged out for receipt of new holdings in J and AMTM through a corporate action.
+Jacobs Solutions Inc. Common Stock
+(J) [ST]
+E
+09/30/2024 10/02/2024
+$1,001 - $15,000
+Filing Status: New
+Subholding Of: State Street Bank & Trust Co.
+Description: Holdings in J exchanged out for receipt of new holdings in J and AMTM through a corporate action.
+Liberty Media Corporation - Series A
+Liberty SiriusXM Common Stock
+(LSXMA) [ST]
+E
+09/10/2024 09/17/2024
+$1,001 - $15,000
+
+
+ID
+Owner Asset
+Transaction
+Type
+Date
+Notification
+Date
+Amount
+Cap.
+Gains >
+$200?
+Filing Status: New
+Subholding Of: State Street Bank & Trust Co.
+Description: Holdings in LSXMA and LSXMK exchanged out for receipt of holdings in SIRI through a corporate action.
+Liberty Media Corporation - Series C
+Liberty SiriusXM Common Stock
+(LSXMK) [ST]
+E
+09/10/2024 09/17/2024
+$1,001 - $15,000
+Filing Status: New
+Subholding Of: State Street Bank & Trust Co.
+Description: Holdings in LSXMA and LSXMK exchanged out for receipt of holdings in SIRI through a corporate action.
+Nike, Inc. Common Stock (NKE) [ST]
+S (partial)
+09/11/2024
+10/08/2024
+$1,001 - $15,000
+Filing Status: New
+Subholding Of: Kean Family Partnership
+SiriusXM Holdings Inc. - Common
+Stock (SIRI) [ST]
+E
+09/10/2024 09/17/2024
+$1,001 - $15,000
+Filing Status: New
+Subholding Of: State Street Bank & Trust Co.
+Description: Holdings in LSXMA and LSXMK exchanged out for receipt of holdings in SIRI through a corporate action.
+* For the complete list of asset type abbreviations, please visit https://fd.house.gov/reference/asset-type-codes.aspx.
+Investment Vehicle Details
+Kean Family Partnership (33% Interest)
+Location: US
+State Street Bank & Trust Co.
+State Street Bank & Trust Co. DC1
+State Street Bank & Trust Co. DC2
+State Street Bank & Trust Co. SP
+Initial Public Offerings
+ Yes 
+ No
+Certification and Signature
+ I CERTIFY that the statements I have made on the attached Periodic Transaction Report are true, complete, and correct to the best of
+my knowledge and belief. Further, I CERTIFY that I have disclosed all transactions as required by the STOCK Act.
+Digitally Signed: Hon. Thomas H. Kean Jr., 10/15/2024

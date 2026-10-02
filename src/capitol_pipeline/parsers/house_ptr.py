@@ -827,7 +827,42 @@ def _finish_row(transaction: HousePtrTransaction, lines: list[str]) -> HousePtrT
     comment = canonical_filing_status(format_annotation(remaining))
     update["comment"] = comment
     update["filing_status"] = parse_filing_status(comment)
+    if transaction.owner == "self":
+        designated = account_owner_designation(comment)
+        if designated:
+            update["owner"] = designated
     return transaction.model_copy(update=update)
+
+
+#: An owner designation at the end of a row's "Subholding Of:" account name:
+#: "State Street Bank & Trust Co. SP", "... Investment Account - DC2",
+#: "Morgan Stanley (JT)", "TD Ameritrade G JT".
+_ACCOUNT_DESIGNATION_PATTERN = re.compile(
+    r"Subholding\s+Of\s*:\s*[^|]*?(?:\s|-|\()(?P<code>SP|DC\d?|JT)\)?\s*(?:\||$)", re.I
+)
+
+
+def account_owner_designation(comment: str | None) -> str | None:
+    """The owner a row's own account name designates, when it designates one.
+
+    Applied only where the owner column is blank. Some filers leave that
+    column empty and name the owner in the account instead: Tom Kean Jr.'s
+    PTR 20026021 lists the same corporate action in "State Street Bank &
+    Trust Co.", "... SP", "... DC1" and "... DC2", and his later filings put
+    SP in the owner column for the "... SP" account. Across the 5,939 text
+    layers on file, 11 rows have such a designation with a blank owner
+    column; on the 83 rows where both are printed they always agree.
+    """
+
+    match = _ACCOUNT_DESIGNATION_PATTERN.search(comment or "")
+    if not match:
+        return None
+    code = match.group("code").upper()
+    if code == "SP":
+        return "spouse"
+    if code == "JT":
+        return "joint"
+    return "child"
 
 
 def parse_transactions(text: str) -> list[HousePtrTransaction]:

@@ -13,6 +13,7 @@ from capitol_pipeline.parsers.house_ptr import (
     OVER_ONE_MILLION_NOTE,
     ROW_CORE_PATTERN,
     TRANSACTION_PATTERN,
+    account_owner_designation,
     format_annotation,
     join_split_amounts,
     parse_amount_range,
@@ -464,3 +465,39 @@ def test_join_split_amounts_only_joins_a_real_band() -> None:
     # Never across another row's type code and dates.
     across = "$15,001 -\nAcme (ACME) [ST]\nP\n01/02/2026 01/05/2026\n$50,000\n"
     assert join_split_amounts(across) == across
+
+
+def test_account_name_designates_the_owner_when_the_column_is_blank() -> None:
+    """Doc 20026021 (Kean): the owner column is blank on every row and the
+    account names carry it ("State Street Bank & Trust Co." / "... SP" /
+    "... DC1" / "... DC2"). Doc 20022746 (Wittman): "Morgan Stanley (JT)"."""
+
+    parsed, _ = parse_house_ptr_text(
+        load_fixture("20026021.txt"),
+        build_stub("20026021", "Thomas H. Kean", "NJ", "2024-10-15"),
+    )
+    by_account: dict[str, set[str]] = {}
+    for row in parsed.transactions:
+        account = re.search(r"Subholding Of: ([^|]+)", row.comment or "").group(1).strip()
+        by_account.setdefault(account, set()).add(row.owner)
+    assert by_account["State Street Bank & Trust Co."] == {"self"}
+    assert by_account["State Street Bank & Trust Co. SP"] == {"spouse"}
+    assert by_account["State Street Bank & Trust Co. DC1"] == {"child"}
+    assert by_account["State Street Bank & Trust Co. DC2"] == {"child"}
+    assert by_account["Kean Family Partnership"] == {"self"}
+
+    parsed, _ = parse_house_ptr_text(
+        load_fixture("20022746.txt"),
+        build_stub("20022746", "Robert J. Wittman", "VA", "2023-05-10"),
+    )
+    assert [t.owner for t in parsed.transactions] == ["joint", "joint"]
+
+
+def test_a_printed_owner_code_wins_over_the_account_name() -> None:
+    assert account_owner_designation("Filing Status: New | Subholding Of: Morgan Stanley (JT)") == "joint"
+    assert account_owner_designation("Filing Status: New | Subholding Of: Charles Schwab Investment Account - DC2") == "child"
+    assert account_owner_designation("Filing Status: New | Subholding Of: TR - SP | Description: x") == "spouse"
+    assert account_owner_designation("Filing Status: New | Subholding Of: SP M40 (Merrill Lynch)") is None
+    assert account_owner_designation("Filing Status: New | Description: sold SP shares") is None
+    row = "DC\nAcme Holdings (ACME) [ST]\nP\n01/02/2026 01/05/2026\n$1,001 - $15,000\nFiling Status: New\nSubholding Of: Brokerage SP\n"
+    assert [t.owner for t in parse_transactions(row)] == ["child"]
