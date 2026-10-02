@@ -959,9 +959,23 @@ def plan_house_publication(
         # before the transcription is stored (it is what the next run matches).
         if not scanned:
             parsed, trades, line_report = stabilize_house_line_ids(settings, stub, parsed, trades)
+        gate: dict[str, object] | None = None
+        vision = parsed.vision_report if isinstance(parsed.vision_report, dict) else {}
+        if scanned and not vision.get("noTransactions"):
+            # A read that left nothing to publish -- every row dropped for a
+            # disputed type, or failed date validation -- is withheld too,
+            # and says why. "Nothing to report" is a result, not a hold.
+            gate = {
+                "decision": "withheld",
+                "reasons": scanned_filing_gate(stub, parsed, trades, [], None),
+                "override": bool(allow_partial),
+                "rows": 0,
+                "publish": 0,
+                "at": now_iso(),
+            }
         return HousePublishPlan(
             stub_status=status, parsed=parsed, trades=trades, publish=list(trades),
-            withheld=[], scanned=scanned, line_report=line_report, gate=None,
+            withheld=[], scanned=scanned, line_report=line_report, gate=gate,
         )
 
     parsed, trades, line_report = stabilize_house_line_ids(

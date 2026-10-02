@@ -1076,3 +1076,25 @@ def test_every_call_carries_exactly_one_rendered_page(monkeypatch: pytest.Monkey
         ("gemini-3.8-flash", "Page 2 of 3:"), ("gemini-3.5-flash", "Page 2 of 3:"),
         ("gemini-3.8-flash", "Page 3 of 3:"), ("gemini-3.5-flash", "Page 3 of 3:"),
     ]
+
+
+def test_a_read_that_leaves_nothing_to_publish_is_withheld_and_says_why(exporter: _Calls) -> None:
+    # 9116218 read again on 2026-10-02 by the Gemini pair: one read said
+    # purchase, the other sale, and the only row was dropped for its type.
+    stub, parsed, _trades = _scanned([], stub=_stub("9116218", filing_date="2026-07-14"),
+                                     needsReview=True, rowsDroppedForType=1,
+                                     needsReviewReasons=["reads disagree on transaction_type"])
+    summary = cli.persist_parsed_house_stub(Settings(), stub, parsed, [])
+
+    assert exporter.upserts == []
+    assert summary["stubStatus"] == "needs_review"
+    gate = summary["filingGate"]
+    assert gate["decision"] == "withheld"
+    assert "1 row(s) dropped: the reads disagreed on the transaction type" in gate["reasons"]
+
+
+def test_nothing_to_report_is_a_result_not_a_hold(exporter: _Calls) -> None:
+    stub, parsed, _trades = _scanned([], noTransactions=True)
+    summary = cli.persist_parsed_house_stub(Settings(), stub, parsed, [])
+    assert summary["filingGate"] is None
+    assert summary["stubStatus"] == "parsed"
