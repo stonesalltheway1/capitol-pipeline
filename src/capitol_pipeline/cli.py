@@ -9,7 +9,7 @@ import logging
 from pathlib import Path
 from tempfile import TemporaryDirectory
 import time
-from typing import Iterable, TypeVar
+from typing import Iterable, Mapping, TypeVar
 
 import click
 import httpx
@@ -311,6 +311,51 @@ def build_review_retry_after_iso(hours: int) -> str:
 
     delay_hours = max(1, hours)
     return (datetime.now(timezone.utc) + timedelta(hours=delay_hours)).isoformat()
+
+
+#: Longest a review-queue filing waits between attempts while every attempt
+#: comes back the same. A week still revisits it after a code change.
+REVIEW_BACKOFF_CAP_HOURS = 24 * 7
+
+
+def review_config_signature(ocr_backend: str, vision_backend: str) -> str:
+    """What a review attempt ran with; a change makes every filing eligible again."""
+
+    return f"ocr={ocr_backend};vision={vision_backend}"
+
+
+def review_outcome_signature(
+    status: str,
+    *,
+    trade_rows: int = 0,
+    withheld: int = 0,
+    parser_version: str | None = None,
+    error: str | None = None,
+) -> str:
+    """A short fingerprint of what a review attempt produced."""
+
+    if error is not None:
+        return f"failed|{error[:120]}"
+    return f"{status}|rows={trade_rows}|withheld={withheld}|parser={parser_version or '-'}"
+
+
+def next_review_backoff(
+    metadata: Mapping[str, object],
+    outcome: str,
+    base_hours: int,
+) -> tuple[int, int]:
+    """Return ``(streak, hours)`` for the next attempt at a review-queue filing.
+
+    ``streak`` counts consecutive attempts with the same outcome. The wait
+    doubles with it (12 h, 24 h, 48 h, ...) up to a week, so a filing the
+    current configuration cannot read stops taking a slot from one it has
+    never tried. A different outcome starts the count again.
+    """
+
+    previous = metadata.get("reviewLastOutcome")
+    streak = int(metadata.get("reviewOutcomeStreak") or 0) + 1 if previous == outcome else 1
+    hours = min(REVIEW_BACKOFF_CAP_HOURS, max(1, base_hours) * 2 ** min(streak - 1, 10))
+    return streak, hours
 
 
 def download_house_pdf(stub: FilingStub, settings: Settings, destination: Path) -> None:
@@ -902,8 +947,16 @@ def process_house_queue_rows(
     with_embeddings: bool = False,
     review_retry_hours: int = 12,
     vision_backend: str = "off",
+    review_mode: bool = False,
 ) -> dict[str, object]:
-    """Process a batch of queued House PTR stubs from Neon."""
+    """Process a batch of queued House PTR stubs from Neon.
+
+    ``review_mode`` is ``process-house-review``: every filing is a review
+    attempt, recorded with the configuration it ran under, and one that comes
+    back the same as last time backs off (``next_review_backoff``).
+    """
+
+    review_config = review_config_signature(ocr_backend, vision_backend)
 
     summary = {
         "queued": len(queue_rows),
@@ -934,11 +987,12 @@ def process_house_queue_rows(
             "extractionAttempts": attempts,
             "retryAfter": None,
         }
-        if current_status == "needs_review":
+        if review_mode or current_status == "needs_review":
             metadata_updates.update(
                 {
                     "reviewLastAttemptAt": now_iso(),
                     "reviewLastBackend": ocr_backend,
+                    "reviewLastConfig": review_config,
                     "reviewAttempts": int(metadata.get("reviewAttempts") or 0) + 1,
                 }
             )
@@ -978,11 +1032,22 @@ def process_house_queue_rows(
                     )
             else:
                 summary["needsReview"] += 1
-                review_updates: dict[str, object] = {
-                    "retryAfter": build_review_retry_after_iso(review_retry_hours),
-                    "needsReviewAt": now_iso(),
-                }
-                if current_status == "needs_review":
+                retry_hours = review_retry_hours
+                review_updates: dict[str, object] = {"needsReviewAt": now_iso()}
+                if review_mode:
+                    trade_counts = upsert_summary.get("trades") or {}
+                    outcome = review_outcome_signature(
+                        status,
+                        trade_rows=int(trade_counts.get("upserted", 0)),  # type: ignore[union-attr]
+                        withheld=int(trade_counts.get("withheld", 0)),  # type: ignore[union-attr]
+                        parser_version=parsed.parser_version,
+                    )
+                    streak, retry_hours = next_review_backoff(metadata, outcome, review_retry_hours)
+                    review_updates.update(
+                        {"reviewLastOutcome": outcome, "reviewOutcomeStreak": streak}
+                    )
+                review_updates["retryAfter"] = build_review_retry_after_iso(retry_hours)
+                if review_mode or current_status == "needs_review":
                     review_updates.update(
                         {
                             "reviewLastBackend": ocr_backend,
@@ -1041,19 +1106,31 @@ def process_house_queue_rows(
         except Exception as error:  # pragma: no cover - depends on live upstream PDFs
             retryable = is_retryable_house_error(error)
             failed_status = "pending_extraction" if retryable else "needs_review"
+            retry_hours = review_retry_hours
             failure_updates: dict[str, object] = {
                 **metadata,
                 "failedAt": now_iso(),
                 "lastError": str(error)[:500],
-                "retryAfter": (
-                    build_retry_after_iso(error, attempts)
-                    if retryable
-                    else build_review_retry_after_iso(review_retry_hours)
-                ),
             }
+            if review_mode and not retryable:
+                outcome = review_outcome_signature("failed", error=str(error))
+                streak, retry_hours = next_review_backoff(metadata, outcome, review_retry_hours)
+                failure_updates.update(
+                    {
+                        "reviewLastOutcome": outcome,
+                        "reviewOutcomeStreak": streak,
+                        "reviewLastConfig": review_config,
+                        "reviewAttempts": int(metadata.get("reviewAttempts") or 0) + 1,
+                    }
+                )
+            failure_updates["retryAfter"] = (
+                build_retry_after_iso(error, attempts)
+                if retryable
+                else build_review_retry_after_iso(retry_hours)
+            )
             if not retryable:
                 failure_updates["needsReviewAt"] = now_iso()
-                if current_status == "needs_review":
+                if review_mode or current_status == "needs_review":
                     failure_updates.update(
                         {
                             "reviewLastBackend": ocr_backend,
@@ -3401,6 +3478,7 @@ def process_house_review_command(
         limit=limit,
         only_needs_review=True,
         doc_ids=[doc_id.strip() for doc_id in doc_ids if doc_id.strip()] or None,
+        review_config=review_config_signature(ocr_backend, vision_backend),
     )
     summary = process_house_queue_rows(
         settings,
@@ -3410,6 +3488,7 @@ def process_house_review_command(
         with_embeddings=with_embeddings,
         review_retry_hours=review_retry_hours,
         vision_backend=vision_backend,
+        review_mode=True,
     )
     summary["mode"] = "needs_review"
     click.echo(json.dumps(summary, indent=2))

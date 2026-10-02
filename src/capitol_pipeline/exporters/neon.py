@@ -1355,15 +1355,35 @@ def fetch_house_stub_queue(
     include_needs_review: bool = False,
     only_needs_review: bool = False,
     doc_ids: list[str] | None = None,
+    review_config: str | None = None,
 ) -> list[dict[str, object]]:
     """Load queued House filing stubs that are ready for extraction or retry.
 
     ``doc_ids`` narrows the queue to those filings (the status and retry
     clauses still apply), for targeted re-runs.
+
+    The review queue (``only_needs_review``) is served least recently
+    attempted first. With ``review_config`` (the scheduled
+    ``process-house-review``) it also honours each filing's ``retryAfter``
+    back-off, except for a filing last *reviewed* under a different
+    configuration: turning the vision backend on is a reason to look again.
+    Until 2026-10 it did neither. It took the twelve most recently *detected*
+    filings every six hours, got the same answer for the same twelve every
+    time, and never reached the other six hundred.
     """
 
     doc_filter = "AND doc_id = ANY(%s)" if doc_ids else ""
-    params: list[object] = [list(doc_ids)] if doc_ids else []
+    params: list[object] = []
+    order_clause = """
+                    CASE
+                        WHEN status = 'pending_extraction'
+                          THEN 0
+                        WHEN status = 'extracting' THEN 1
+                        WHEN status = 'needs_review' THEN 2
+                        ELSE 3
+                    END,
+                    detected_at DESC
+    """
     if only_needs_review:
         # A filing that was read and then withheld for review carries no
         # lastError (house_stub_last_error returns None as soon as any row was
@@ -1384,7 +1404,23 @@ def fetch_house_stub_queue(
                 )
             )
         """
-        retry_clause = "TRUE"
+        if review_config is not None and not doc_ids:
+            retry_clause = """
+            (
+                COALESCE(NULLIF(metadata->>'retryAfter', '')::timestamptz, NOW() - INTERVAL '1 second') <= NOW()
+                OR (metadata ? 'reviewLastConfig' AND metadata->>'reviewLastConfig' <> %s)
+            )
+            """
+            params.append(review_config)
+        else:
+            retry_clause = "TRUE"
+        # Every attempt, by house-ingest or by review, stamps extractionStartedAt.
+        order_clause = """
+                    NULLIF(metadata->>'extractionStartedAt', '')::timestamptz ASC NULLS FIRST,
+                    filing_year DESC,
+                    detected_at DESC,
+                    doc_id
+        """
     elif include_needs_review:
         status_clause = "status IN ('pending_extraction', 'extracting', 'needs_review')"
         retry_clause = (
@@ -1410,18 +1446,10 @@ def fetch_house_stub_queue(
                         OR COALESCE(metadata->>'lastError', '') NOT ILIKE 'PTR PDF fetch failed with 404%%'
                   )
                   {doc_filter}
-                ORDER BY
-                    CASE
-                        WHEN status = 'pending_extraction'
-                          THEN 0
-                        WHEN status = 'extracting' THEN 1
-                        WHEN status = 'needs_review' THEN 2
-                        ELSE 3
-                    END,
-                    detected_at DESC
+                ORDER BY {order_clause}
                 LIMIT %s
                 """,
-                (*params, max(1, limit)),
+                (*params, *([list(doc_ids)] if doc_ids else []), max(1, limit)),
             )
             return list(cursor.fetchall())
 
