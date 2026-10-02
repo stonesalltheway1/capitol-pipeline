@@ -592,6 +592,9 @@ def test_image_only_pdf_with_vision_auto_goes_to_vision(
     from test_ptr_vision import CHEVRON_VISION_ROW, _enable, _install_fake_client, _payload
 
     _enable(monkeypatch)
+    # The fake answers every call with the same row; one request for both
+    # pages keeps this about routing, not about how many pages a call reads.
+    monkeypatch.setenv("CAPITOL_PTR_VISION_CHUNK_PAGES", "4")
     _, calls = _install_fake_client(monkeypatch, _payload(CHEVRON_VISION_ROW))
     parsed, rows = house_ptr.parse_house_ptr_pdf(
         KHANNA_SCAN, stub=_stub(), backend="auto", vision_backend="auto"

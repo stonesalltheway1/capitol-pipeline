@@ -384,6 +384,7 @@ def withhold_rows(
     doc_id: str,
     filing_date: str | None,
     standins: list[dict[str, object]] | None = None,
+    source_changed: bool = False,
 ) -> tuple[HousePtrParseResult, list[NormalizedTradeRow], list[dict[str, object]]]:
     """Keep out of ``trades`` the rows of a renumbered parse that must not be published.
 
@@ -394,6 +395,10 @@ def withhold_rows(
     or when an amendment row from another filing already publishes it. Held
     rows keep their number and are marked in the transcription, so the next
     read holds them back too. Returns the parse, the rows to write, a report.
+
+    ``source_changed`` says the filing's PDF is not the one its last read was
+    made of. A withdrawn id may come back then, and only then: the same page
+    read again is the same evidence that was withdrawn, whoever reads it.
     """
 
     live = {reference.line_number for reference in references if reference.origin == "trade"}
@@ -410,7 +415,7 @@ def withhold_rows(
             continue
         if number in marked:
             holds[number] = str(marked[number])
-        elif number in withdrawn:
+        elif number in withdrawn and not source_changed:
             holds[number] = f"withdrawn earlier: tr-house-{doc_id}-{number} is in the trade change log"
     # Every row competes for a stand-in, published ones included, so a
     # stand-in for a row this filing already published cannot settle on an

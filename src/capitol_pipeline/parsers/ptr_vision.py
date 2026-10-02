@@ -115,6 +115,46 @@ VISION_PARSER_VERSION = VISION_PARSER_VERSIONS["anthropic"]
 #: Vendor prefixes :func:`is_vision_parser_version` recognises.
 _VISION_VERSION_PREFIXES: tuple[str, ...] = ("claude-", "gemini-")
 
+#: Bumped whenever a change to how a filing is read or merged could change a
+#: row: the prompt, the schema, the agreement rules, the example-row scrub,
+#: what a row is rated. ``parserVersion`` names the vendor and never moved,
+#: which is how reads made before the Type-column check were still being
+#: replayed as current a month later. A saved read is replayed only when it
+#: carries this version and :data:`ptr_grid.DETECTOR_VERSION` or newer.
+#:   1  (absent) everything stored before 2026-10-02
+#:   2  identical printed rows are kept as two trades; a read that disputed
+#:      an amount says so on the row (``amountDisputed``); one page per call
+VISION_READ_VERSION = 2
+
+
+def saved_read_is_current(vision: object) -> tuple[bool, str | None]:
+    """Whether a stored ``visionParse`` was made by today's reader and detector.
+
+    Returns ``(current, why_not)``. A read with no version stamp predates the
+    stamp and is not current; neither is one stamped by an older reader or
+    checked by an older detector. Only a current read may stand in for a
+    fresh one or be published from the stub.
+    """
+
+    if not isinstance(vision, dict):
+        return False, "no saved read"
+    try:
+        read_version = int(vision.get("visionVersion") or 0)
+        detector_version = int(vision.get("detectorVersion") or 0)
+    except (TypeError, ValueError):
+        return False, "saved read carries an unreadable version"
+    if read_version < VISION_READ_VERSION:
+        return False, (
+            f"saved read predates vision read version {VISION_READ_VERSION} "
+            f"(it carries {read_version or 'none'})"
+        )
+    if detector_version < ptr_grid.DETECTOR_VERSION:
+        return False, (
+            f"saved read was checked by detector version {detector_version or 'none'}, "
+            f"older than {ptr_grid.DETECTOR_VERSION}"
+        )
+    return True, None
+
 
 def vision_parser_version(provider_name: str) -> str:
     """The ``parser_version`` a given provider's transcriptions carry."""
@@ -166,9 +206,13 @@ EFFORT_LEVELS: tuple[str, ...] = ("low", "medium", "high", "xhigh", "max")
 #: requests use.
 EFFORT = DEFAULT_EFFORT
 
-#: Pages per request (paper attachments run 16-18 rows a page, so four pages
-#: is ~70 rows of JSON). Override with ``CAPITOL_PTR_VISION_CHUNK_PAGES``.
-DEFAULT_CHUNK_PAGES = 4
+#: Pages per request. One: every page is its own call, so a read is about
+#: exactly one rendered image and its rows cannot drift onto a neighbouring
+#: page's ladder. That is how every read the audits trusted was made (the
+#: supervised driver refused anything else), and it was not the default --
+#: the box ran four pages a call for a month. Override with
+#: ``CAPITOL_PTR_VISION_CHUNK_PAGES``.
+DEFAULT_CHUNK_PAGES = 1
 MAX_CHUNK_PAGES = 12
 
 #: Cost ceiling per filing in USD, compared against the pre-flight estimate;
@@ -945,6 +989,33 @@ def estimate_filing_cost_usd(
     return round(per_read * READS_PER_FILING + pages * orientation, 4)
 
 
+def calls_needed(
+    page_count: int,
+    *,
+    chunk_pages: int | None = None,
+    orientation_mode: str | None = None,
+) -> int:
+    """Model requests a filing needs when nothing has to be retried.
+
+    Two reads of every page group, plus two orientation questions a page when
+    a model decides orientation. ``CAPITOL_PTR_VISION_PAGE_RANGE`` narrows the
+    pages, as it does the read.
+    """
+
+    pages = max(0, int(page_count or 0))
+    window = resolve_page_range()
+    if window is not None and pages:
+        first, last = window
+        pages = max(0, min(pages, last) - first + 1)
+    if pages == 0:
+        return 0
+    size = max(1, int(chunk_pages or resolve_chunk_pages()))
+    calls = READS_PER_FILING * -(-pages // size)
+    if (orientation_mode or resolve_orientation_mode()) == "model":
+        calls += 2 * pages
+    return calls
+
+
 def sum_usage(*usages: dict[str, int] | None) -> dict[str, int]:
     """Add normalized usage dicts field by field."""
 
@@ -1568,6 +1639,27 @@ def _has_amount(row: dict[str, Any]) -> bool:
     return bool(low) and bool(high)
 
 
+def _amount_disputed(row: dict[str, Any]) -> bool:
+    """Whether the row lost its amount to the reads disagreeing about it.
+
+    That is the only case the checkbox detector may settle. A row whose two
+    reads *agreed* that no amount box is ticked has nothing to settle, and the
+    detector lending it a letter is how 9116218 came to carry $15,001-$50,000
+    off the form's printed example. ``amountDisputed`` is stored on the row
+    from read version 2; older transcriptions said it only in the comment.
+    """
+
+    if row.get("_amount_unresolved") or row.get("amountDisputed"):
+        return True
+    for part in str(row.get("comment") or "").split(";"):
+        part = part.strip()
+        if part.startswith("two reads disagreed on:") and "amount" in part:
+            return True
+        if part.startswith("amount column letter") and "does not match the reported band" in part:
+            return True
+    return False
+
+
 def _adopt_detector_amount(row: dict[str, Any], letter: str) -> None:
     """Take the amount from the box the detector says is ticked.
 
@@ -1638,6 +1730,7 @@ def apply_checkbox_detector(
             "resolved": 0,
             "typeAgreed": 0,
             "typeDisagreed": 0,
+            "exampleRow": result.get("exampleRow"),
         }
         if result["status"] != "ok":
             for row in page_rows:
@@ -1685,13 +1778,27 @@ def apply_checkbox_detector(
                 _null_amount(row, "checkbox detector could not tell which amount box is ticked")
             elif model_letter is None:
                 # No model letter survived. When the row also has no band left
-                # (the two reads named different columns, or one contradicted
-                # itself) the detector is the only witness there is, and column
-                # K is a flag rather than a band, so it cannot stand in for one.
+                # because the two reads named different columns, or one
+                # contradicted itself, the detector is the only witness there
+                # is, and column K is a flag rather than a band, so it cannot
+                # stand in for one. When the reads instead agreed that nothing
+                # is ticked, a tick here is a contradiction to put in front of
+                # a person, never an amount to publish.
                 if found["letter"] in AMOUNT_LETTER_BANDS and not _has_amount(row):
-                    _adopt_detector_amount(row, str(found["letter"]))
-                    row["detectorStatus"] = "resolved"
-                    summary["resolved"] += 1
+                    if _amount_disputed(row):
+                        _adopt_detector_amount(row, str(found["letter"]))
+                        row["detectorStatus"] = "resolved"
+                        summary["resolved"] += 1
+                    else:
+                        row["detectorStatus"] = "disagree"
+                        summary["disagreed"] += 1
+                        row["legibility"] = _downgrade(_worst_legibility(row.get("legibility")), "partial")
+                        note = (
+                            f"checkbox detector reads a tick in column {found['letter']} but "
+                            "neither read saw an amount ticked; no amount taken"
+                        )
+                        existing = _merge_comment(row.get("comment"))
+                        row["comment"] = f"{existing}; {note}" if existing else note
                 else:
                     row["detectorStatus"] = "unchecked"
             elif found["letter"] == model_letter:
@@ -1876,6 +1983,10 @@ def _read_once(
         try:
             response = provider.read(parts, **kwargs)
             break
+        except ptr_vision_provider.VisionRunStopped:
+            # Budget spent, quota gone or key refused: not this read's problem
+            # and not one a retry can fix. The filing loop stops the run.
+            raise
         except TypeError as error:
             # The installed SDK does not accept output_config at all -> drop it
             # and use a single strict tool instead. Does not consume a retry.
@@ -2210,6 +2321,7 @@ def merge_matched_rows(row_a: dict[str, Any], row_b: dict[str, Any]) -> tuple[di
                 merged["amount_column_letter"] = None
                 merged["_amount_unresolved"] = "amount_column_letter"
                 merged["_amount_letters"] = [letter_a, letter_b]
+                merged["amountDisputed"] = True
                 disagreements.append("amount_column_letter")
             elif value_a != value_b:
                 merged["amount_min"] = None
@@ -2217,6 +2329,7 @@ def merge_matched_rows(row_a: dict[str, Any], row_b: dict[str, Any]) -> tuple[di
                 merged["amount_column_letter"] = None
                 merged["_amount_unresolved"] = "amount"
                 merged["_amount_letters"] = [letter_a, letter_b]
+                merged["amountDisputed"] = True
                 disagreements.append("amount")
             else:
                 merged["amount_column_letter"] = letter_a or letter_b
@@ -2346,12 +2459,22 @@ def build_vision_metadata(report: dict[str, Any]) -> dict[str, Any]:
         "orientationModel": orientation_model,
         "orientationMode": report.get("orientation_mode"),
         "parserVersion": report.get("parser_version"),
+        # What made and checked this read; a later run replays it only when
+        # both are current (saved_read_is_current).
+        "visionVersion": VISION_READ_VERSION,
+        "detectorVersion": ptr_grid.DETECTOR_VERSION,
         "effort": report.get("effort"),
         "at": report.get("at"),
         "pdfSha256": report.get("pdf_sha256"),
         "ok": bool(report.get("ok")),
         "skipped": bool(report.get("skipped")),
         "reason": report.get("reason"),
+        # Set when the run could not make another call (budget, quota, key);
+        # the caller stops taking filings. budgetSkipped: this filing would
+        # not fit what was left, so no call was made for it.
+        "stopRun": report.get("stop_run"),
+        "budgetSkipped": bool(report.get("budget_skipped")),
+        "callsNeeded": report.get("calls_needed"),
         "stopReason": report.get("stop_reason"),
         "attempts": report.get("attempts"),
         "structuredOutput": report.get("structuredOutput"),
@@ -2653,6 +2776,36 @@ def extract_via_vision(
     model_b = provider.read_model_b
     orientation_mode = resolve_orientation_mode()
     orientation_model = provider.orientation_model if orientation_mode == "model" else None
+
+    # The run's call budget, checked before the first call: a filing that
+    # cannot be read whole is not started, so it is never half-read and its
+    # saved read is never touched.
+    budget = ptr_vision_provider.run_budget()
+    if budget.stopped is not None:
+        return _skip(
+            f"vision run stopped: {budget.stopped.reason}",
+            provider=provider,
+            pdf_sha256=pdf_sha256,
+            page_count=page_count,
+            stop_run={"kind": budget.stopped.kind, "reason": budget.stopped.reason},
+        )
+    if page_count:
+        needed = calls_needed(page_count, chunk_pages=resolve_chunk_pages(), orientation_mode=orientation_mode)
+        if not budget.can_afford(needed):
+            logger.warning(
+                "ptr_vision: %s skipped: needs %d model calls, the run has %s left",
+                pdf_path.name,
+                needed,
+                budget.remaining(),
+            )
+            return _skip(
+                f"vision call budget: needs {needed} calls, {budget.remaining()} left in this run",
+                provider=provider,
+                pdf_sha256=pdf_sha256,
+                page_count=page_count,
+                budget_skipped=True,
+                calls_needed=needed,
+            )
     # The rotation is decided by the free detector unless a model was asked
     # for, so the orientation term of the estimate is usually a true zero.
     orientation_cost = (
@@ -2781,122 +2934,144 @@ def extract_via_vision(
     stop_reason: Any = None
     detector_pages: list[dict[str, Any]] = []
 
-    for chunk_index, chunk in enumerate(chunks, start=1):
-        page_range = _page_range(chunk)
-        read_kwargs: dict[str, Any] = {
-            "filename": pdf_path.name,
-            "context": context,
-            "total_pages": total_pages,
-        }
-        if chunk is None:
-            read_kwargs["content"] = document_content
-
-        read_a = _read_pages(provider, chunk, state, label="read A", model=model, **read_kwargs)
-        calls.extend(read_a["calls"])
-        attempts += read_a["attempts"]
-        stop_reason = read_a["stop_reason"]
-        if not read_a["ok"]:
-            # A first read that refused, truncated twice, or errored would fail
-            # the same way again; do not pay for the second.
-            reason = str(read_a["reason"])
-            if chunk is not None and len(chunks) > 1 and "pages" not in reason:
-                reason = f"{reason} (pages {page_range})"
-            return _skip(
-                reason,
-                provider=provider,
-                usage=_usage_so_far(),
-                cost_usd=_cost_so_far(),
-                stop_reason=stop_reason,
-                attempts=attempts,
-                orientation=orientation,
-                calls=calls,
-                page_count=page_count,
-                chunks=chunk_records,
-                chunk_pages=chunk_pages,
-                pdf_sha256=pdf_sha256,
-                cost_estimate_usd=estimate,
-                cost_ceiling_usd=ceiling,
-            )
-
-        read_b = _read_pages(provider, chunk, state, label="read B", model=model_b, **read_kwargs)
-        calls.extend(read_b["calls"])
-        attempts += read_b["attempts"]
-
-        rows_a, scrubs_a = scrub_example_row_values(list(read_a["rows"]), filing_year)
-        rows_a, conflicts_a = apply_amount_letter_check(rows_a)
-        scrubs_total += scrubs_a
-        letter_conflicts_total += conflicts_a
-        payloads.extend(read_a["payloads"])
-        if read_b["ok"]:
-            rows_b, scrubs_b = scrub_example_row_values(list(read_b["rows"]), filing_year)
-            rows_b, conflicts_b = apply_amount_letter_check(rows_b)
-            scrubs_total += scrubs_b
-            letter_conflicts_total += conflicts_b
-            payloads.extend(read_b["payloads"])
-            merged, agreement = reconcile_reads(rows_a, rows_b)
-            merged, page_summaries = apply_checkbox_detector(merged, chunk)
-            detector_pages.extend(page_summaries)
-            if not rows_a and not rows_b and any(read_a["flags"]) and any(read_b["flags"]):
-                no_transactions_chunks += 1
-        else:
-            merged, agreement = _single_read_fallback(rows_a, str(read_b["reason"]))
-            read_b_failures.append(f"pages {page_range}: {read_b['reason']}")
-
-        all_rows.extend(merged)
-        rows_a_total += int(agreement["rowsA"] or 0)
-        if agreement.get("rowsB") is not None:
-            rows_b_total += int(agreement["rowsB"])
-        matched_total += int(agreement["matched"])
-        unmatched_a_total += int(agreement["unmatchedA"])
-        unmatched_b_total += int(agreement["unmatchedB"])
-        row_counts_agree = row_counts_agree and bool(agreement.get("rowCountsAgree"))
-        for field, count in (agreement.get("fieldDisagreements") or {}).items():
-            disagreement_totals[field] = disagreement_totals.get(field, 0) + int(count)
-        chunk_usage = sum_usage(read_a["usage"], read_b["usage"])
-        chunk_records.append(
-            {
-                "chunk": chunk_index,
-                "pages": page_range,
-                "rowsA": agreement["rowsA"],
-                "rowsB": agreement.get("rowsB"),
-                "matched": agreement["matched"],
-                "fieldDisagreements": agreement.get("fieldDisagreements") or {},
-                "halvedA": read_a["halved"],
-                "halvedB": read_b["halved"],
-                "readBFailed": None if read_b["ok"] else read_b["reason"],
-                "letterConflicts": conflicts_a + (conflicts_b if read_b["ok"] else 0),
-                "usage": chunk_usage,
-                "costUsd": round(read_a["cost_usd"] + read_b["cost_usd"], 6),
+    try:
+        for chunk_index, chunk in enumerate(chunks, start=1):
+            page_range = _page_range(chunk)
+            read_kwargs: dict[str, Any] = {
+                "filename": pdf_path.name,
+                "context": context,
+                "total_pages": total_pages,
             }
-        )
+            if chunk is None:
+                read_kwargs["content"] = document_content
 
-        spent = _cost_so_far()
-        if spent > ceiling * COST_OVERRUN_FACTOR and chunk_index < len(chunks):
-            logger.error(
-                "ptr_vision: %s abandoned after pages %s: $%.2f spent > %.1fx the $%.2f ceiling",
-                pdf_path.name,
-                page_range,
-                spent,
-                COST_OVERRUN_FACTOR,
-                ceiling,
+            read_a = _read_pages(provider, chunk, state, label="read A", model=model, **read_kwargs)
+            calls.extend(read_a["calls"])
+            attempts += read_a["attempts"]
+            stop_reason = read_a["stop_reason"]
+            if not read_a["ok"]:
+                # A first read that refused, truncated twice, or errored would fail
+                # the same way again; do not pay for the second.
+                reason = str(read_a["reason"])
+                if chunk is not None and len(chunks) > 1 and "pages" not in reason:
+                    reason = f"{reason} (pages {page_range})"
+                return _skip(
+                    reason,
+                    provider=provider,
+                    usage=_usage_so_far(),
+                    cost_usd=_cost_so_far(),
+                    stop_reason=stop_reason,
+                    attempts=attempts,
+                    orientation=orientation,
+                    calls=calls,
+                    page_count=page_count,
+                    chunks=chunk_records,
+                    chunk_pages=chunk_pages,
+                    pdf_sha256=pdf_sha256,
+                    cost_estimate_usd=estimate,
+                    cost_ceiling_usd=ceiling,
+                )
+
+            read_b = _read_pages(provider, chunk, state, label="read B", model=model_b, **read_kwargs)
+            calls.extend(read_b["calls"])
+            attempts += read_b["attempts"]
+
+            rows_a, scrubs_a = scrub_example_row_values(list(read_a["rows"]), filing_year)
+            rows_a, conflicts_a = apply_amount_letter_check(rows_a)
+            scrubs_total += scrubs_a
+            letter_conflicts_total += conflicts_a
+            payloads.extend(read_a["payloads"])
+            if read_b["ok"]:
+                rows_b, scrubs_b = scrub_example_row_values(list(read_b["rows"]), filing_year)
+                rows_b, conflicts_b = apply_amount_letter_check(rows_b)
+                scrubs_total += scrubs_b
+                letter_conflicts_total += conflicts_b
+                payloads.extend(read_b["payloads"])
+                merged, agreement = reconcile_reads(rows_a, rows_b)
+                merged, page_summaries = apply_checkbox_detector(merged, chunk)
+                detector_pages.extend(page_summaries)
+                if not rows_a and not rows_b and any(read_a["flags"]) and any(read_b["flags"]):
+                    no_transactions_chunks += 1
+            else:
+                merged, agreement = _single_read_fallback(rows_a, str(read_b["reason"]))
+                read_b_failures.append(f"pages {page_range}: {read_b['reason']}")
+
+            all_rows.extend(merged)
+            rows_a_total += int(agreement["rowsA"] or 0)
+            if agreement.get("rowsB") is not None:
+                rows_b_total += int(agreement["rowsB"])
+            matched_total += int(agreement["matched"])
+            unmatched_a_total += int(agreement["unmatchedA"])
+            unmatched_b_total += int(agreement["unmatchedB"])
+            row_counts_agree = row_counts_agree and bool(agreement.get("rowCountsAgree"))
+            for field, count in (agreement.get("fieldDisagreements") or {}).items():
+                disagreement_totals[field] = disagreement_totals.get(field, 0) + int(count)
+            chunk_usage = sum_usage(read_a["usage"], read_b["usage"])
+            chunk_records.append(
+                {
+                    "chunk": chunk_index,
+                    "pages": page_range,
+                    "rowsA": agreement["rowsA"],
+                    "rowsB": agreement.get("rowsB"),
+                    "matched": agreement["matched"],
+                    "fieldDisagreements": agreement.get("fieldDisagreements") or {},
+                    "halvedA": read_a["halved"],
+                    "halvedB": read_b["halved"],
+                    "readBFailed": None if read_b["ok"] else read_b["reason"],
+                    "letterConflicts": conflicts_a + (conflicts_b if read_b["ok"] else 0),
+                    "usage": chunk_usage,
+                    "costUsd": round(read_a["cost_usd"] + read_b["cost_usd"], 6),
+                }
             )
-            return _skip(
-                f"cost ceiling exceeded mid-filing: ${spent:.2f} spent after pages {page_range} "
-                f"(ceiling ${ceiling:.2f} x {COST_OVERRUN_FACTOR})",
-                provider=provider,
-                usage=_usage_so_far(),
-                cost_usd=spent,
-                stop_reason=stop_reason,
-                attempts=attempts,
-                orientation=orientation,
-                calls=calls,
-                page_count=page_count,
-                chunks=chunk_records,
-                chunk_pages=chunk_pages,
-                pdf_sha256=pdf_sha256,
-                cost_estimate_usd=estimate,
-                cost_ceiling_usd=ceiling,
-            )
+
+            spent = _cost_so_far()
+            if spent > ceiling * COST_OVERRUN_FACTOR and chunk_index < len(chunks):
+                logger.error(
+                    "ptr_vision: %s abandoned after pages %s: $%.2f spent > %.1fx the $%.2f ceiling",
+                    pdf_path.name,
+                    page_range,
+                    spent,
+                    COST_OVERRUN_FACTOR,
+                    ceiling,
+                )
+                return _skip(
+                    f"cost ceiling exceeded mid-filing: ${spent:.2f} spent after pages {page_range} "
+                    f"(ceiling ${ceiling:.2f} x {COST_OVERRUN_FACTOR})",
+                    provider=provider,
+                    usage=_usage_so_far(),
+                    cost_usd=spent,
+                    stop_reason=stop_reason,
+                    attempts=attempts,
+                    orientation=orientation,
+                    calls=calls,
+                    page_count=page_count,
+                    chunks=chunk_records,
+                    chunk_pages=chunk_pages,
+                    pdf_sha256=pdf_sha256,
+                    cost_estimate_usd=estimate,
+                    cost_ceiling_usd=ceiling,
+                )
+    except ptr_vision_provider.VisionRunStopped as stop:
+        # The run cannot make another call. Nothing from this filing is
+        # kept as a read: a half-read filing is not a read, and the stub's
+        # last good read must survive it.
+        logger.error("ptr_vision: %s: vision run stopped (%s): %s", pdf_path.name, stop.kind, stop.reason)
+        return _skip(
+            f"vision run stopped: {stop.reason}",
+            provider=provider,
+            usage=_usage_so_far(),
+            cost_usd=_cost_so_far(),
+            attempts=attempts,
+            orientation=orientation,
+            calls=calls,
+            page_count=page_count,
+            chunks=chunk_records,
+            chunk_pages=chunk_pages,
+            pdf_sha256=pdf_sha256,
+            cost_estimate_usd=estimate,
+            cost_ceiling_usd=ceiling,
+            stop_run={"kind": stop.kind, "reason": stop.reason},
+        )
 
     read_agreement: dict[str, Any] = {
         "rowsA": rows_a_total,
@@ -3031,6 +3206,7 @@ TRANSCRIPTION_FIELDS: tuple[str, ...] = tuple(TRANSACTION_ITEM_SCHEMA["required"
     "detectorStatus",
     "detectorType",
     "detectorTypeStatus",
+    "amountDisputed",
 )
 
 #: Merged rows stored verbatim on ``visionParse.transcription``. Generous: the
@@ -3134,11 +3310,18 @@ def detector_totals(page_summaries: list[dict[str, Any]]) -> dict[str, Any]:
         "disagreed": sum(int(page["disagreed"]) for page in page_summaries),
         "ambiguous": sum(int(page["ambiguous"]) for page in page_summaries),
         "resolved": sum(int(page.get("resolved") or 0) for page in page_summaries),
+        "typeDisagreed": sum(int(page.get("typeDisagreed") or 0) for page in page_summaries),
         "unalignedPages": [
             int(page["page"])
             for page in page_summaries
             if page["status"] == "unaligned" and page["rows"]
         ],
+        "noTickPages": [
+            int(page["page"])
+            for page in page_summaries
+            if page["status"] == "no-ticks" and page["rows"]
+        ],
+        "detectorVersion": ptr_grid.DETECTOR_VERSION,
     }
 
 
@@ -3150,10 +3333,19 @@ def detector_review_reasons(detector: dict[str, Any]) -> list[str]:
         reasons.append(f"checkbox detector disagreed on {detector['disagreed']} row(s)")
     if detector["ambiguous"]:
         reasons.append(f"checkbox detector ambiguous on {detector['ambiguous']} row(s)")
+    if detector.get("typeDisagreed"):
+        reasons.append(
+            f"checkbox detector contradicted the transaction type on {detector['typeDisagreed']} row(s)"
+        )
     if detector["unalignedPages"]:
         reasons.append(
             "checkbox detector could not align rows on page(s) "
             + ", ".join(str(page) for page in detector["unalignedPages"])
+        )
+    if detector.get("noTickPages"):
+        reasons.append(
+            "checkbox detector found no ticked amount on page(s) "
+            + ", ".join(str(page) for page in detector["noTickPages"])
         )
     return reasons
 

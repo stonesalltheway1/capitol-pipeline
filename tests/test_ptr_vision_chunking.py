@@ -450,15 +450,16 @@ def test_cost_overrun_abandons_a_filing_mid_way(
     _enable(monkeypatch)
     monkeypatch.setenv("CAPITOL_PTR_VISION_CHUNK_PAGES", "1")
     # The ceiling is tiny but the pre-flight estimate is patched to pass.
-    monkeypatch.setenv("CAPITOL_PTR_VISION_MAX_COST_USD", "0.05")
+    monkeypatch.setenv("CAPITOL_PTR_VISION_MAX_COST_USD", "0.03")
     monkeypatch.setattr(ptr_vision, "estimate_filing_cost_usd", lambda *_a, **_k: 0.01)
     pdf = _write_real_pdf(tmp_path, pages=3)
     fake = _install(monkeypatch, _payload(_row("x")))
 
     result = extract_via_vision(pdf)
 
-    # Each read costs ~$0.04 at Opus rates; after chunk 1 (two reads) we are
-    # past 1.5 x $0.05, so chunks 2 and 3 are never sent.
+    # Read A costs ~$0.04 at Opus rates and read B ~$0.016 at Sonnet's; after
+    # chunk 1 (two reads) we are past 1.5 x $0.03, so chunks 2 and 3 are never
+    # sent.
     assert len(fake.reads) == 2
     assert result["skipped"] is True
     assert "cost ceiling exceeded mid-filing" in str(result["reason"])
@@ -606,6 +607,8 @@ def test_status_helper_never_parses_zero_rows_without_the_flag() -> None:
 def _prior(pdf: Path, *, age_days: int = 1, version: str = VISION_PARSER_VERSION, sha: str | None = None) -> dict[str, Any]:
     import hashlib
 
+    from capitol_pipeline.parsers.ptr_grid import DETECTOR_VERSION
+
     rows = [
         HousePtrTransaction(
             line_number=1,
@@ -634,6 +637,8 @@ def _prior(pdf: Path, *, age_days: int = 1, version: str = VISION_PARSER_VERSION
         "visionParse": {
             "ok": True,
             "parserVersion": version,
+            "visionVersion": ptr_vision.VISION_READ_VERSION,
+            "detectorVersion": DETECTOR_VERSION,
             "pdfSha256": sha or hashlib.sha256(pdf.read_bytes()).hexdigest(),
             "at": at,
             "confidence": 0.8,
@@ -681,8 +686,14 @@ def test_unchanged_pdf_reuses_the_previous_vision_result(
         lambda prior, pdf: prior["visionParse"].update({"parserVersion": "claude-sonnet-5-vision-v1"}),
         lambda prior, pdf: prior["visionParse"].update({"ok": False}),
         lambda prior, pdf: prior.update({"parsedTransactions": []}),
+        # Made before reads carried a version (every read stored up to
+        # 2026-10-02), or checked by an older checkbox detector.
+        lambda prior, pdf: prior["visionParse"].pop("visionVersion"),
+        lambda prior, pdf: prior["visionParse"].update({"visionVersion": 1}),
+        lambda prior, pdf: prior["visionParse"].update({"detectorVersion": 2}),
     ],
-    ids=["hash-changed", "stale", "old-version", "not-ok", "no-rows"],
+    ids=["hash-changed", "stale", "old-version", "not-ok", "no-rows", "unversioned-read",
+         "older-reader", "older-detector"],
 )
 def test_prior_result_is_not_reused_when_it_no_longer_applies(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path, mutate: Any
@@ -974,6 +985,8 @@ def test_detector_confirms_and_contradicts_the_model_letter() -> None:
             # is silent on the type -- the correct answer, not a default.
             "typeAgreed": 0,
             "typeDisagreed": 0,
+            # No pre-printed example row on a synthetic page without one.
+            "exampleRow": None,
         }
     ]
 
@@ -1060,6 +1073,7 @@ def test_page_number_is_in_the_schema_and_prompt() -> None:
 def test_page_range_knob_reads_only_those_pages(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
     _enable(monkeypatch)
     monkeypatch.setenv("CAPITOL_PTR_VISION_PAGE_RANGE", "3-4")
+    monkeypatch.setenv("CAPITOL_PTR_VISION_CHUNK_PAGES", "4")
     pdf = _write_real_pdf(tmp_path, pages=6)
     fake = _install(monkeypatch, _payload(_row("x", page_number=3)))
 
@@ -1439,6 +1453,9 @@ def test_reconcile_stored_transcription_settles_an_amount_with_no_model(
     # No provider is available at all: a reconcile that reached for one would
     # fail here rather than quietly spend.
     monkeypatch.setattr(ptr_vision, "_client_once", lambda: pytest.fail("a model was called"))
+    # Withheld because the two reads named different columns: the detector
+    # may settle that. (One the reads agreed is unticked it may not; see
+    # test_the_detector_never_lends_an_amount_to_a_row_nobody_ticked.)
     withheld = _row(
         "WHITE MTNS INS GROUP LTD",
         page_number=1,
@@ -1446,6 +1463,7 @@ def test_reconcile_stored_transcription_settles_an_amount_with_no_model(
         amount_max=None,
         amount_column_letter=None,
         legibility="partial",
+        amountDisputed=True,
     )
 
     outcome = ptr_vision.reconcile_stored_transcription(pdf, [withheld])

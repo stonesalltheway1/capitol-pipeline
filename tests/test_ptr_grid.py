@@ -268,3 +268,109 @@ def test_a_header_block_does_not_stop_a_page_aligning() -> None:
     # Paycom and Block Class A are Sales; Take-Two and Block A Class are ticked
     # under Partial Sale, which leaves both columns this reads empty.
     assert [entry["kind"] for entry in result["types"]] == ["sale", "sale", "none", "none"]
+
+
+# ---------------------------------------------------------------------------
+# The pre-printed example row (2026-10-02)
+# ---------------------------------------------------------------------------
+#
+# The four 2026 filings below are the ones the supervised audit of 2026-10-02
+# caught the detector misreading, each checked against a 2x render of the
+# page. On every one the form's printed example row ("Example: Mega Corp.
+# Common Stock", x under Sale, x in column B) was taken for the first real row.
+
+
+def _example_detect(name: str, rows: int) -> dict:
+    return detect_page(analyze_amount_grid(_load(name)), expected_rows=rows)
+
+
+def test_a_row_with_no_amount_ticked_never_borrows_the_examples_x() -> None:
+    # Rogers 9116218: one real row, a redeemed bond, with no amount box ticked
+    # at all (both reads say so; the page agrees). The example's x in B was
+    # the only tick on the page, the count matched, and the pipeline published
+    # an invented $15,001-$50,000 on a filing it rated clean.
+    result = _example_detect("9116218_p1", 1)
+    assert result["exampleRow"] is not None
+    assert result["status"] == "no-ticks"
+    assert result["letters"] == []
+
+
+def test_a_fleck_in_the_header_and_the_example_row_are_not_rows() -> None:
+    # Malliotakis 9116217: a handwritten US Treasury Bill, Purchase, column D.
+    # A 5-pixel fleck in column I sat inside the header block below the old
+    # top-half search; with it and the example row both counted, the runt
+    # filter kept the example and the detector contradicted a correct read.
+    result = _example_detect("9116217_p1", 1)
+    assert result["status"] == "ok"
+    assert [entry["letter"] for entry in result["letters"]] == ["D"]
+    assert [entry["kind"] for entry in result["types"]] == ["purchase"]
+    assert result["exampleRow"] is not None
+
+
+def test_a_doubled_box_edge_does_not_turn_a_row_into_text() -> None:
+    # Wied 9116326 page 1: Schwab C (partial sale, its own column on this
+    # form), then Salesforce, ServiceNow and HubSpot, all Purchase in B. The
+    # boxes are printed twice, offset, and the doubled edges made Salesforce's
+    # row read as header text; with the example row counted the count still
+    # matched and every row took its upstairs neighbour's tick.
+    result = _example_detect("9116326_p1", 4)
+    assert result["status"] == "ok"
+    assert [entry["letter"] for entry in result["letters"]] == ["C", "B", "B", "B"]
+    assert [entry["kind"] for entry in result["types"]] == ["none", "purchase", "purchase", "purchase"]
+
+
+def test_a_box_edge_left_after_masking_is_not_a_second_tick() -> None:
+    # Harshbarger 9116257: Main Str Energy, Purchase, B; then Honeywell twice,
+    # Exchange, A. The first Honeywell row read as ambiguous on 0.0303 of ink
+    # an H box's doubled edge left against a floor of 0.03.
+    result = _example_detect("9116257_p1", 3)
+    assert result["status"] == "ok"
+    assert [entry["letter"] for entry in result["letters"]] == ["B", "A", "A"]
+    assert [entry["kind"] for entry in result["types"]] == ["purchase", "none", "none"]
+
+
+@pytest.mark.parametrize(
+    ("name", "rows", "letters", "types"),
+    [
+        # Harshbarger's other two filings, which could not align at all.
+        ("9116258_p1", 4, ["D", "B", "D", "C"], ["purchase"] * 4),
+        ("9116331_p1", 4, ["B", "B", "B", "B"], ["sale", "purchase", "purchase", "sale"]),
+    ],
+)
+def test_pages_that_would_not_align_now_do(name: str, rows: int, letters: list[str], types: list[str]) -> None:
+    result = _example_detect(name, rows)
+    assert result["status"] == "ok"
+    assert [entry["letter"] for entry in result["letters"]] == letters
+    assert [entry["kind"] for entry in result["types"]] == types
+
+
+def test_a_continuation_page_has_no_example_row() -> None:
+    # 9116258 page 2: seven typed rows straight under the header, the first in
+    # C. Nothing on it may be set aside.
+    result = _example_detect("9116258_p2", 7)
+    assert result["exampleRow"] is None
+    assert [entry["letter"] for entry in result["letters"]] == ["C", "D", "C", "C", "C", "B", "B"]
+
+
+@pytest.mark.parametrize("name", ["8219414_p1", "8219905_p1", "8220068_p1", "8219843_p1", "8219362_p1"])
+def test_the_example_row_is_recognised_on_every_paper_form_fixture(name: str) -> None:
+    bands = classify_bands(analyze_amount_grid(_load(name)))
+    flagged = [band for band in bands if band.get("example")]
+    assert len(flagged) == 1
+    assert flagged[0]["letter"] == "B"
+    # It is still read as the tick it is; it is only never aligned.
+    assert flagged[0]["kind"] == "marked"
+
+
+@pytest.mark.parametrize("name", ["9116141_p2", "8221322_p19", "8221358_p20", "8219444_p12", "8221360_p2"])
+def test_typed_ticks_are_never_taken_for_the_example(name: str) -> None:
+    # McCaul's typed House form ticks with typeset glyphs as small as the
+    # example's x (0.31-0.44 of the pitch against 0.19-0.27); the brokerage
+    # grids smaller still. Neither prints an example row. Every tick on those
+    # pages is the same size, which the relative test sees.
+    bands = classify_bands(analyze_amount_grid(_load(name)))
+    assert not any(band.get("example") for band in bands)
+
+
+def test_the_detector_version_moves_with_this_change() -> None:
+    assert ptr_grid.DETECTOR_VERSION >= 3

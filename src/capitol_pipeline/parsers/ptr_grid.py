@@ -36,12 +36,29 @@ The detector never sets an amount. It confirms or contradicts the model's
 ``amount_column_letter``; :mod:`capitol_pipeline.parsers.ptr_vision` nulls the
 amount on a contradiction or an ambiguous cell and routes the filing to review.
 
+The paper form's pre-printed example row ("Example: Mega Corp. Common Stock",
+an x under Sale and an x in column B) is part of the blank, not a filing, and
+it inks the grid exactly where a first row would. :func:`find_example_row`
+recognises it by what printing does that a hand or a filer's software does
+not -- see the constants beside it -- and :func:`align_rows` never pairs a
+model row with it.
+
 All coordinates are pixels in the rendered upright page.
 """
 
 from __future__ import annotations
 
 from typing import Any
+
+#: Bumped whenever a change here can move a letter or a type onto a different
+#: row. A saved read checked by an older detector is not replayed as if this
+#: one had checked it (``ptr_vision.VISION_READ_VERSION`` is the read's half).
+#:   1  the amount ladder (cc2747d)
+#:   2  the Purchase/Sale type block (17e12bc, abbbfd6)
+#:   3  the pre-printed example row is recognised and never aligned; the
+#:      header block runs to its last contiguous text band; box edges are
+#:      masked in short bands; a page with no tick for a row says so
+DETECTOR_VERSION = 3
 
 AMOUNT_LETTERS = "ABCDEFGHIJK"
 
@@ -113,6 +130,15 @@ CELL_MARGIN = 0.30
 BOX_EDGE_FRACTION = 0.8
 BOX_EDGE_MIN_ROWS = 12
 BOX_EDGE_MASK_PX = 1
+#: The sampled window of a short band is too few rows to test for a box edge
+#: (a 21-pixel band leaves 11), so in a band at least this tall the edge is
+#: also looked for over the band's full height. Measured on 9116326 page 1 and
+#: 9116257 page 1, computer-filled House forms whose drawn boxes are printed
+#: twice, slightly offset: the doubled edges put 0.09-0.25 of ink in every
+#: cell of a 21-pixel row, the row read as header text, and the page lost a
+#: row it needed to align. A tick is diagonal and never fills a column of the
+#: full band; the McCaul forms' rows are 10-14 pixels and never reach this.
+BOX_EDGE_PROBE_MIN_ROWS = 16
 #: A cell is inked when its density clears both the floor and the baseline
 #: (median cell density, i.e. an empty cell) times the factor.
 MARK_MIN_DENSITY = 0.03
@@ -120,6 +146,11 @@ MARK_BASELINE_FACTOR = 3.0
 MARK_BASELINE_OFFSET = 0.004
 #: A tick is unambiguous when the runner-up cell is below this share of it.
 MARK_DOMINANCE = 0.6
+#: A cell under this share of the band's darkest cell is not a second tick,
+#: whatever the floor says: it is what a box edge leaves after masking. On
+#: 9116257 page 1 a Honeywell row ticked in A at 0.364 read as ambiguous
+#: because the H box's doubled edge left 0.0303 against a floor of 0.03.
+MARK_NOISE_SHARE = 0.15
 #: A band with this many inked cells is header text, not a row.
 TEXT_BAND_CELLS = 5
 #: A candidate band shorter than this fraction of the median candidate height
@@ -132,6 +163,48 @@ RUNT_BAND_RATIO = 0.5
 #: block is 88 px against a median of 31 and it is the reason the page could
 #: not be aligned at all -- which cost two rows their type check.
 GIANT_BAND_RATIO = 2.0
+#: Inside the header block a band shorter than this share of the ladder pitch
+#: is a fleck of the header's own print -- the tail of a dollar range, a
+#: speck -- and does not end the block. On 9116217 page 1 a 5-pixel fleck in
+#: column I sat between two header text bands, outside the old top-half
+#: search, and was taken for a row. Every tick measured is 0.18 of a pitch or
+#: more (the example row's printed x on 9116257), every handwritten one 0.45.
+HEADER_FLECK_MAX_PITCH_RATIO = 0.15
+
+# -- The pre-printed example row -------------------------------------------
+#
+# The House paper form prints one example in its grid: "Example: Mega Corp.
+# Common Stock", an x under Sale, 02/05/20 and 03/07/20 (other printings carry
+# 02/05/24 or 8/14/12), and an x in column B. The detector sees that x in B as
+# a tick on the first row. Until 2026-10-02 the only defence was a count rule
+# -- one extra candidate whose first is B is the example -- and the count rule
+# fails both ways. On 9116218 the one real row ticks no amount at all, so the
+# example's x was the only candidate, the count matched, and the detector
+# "resolved" an invented $15,001-$50,000 on a filing it then rated clean. On
+# 9116217, 9116326 and 9116257 a fleck or a missed row made the count match
+# with the example still in it, and every row took its upstairs neighbour's
+# tick, contradicting reads that were right.
+#
+# So it is recognised by what printing does. Measured on every paper-form
+# page available (the 44 staged 2026 PDFs and the ground-truth set):
+#
+#   the example's x is a typeset glyph: 8-12 px tall at the render zoom,
+#   0.19-0.27 of the ladder pitch, on every printing seen; and
+#   the rows filled in under it are 21-42 px (0.41-0.81 of a pitch), so the
+#   example is at most 0.5 of the rows on its own page.
+#
+# The typed House form McCaul files (8221326, 8221359, 9116141) prints no
+# example row and its own ticks are typeset glyphs too: 10-14 px against a
+# 32-33 px pitch, 0.31-0.44. That is why the size test is relative to the
+# page whenever the page has other ticks, and why the absolute test, used only
+# when the example's x is the one tick on the page, stops below 0.31.
+
+#: The example is printed in column B, under Sale.
+EXAMPLE_ROW_LETTER_INDEX = 1
+#: Its x is no taller than this share of the ladder pitch.
+EXAMPLE_ROW_MAX_PITCH_RATIO = 0.29
+#: And, when the page has other ticks, no taller than this share of theirs.
+EXAMPLE_ROW_MAX_RELATIVE_HEIGHT = 0.6
 
 # -- The Type block ---------------------------------------------------------
 #
@@ -484,12 +557,15 @@ def analyze_amount_grid(gray: Any) -> dict[str, Any] | None:
         [rule["x"] for rule in find_vertical_rules(dark, 0)], ladder[0], ladder_pitch
     )
 
-    def _densities(ya: int, yb: int, cells: list[tuple[int, int]]) -> list[float]:
+    def _densities(
+        ya: int, yb: int, cells: list[tuple[int, int]], a: int, b: int
+    ) -> list[float]:
         out: list[float] = []
         for cx0, cx1 in cells:
             cell_w = cx1 - cx0
             xa, xb = cx0 + int(cell_w * CELL_MARGIN), cx1 - int(cell_w * CELL_MARGIN)
-            out.append(cell_ink_density(dark[ya:yb, xa:xb]))
+            probe = dark[a:b, xa:xb] if (b - a) >= BOX_EDGE_PROBE_MIN_ROWS else None
+            out.append(cell_ink_density(dark[ya:yb, xa:xb], probe=probe))
         return out
 
     profile = interior.sum(axis=1) / float(interior.shape[1])
@@ -504,10 +580,10 @@ def analyze_amount_grid(gray: Any) -> dict[str, Any] | None:
         band: dict[str, Any] = {
             "y0": int(a),
             "y1": int(b),
-            "densities": _densities(ya, yb, columns),
+            "densities": _densities(ya, yb, columns, a, b),
         }
         if type_columns is not None:
-            band["typeDensities"] = _densities(ya, yb, type_columns)
+            band["typeDensities"] = _densities(ya, yb, type_columns, a, b)
         bands.append(band)
 
     # The empty-cell baseline comes from the bands that are not header text.
@@ -545,6 +621,28 @@ def analyze_amount_grid(gray: Any) -> dict[str, Any] | None:
         if all(d >= SOLID_BAR_DENSITY for d in band["densities"]):
             continue  # a section bar, not header text
         header_end = max(header_end, band["y1"])
+    # The header block is contiguous: on a page with few row slots its
+    # vertical dollar-range labels run past the top half of the ladder
+    # (9116217 page 1: to 71% of it). Text bands that follow the block with
+    # nothing between them but empty bands and flecks of print are still the
+    # block, and so is any fleck inside it. A band that could be a tick ends
+    # it, as does a solid section bar (the brokerage grids), so no row is ever
+    # taken into the header this way.
+    if header_end > y0:
+        threshold = max(MARK_MIN_DENSITY, baseline * MARK_BASELINE_FACTOR + MARK_BASELINE_OFFSET)
+        fleck = HEADER_FLECK_MAX_PITCH_RATIO * ladder_pitch
+        for band in sorted(bands, key=lambda entry: entry["y0"]):
+            if band["y1"] <= header_end:
+                continue
+            densities = band["densities"]
+            if _is_text(densities):
+                if all(d >= SOLID_BAR_DENSITY for d in densities):
+                    break
+                header_end = band["y1"]
+                continue
+            if all(d < threshold for d in densities) or (band["y1"] - band["y0"]) < fleck:
+                continue
+            break
     below = [y for y in hrules if y >= header_end]
     caption_end = int(below[0]) if below else header_end
     return {
@@ -560,6 +658,7 @@ def analyze_amount_grid(gray: Any) -> dict[str, Any] | None:
         "typeBaseline": type_baseline,
         "headerEnd": int(header_end),
         "captionEnd": int(caption_end),
+        "pitch": ladder_pitch,
     }
 
 
@@ -630,21 +729,31 @@ def orientation_score(analysis: dict[str, Any] | None) -> float:
     return round(score, 4)
 
 
-def cell_ink_density(cell: Any) -> float:
+def cell_ink_density(cell: Any, probe: Any = None) -> float:
     """Ink fraction of the sampled (central) part of a cell.
 
     In bands at least :data:`BOX_EDGE_MIN_ROWS` tall, columns that are
     :data:`BOX_EDGE_FRACTION` dark are a drawn box edge that strayed into the
     window and are left out; a typed "x" in a six-row band is never tested.
+    ``probe`` is the same columns over the band's full height: a column dark
+    through all of it is a box edge too, which is how a short band's edges
+    are found (:data:`BOX_EDGE_PROBE_MIN_ROWS`).
     """
 
     np = _np()
     if cell.size == 0:
         return 0.0
     rows, cols = cell.shape
-    if rows < BOX_EDGE_MIN_ROWS or cols < 3:
+    tested = rows >= BOX_EDGE_MIN_ROWS
+    probed = probe is not None and getattr(probe, "shape", (0, 0))[1] == cols
+    if cols < 3 or not (tested or probed):
         return float(cell.mean())
-    keep = cell.mean(axis=0) < BOX_EDGE_FRACTION
+    edge = np.zeros(cols, dtype=bool)
+    if tested:
+        edge |= cell.mean(axis=0) >= BOX_EDGE_FRACTION
+    if probed:
+        edge |= probe.mean(axis=0) >= BOX_EDGE_FRACTION
+    keep = ~edge
     for shift in range(1, BOX_EDGE_MASK_PX + 1):
         keep &= np.roll(keep, shift) & np.roll(keep, -shift)
     if keep.sum() < 0.3 * cols:
@@ -656,7 +765,12 @@ def classify_band(densities: list[float], baseline: float) -> dict[str, Any]:
     """Name the ticked column of one band, or say why there is none."""
 
     threshold = max(MARK_MIN_DENSITY, baseline * MARK_BASELINE_FACTOR + MARK_BASELINE_OFFSET)
-    inked = [index for index, density in enumerate(densities) if density >= threshold]
+    peak = max(densities) if densities else 0.0
+    inked = [
+        index
+        for index, density in enumerate(densities)
+        if density >= threshold and density >= MARK_NOISE_SHARE * peak
+    ]
     texty = [index for index, density in enumerate(densities) if density >= TEXT_CELL_DENSITY]
     order = sorted(range(len(densities)), key=lambda index: densities[index], reverse=True)
     best = order[0] if order else None
@@ -714,8 +828,57 @@ def classify_type(densities: list[float] | None, baseline: float) -> dict[str, A
     return record
 
 
+def _band_height(band: dict[str, Any]) -> int:
+    return int(band["y1"]) - int(band["y0"])
+
+
+def _could_be_example(band: dict[str, Any], pitch: float) -> bool:
+    """A clean tick in column B, typeset-small, not under Purchase."""
+
+    return (
+        band.get("kind") == "marked"
+        and band.get("index") == EXAMPLE_ROW_LETTER_INDEX
+        and (band.get("type") or {}).get("kind") != "purchase"
+        and pitch > 0
+        and _band_height(band) <= EXAMPLE_ROW_MAX_PITCH_RATIO * pitch
+    )
+
+
+def find_example_row(bands: list[dict[str, Any]], pitch: float) -> int | None:
+    """Index into ``bands`` of the form's pre-printed example row, or None.
+
+    The example is the first row of the grid, so only the first tick below
+    the header can be it. It must be :func:`_could_be_example` -- a clean tick
+    in B, no taller than :data:`EXAMPLE_ROW_MAX_PITCH_RATIO` of the ladder
+    pitch, and not read under Purchase -- and, when the page has other ticks,
+    no taller than :data:`EXAMPLE_ROW_MAX_RELATIVE_HEIGHT` of theirs. A
+    continuation page has no example row and its first tick is a real one; a
+    form whose own ticks are typeset glyphs (the McCaul filings) fails the
+    relative test because every tick on it is the same size.
+    """
+
+    candidates = [i for i, band in enumerate(bands) if band.get("kind") in ("marked", "ambiguous")]
+    if not candidates:
+        return None
+    first = candidates[0]
+    band = bands[first]
+    if not _could_be_example(band, pitch):
+        return None
+    others = sorted(_band_height(bands[i]) for i in candidates[1:])
+    if others:
+        median = others[len(others) // 2]
+        if _band_height(band) > EXAMPLE_ROW_MAX_RELATIVE_HEIGHT * median:
+            return None
+    return first
+
+
 def classify_bands(analysis: dict[str, Any]) -> list[dict[str, Any]]:
-    """Classify every band; bands inside the header zone are ``header``."""
+    """Classify every band; bands inside the header zone are ``header``.
+
+    The form's pre-printed example row keeps its kind (it is a tick, and the
+    ladder reads it like one) and is flagged ``example``; :func:`align_rows`
+    never pairs a model row with it.
+    """
 
     baseline = float(analysis.get("baseline") or 0.0)
     type_baseline = float(analysis.get("typeBaseline") or 0.0)
@@ -737,41 +900,59 @@ def classify_bands(analysis: dict[str, Any]) -> list[dict[str, Any]]:
             ):
                 record["kind"] = "header"  # the K column's caption
         out.append(record)
+    pitch = float(analysis.get("pitch") or 0.0)
+    if pitch <= 0 and analysis.get("columns"):
+        widths = sorted(x1 - x0 for x0, x1 in analysis["columns"])
+        pitch = float(widths[len(widths) // 2])
+    example = find_example_row(out, pitch)
+    if example is not None:
+        out[example]["example"] = True
     return out
 
 
-def align_rows(bands: list[dict[str, Any]], expected_rows: int) -> list[dict[str, Any]] | None:
+def align_rows(
+    bands: list[dict[str, Any]], expected_rows: int, pitch: float = 0.0
+) -> list[dict[str, Any]] | None:
     """Pair the model's rows (top to bottom) with the ticked bands.
 
-    Candidates are the marked and ambiguous bands in page order. An exact count
-    match pairs them one to one. Otherwise runt bands are dropped, and only
-    then, one extra candidate whose first band is a clean tick in column B is
-    taken for the paper form's pre-printed example row. Anything else is a
-    failed alignment.
+    Candidates are the marked and ambiguous bands in page order, less the
+    form's pre-printed example row (flagged by :func:`classify_bands`). An
+    exact count match pairs them one to one. Otherwise runt bands are dropped,
+    and anything else is a failed alignment. Fewer ticks than rows is a failed
+    alignment too, never a reason to borrow a band: a row whose amount box is
+    empty has no band, and pairing it with the example's x is how 9116218 got
+    an amount nobody ticked.
 
-    The order matters, and it is measured. The example-row rule cannot tell a
-    real first row from a stray band, and column B is also the commonest real
-    amount, so on any page with one spurious band it silently drops the first
-    row and shifts every row after it. On 8221360 page 2 that is exactly what
-    happened: a five-pixel band among bands 25 to 31 pixels tall made nine
-    candidates for eight rows, the rule dropped Micron Technology, and five of
-    the seven rows then carried another row's amount -- checked against two
-    independent blind transcriptions of the page. Dropping the runt first
-    makes the count match on its own and the example-row rule never fires.
+    The order matters, and it is measured. A count rule for the example row
+    (one extra candidate whose first band is a clean tick in column B) cannot
+    tell a real first row from a stray band, and column B is also the
+    commonest real amount, so on any page with one spurious band it silently
+    drops the first row and shifts every row after it. On 8221360 page 2 that
+    is exactly what happened: a five-pixel band among bands 25 to 31 pixels
+    tall made nine candidates for eight rows, the rule dropped Micron
+    Technology, and five of the seven rows then carried another row's amount
+    -- checked against two independent blind transcriptions of the page.
+    Dropping the runt first makes the count match on its own. The count rule
+    survives only as a last resort, and only for a first band that is small
+    enough to be the printed x (:func:`_could_be_example`).
     """
 
-    candidates = [band for band in bands if band["kind"] in ("marked", "ambiguous")]
     if expected_rows <= 0:
         return None
+    candidates = [
+        band
+        for band in bands
+        if band["kind"] in ("marked", "ambiguous") and not band.get("example")
+    ]
     if len(candidates) == expected_rows:
         return candidates
     if len(candidates) > expected_rows:
-        heights = sorted(band["y1"] - band["y0"] for band in candidates)
+        heights = sorted(_band_height(band) for band in candidates)
         median = heights[len(heights) // 2]
         kept = [
             band
             for band in candidates
-            if median * RUNT_BAND_RATIO <= (band["y1"] - band["y0"]) <= median * GIANT_BAND_RATIO
+            if median * RUNT_BAND_RATIO <= _band_height(band) <= median * GIANT_BAND_RATIO
         ]
         if expected_rows <= len(kept) < len(candidates):
             candidates = kept
@@ -779,8 +960,8 @@ def align_rows(bands: list[dict[str, Any]], expected_rows: int) -> list[dict[str
         return candidates
     if (
         len(candidates) == expected_rows + 1
-        and candidates[0]["kind"] == "marked"
-        and candidates[0]["index"] == 1
+        and not any(band.get("example") for band in bands)
+        and _could_be_example(candidates[0], pitch)
     ):
         return candidates[1:]
     return None
@@ -792,7 +973,9 @@ def detect_page(analysis: dict[str, Any] | None, expected_rows: int) -> dict[str
     Returns ``{"status", "columns", "bands", "candidates", "letters"}`` where
     ``letters`` is one entry per expected row: ``{"letter", "kind"}`` (kind
     ``marked`` or ``ambiguous``). ``status`` is ``ok``, ``no-grid``,
-    ``no-rows`` or ``unaligned``.
+    ``no-rows``, ``no-ticks`` (a ladder with nothing ticked on it but the
+    example row) or ``unaligned``. ``exampleRow`` is where the pre-printed
+    example row was found, or None.
     """
 
     if analysis is None:
@@ -804,9 +987,15 @@ def detect_page(analysis: dict[str, Any] | None, expected_rows: int) -> dict[str
             "letters": [],
             "types": [],
             "typeColumns": None,
+            "exampleRow": None,
         }
     classified = classify_bands(analysis)
-    candidates = [band for band in classified if band["kind"] in ("marked", "ambiguous")]
+    example = next((band for band in classified if band.get("example")), None)
+    candidates = [
+        band
+        for band in classified
+        if band["kind"] in ("marked", "ambiguous") and not band.get("example")
+    ]
     base = {
         "columns": len(analysis["columns"]),
         "bands": len(classified),
@@ -814,10 +1003,19 @@ def detect_page(analysis: dict[str, Any] | None, expected_rows: int) -> dict[str
         "letters": [],
         "types": [],
         "typeColumns": analysis.get("typeColumns"),
+        # Where the pre-printed example row was found, so a reviewer can see
+        # what was set aside: [y0, y1] in page pixels, or None.
+        "exampleRow": [int(example["y0"]), int(example["y1"])] if example else None,
     }
     if expected_rows <= 0:
         return {"status": "no-rows", **base}
-    aligned = align_rows(classified, expected_rows)
+    if not candidates:
+        # The ladder is there and nothing on it is ticked (the example's x
+        # aside). That is a finding, not a failure to align: no row on this
+        # page has an amount box the detector can see, and it will not lend
+        # one any row.
+        return {"status": "no-ticks", **base}
+    aligned = align_rows(classified, expected_rows, float(analysis.get("pitch") or 0.0))
     if aligned is None:
         return {"status": "unaligned", **base}
     return {
@@ -880,10 +1078,13 @@ def draw_synthetic_grid(
     ys = [grid_y0, grid_y0 + header_h] + [grid_y0 + header_h + row_h * r for r in range(1, total_rows + 1)]
     if box_style:
         # Thin column rules the whole height, like the real form, plus a drawn
-        # box inside every cell.
+        # box inside every cell -- except the example row's, which the real
+        # form prints bare (9116217, 9116257, 9116326 page 1).
         for x in xs:
             page[grid_y0 : grid_y1 + 1, x : x + 1] = 0
-        for ya, yb in zip(ys[1:], ys[2:]):
+        for slot, (ya, yb) in enumerate(zip(ys[1:], ys[2:])):
+            if example_row and slot == 0:
+                continue
             for xa, xb in zip(xs, xs[1:]):
                 page[ya + 3 : ya + 5, xa + 3 : xb - 3] = 0
                 page[yb - 5 : yb - 3, xa + 3 : xb - 3] = 0

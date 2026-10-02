@@ -639,6 +639,8 @@ def test_detect_orientation_falls_back_when_rendering_fails(
 
 def test_image_request_shape_with_a_real_pdf(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
     _enable(monkeypatch)
+    # The shape of a multi-page request; the default is one page a call.
+    monkeypatch.setenv("CAPITOL_PTR_VISION_CHUNK_PAGES", "4")
     pdf = _write_real_pdf(tmp_path, portrait=True, pages=2)
     captured, calls = _install_fake_client(monkeypatch, _payload(CHEVRON_VISION_ROW), orientation="0")
 
@@ -704,9 +706,11 @@ def test_image_request_shape_with_a_real_pdf(monkeypatch: pytest.MonkeyPatch, tm
         "cache_write": 2 * 1_000,
         "output": 2 * 800 + 4 * 2,
     }
-    read_cost = (4_000 * 5.0 + 2_000 * 0.5 + 1_000 * 6.25 + 800 * 25.0) / 1_000_000
+    # Read A on claude-opus-5, read B on claude-sonnet-5 (two models on purpose).
+    read_a_cost = (4_000 * 5.0 + 2_000 * 0.5 + 1_000 * 6.25 + 800 * 25.0) / 1_000_000
+    read_b_cost = (4_000 * 2.0 + 2_000 * 0.2 + 1_000 * 2.5 + 800 * 10.0) / 1_000_000
     orient_cost = (1_500 * 1.0 + 2 * 5.0) / 1_000_000
-    assert result["cost_usd"] == pytest.approx(2 * read_cost + 4 * orient_cost)
+    assert result["cost_usd"] == pytest.approx(read_a_cost + read_b_cost + 4 * orient_cost)
     assert [call["label"] for call in result["calls"]] == ["orientation", "read A", "read B"]
     assert result["calls"][0]["model"] == ORIENTATION_MODEL_ID
     assert result["calls"][1]["model"] == MODEL_ID
@@ -1405,8 +1409,11 @@ def test_vision_metadata_carries_usage_and_cost(
         "cacheWriteTokens": 2_000,
         "outputTokens": 1_600,
     }
-    # per read: 4000*$5 + 2000*$0.50 + 1000*$6.25 + 800*$25, per MTok = $0.04725
-    assert metadata["costUsd"] == pytest.approx(0.0945)
+    # Read A is claude-opus-5: 4000*$5 + 2000*$0.50 + 1000*$6.25 + 800*$25 per
+    # MTok = $0.04725. Read B is a different model on purpose, claude-sonnet-5:
+    # 4000*$2 + 2000*$0.20 + 1000*$2.50 + 800*$10 = $0.0189.
+    assert metadata["modelB"] == "claude-sonnet-5"
+    assert metadata["costUsd"] == pytest.approx(0.06615)
     assert metadata["pricing"]["inputPerMTok"] == 5.0
     assert metadata["pricing"]["outputPerMTok"] == 25.0
     assert metadata["pricing"]["orientation"] == {"inputPerMTok": 1.0, "outputPerMTok": 5.0}

@@ -26,6 +26,7 @@ from capitol_pipeline.parsers.ptr_vision import (
     current_vision_parser_version,
     extract_via_vision,
     is_vision_parser_version,
+    saved_read_is_current,
     scrub_example_row_values,
 )
 from capitol_pipeline.processors.ocr import fix_font_mojibake, OcrProcessor
@@ -1018,8 +1019,8 @@ def parse_house_ptr_text(
     # three NVDA purchases of 07/17/2025 at $100,001 - $250,000 on one page
     # of 20030803). Checked against the PDFs on 2026-10-02: the 578 lines the
     # old filter dropped each sit on their own line of the page, and no date
-    # in those 258 filings is overprinted. ``dedupe_transactions`` stays for
-    # the vision path, where a model can report one row twice.
+    # in those 258 filings is overprinted. The vision path keeps them too
+    # (since 2026-10-02); ``dedupe_transactions`` is no longer called.
     transactions = parse_transactions(text)
     valid_transactions = [
         transaction
@@ -1137,6 +1138,15 @@ def _run_vision_parse(
         # would produce it today: a provider switch re-reads rather than
         # publishing rows under a version that did not write them.
         if candidate.get("parserVersion") != current_vision_parser_version():
+            return None
+        # Nor when an older reader or an older checkbox detector made it.
+        # parserVersion names the vendor and never moved, so reads made before
+        # the Type-column check -- and the 8221322/8221358/8221360 reads whose
+        # misread rows migrations 042/043 took out of trades -- would
+        # otherwise have been replayed as current for 30 days.
+        current, why_not = saved_read_is_current(candidate)
+        if not current:
+            logger.info("house_ptr vision: not replaying the saved read of %s: %s", pdf_path.name, why_not)
             return None
         if candidate.get("pdfSha256") != pdf_sha256:
             return None
@@ -1318,7 +1328,16 @@ def _run_vision_parse(
             pdf_path.name,
         )
 
-    transactions = dedupe_transactions(stub, restored)
+    # No dedupe, for the reason parse_house_ptr_text gives: two identical
+    # printed rows are two trades (separate lots or accounts), and regex-v3
+    # keeps them. The vision path merged them until 2026-10-02 -- Harshbarger
+    # 9116258 prints MAIN STR ENERGY twice on page 2 and published it once.
+    # What a dedupe was standing guard against, a model reporting one row
+    # twice, is caught upstream instead: reconcile_reads pairs rows one to one
+    # across two reads, so a row only one read doubled is unmatched and rated
+    # illegible, and the checkbox detector will not align a page that carries
+    # one row more than it has ticks.
+    transactions = list(restored)
     valid_transactions = [
         transaction
         for transaction in transactions

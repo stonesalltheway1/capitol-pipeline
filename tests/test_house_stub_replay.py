@@ -17,6 +17,8 @@ import pytest
 from capitol_pipeline import cli
 from capitol_pipeline.config import Settings
 from capitol_pipeline.models.congress import FilingStub, MemberMatch
+from capitol_pipeline.parsers import ptr_vision
+from capitol_pipeline.parsers.ptr_grid import DETECTOR_VERSION
 from capitol_pipeline.registries.legislator_service import ServiceTerm
 from capitol_pipeline.registries.members import MemberRegistry
 
@@ -272,20 +274,43 @@ def test_a_low_confidence_filing_can_be_held_back(exporter: _Calls) -> None:
     assert exporter.upserts == []
 
 
-def test_a_settled_row_from_a_filing_in_review_publishes(exporter: _Calls) -> None:
-    # --include-vision can put one in the batch. Withholding is per row now,
-    # so a row carrying a date, a type and an amount band publishes even while
-    # the filing keeps its place in the review queue.
+#: A saved read made by today's reader and checked by today's detector.
+CURRENT_READ = {
+    "visionVersion": ptr_vision.VISION_READ_VERSION,
+    "detectorVersion": DETECTOR_VERSION,
+}
+
+
+def test_a_filing_in_review_is_withheld_whole_unless_the_override_is_asked(exporter: _Calls) -> None:
+    # --include-vision can put one in the batch. The filing is in review, so
+    # by default nothing of it publishes; --publish-partial-filings publishes
+    # the rows that carry a date, a type and an amount band, row by row.
     row = _row(
         parserVersion="claude-vision-v2",
-        visionParse={"ok": True, "needsReview": True, "parserVersion": "claude-vision-v2"},
+        visionParse={"ok": True, "needsReview": True, "parserVersion": "claude-vision-v2", **CURRENT_READ},
     )
     summary = cli.repersist_house_stub_rows(Settings(), [row])
+    assert summary["tradeRowsUpserted"] == 0
+    assert summary["stubs"][0]["stubStatus"] == "needs_review"
+    assert exporter.upserts == []
 
+    summary = cli.repersist_house_stub_rows(Settings(), [row], allow_partial=True)
     assert summary["published"] == 1
     assert summary["tradeRowsUpserted"] == 1
     assert summary["stubs"][0]["stubStatus"] == "needs_review"
     assert len(exporter.upserts[0]) == 1
+
+
+def test_a_stale_vision_read_is_not_replayed(exporter: _Calls) -> None:
+    row = _row(
+        parserVersion="gemini-vision-v2",
+        visionParse={"ok": True, "needsReview": False, "parserVersion": "gemini-vision-v2"},
+    )
+    summary = cli.repersist_house_stub_rows(Settings(), [row], allow_partial=True)
+
+    assert summary["skipped"] == 1
+    assert summary["stubs"][0]["reason"].startswith("stale vision read")
+    assert exporter.upserts == []
 
 
 def test_an_unsettled_row_from_a_filing_in_review_is_held_back(exporter: _Calls) -> None:
@@ -293,9 +318,9 @@ def test_an_unsettled_row_from_a_filing_in_review_is_held_back(exporter: _Calls)
     row = _row(
         parsedTransactions=[dict(MANNING_ROW, amount_min=0, amount_max=0)],
         parserVersion="claude-vision-v2",
-        visionParse={"ok": True, "needsReview": True, "parserVersion": "claude-vision-v2"},
+        visionParse={"ok": True, "needsReview": True, "parserVersion": "claude-vision-v2", **CURRENT_READ},
     )
-    summary = cli.repersist_house_stub_rows(Settings(), [row])
+    summary = cli.repersist_house_stub_rows(Settings(), [row], allow_partial=True)
 
     assert summary["tradeRowsUpserted"] == 0
     assert summary["stubs"][0]["stubStatus"] == "needs_review"
@@ -313,7 +338,7 @@ def test_the_replay_names_the_parser_that_made_the_transcription(exporter: _Call
 
     row = _row(
         parserVersion="regex-v1",
-        visionParse={"ok": True, "needsReview": True, "parserVersion": "gemini-vision-v2"},
+        visionParse={"ok": True, "needsReview": True, "parserVersion": "gemini-vision-v2", **CURRENT_READ},
     )
     _stub, parsed, trades, skip = cli.rebuild_parsed_house_stub(row)
 

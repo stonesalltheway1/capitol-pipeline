@@ -1,10 +1,13 @@
 """Publishing rules for House PTR results.
 
-A filing read off page images publishes row by row while it is
-``needs_review``: a row carrying a date, a type and an amount band goes to
-``trades``, and a row missing any of the three stays in the stub metadata for
-a reviewer. The text path keeps publishing as before. The database is never
-touched: the exporter entry points are patched on the CLI module.
+A filing read off page images publishes whole or not at all: any row that is
+disputed, not rated clear, or short of a date, a type or an amount band holds
+back every row of the filing, and the reads stay on the stub for a reviewer
+(``scanned_filing_gate``). ``allow_partial`` -- ``--publish-partial-filings``
+-- is the explicit override, and publishes the settled rows one by one as the
+path did from 67d2b5c to 2026-10-02; the per-row tests below exercise it. The
+text path keeps publishing as before. The database is never touched: the
+exporter entry points are patched on the CLI module.
 """
 
 from __future__ import annotations
@@ -47,6 +50,19 @@ def _transaction(*, line: int = 1, legibility: str | None = "clear") -> HousePtr
         amount_max=15000,
         owner="spouse",
     )
+
+
+def _settled_row(line: int = 1) -> dict[str, Any]:
+    """A transcription row both reads and the checkbox detector agree on."""
+
+    return {
+        "line_number": line,
+        "asset_description": "Lear Corporation",
+        "transaction_type": "purchase",
+        "legibility": "clear",
+        "detectorStatus": "agree",
+        "detectorTypeStatus": "agree",
+    }
 
 
 def _trade(
@@ -100,12 +116,12 @@ def exporter(monkeypatch: pytest.MonkeyPatch) -> _Calls:
     return calls
 
 
-def test_a_scan_in_review_publishes_the_rows_that_are_settled(exporter: _Calls) -> None:
-    """One disputed row must not hold back the rows nothing disputes.
+def test_the_override_publishes_the_rows_of_a_disputed_scan_that_are_settled(exporter: _Calls) -> None:
+    """With --publish-partial-filings, one disputed row does not hold back the rest.
 
-    On doc 9116141 the old rule did exactly that: 26 rows whose Type column
-    the two reads read one column apart held back 108 rows both reads and the
-    checkbox detector agreed on.
+    On doc 9116141 per-filing withholding held 108 rows both reads and the
+    checkbox detector agreed on behind 26 whose Type column the reads read one
+    column apart. That is what the override is for; it is not the default.
     """
 
     parsed = HousePtrParseResult(
@@ -126,9 +142,10 @@ def test_a_scan_in_review_publishes_the_rows_that_are_settled(exporter: _Calls) 
         _trade(line=3, transaction_date=None),
     ]
 
-    summary = cli.persist_parsed_house_stub(Settings(), _stub(), parsed, trades)
+    summary = cli.persist_parsed_house_stub(Settings(), _stub(), parsed, trades, allow_partial=True)
 
     assert summary["stubStatus"] == "needs_review"
+    assert summary["filingGate"]["decision"] == "published-partial"
     assert [row.source_id for row in exporter.upserts[0]] == ["tr-house-8219444-1"]
     assert summary["trades"]["upserted"] == 1
     assert summary["trades"]["withheld"] == 2
@@ -177,9 +194,10 @@ def test_a_row_the_read_could_not_rate_clear_is_withheld(exporter: _Calls) -> No
     )
     trades = [_trade(line=1), _trade(line=2), _trade(line=3), _trade(line=4)]
 
-    summary = cli.persist_parsed_house_stub(Settings(), _stub(), parsed, trades)
+    summary = cli.persist_parsed_house_stub(Settings(), _stub(), parsed, trades, allow_partial=True)
 
-    # Rated clear publishes. Rated partial or illegible does not. An unrated
+    # Under the per-row override: rated clear publishes. Rated partial or
+    # illegible does not. An unrated
     # row is a transcription from before the reader recorded a rating, replayed
     # from the stub rather than read fresh, and it publishes.
     assert [row.source_id for row in exporter.upserts[0]] == [
@@ -235,6 +253,14 @@ def test_a_relabelled_transcription_is_still_treated_as_a_scan(exporter: _Calls)
 
     summary = cli.persist_parsed_house_stub(Settings(), _stub(), parsed, trades)
 
+    # Treated as a scan: the gate holds the whole filing. The text path would
+    # have published both rows.
+    assert exporter.upserts == []
+    assert summary["trades"]["withheld"] == 2
+    assert summary["filingGate"]["decision"] == "withheld"
+
+    # And under the override, per row, as a scan: the settled row only.
+    summary = cli.persist_parsed_house_stub(Settings(), _stub(), parsed, trades, allow_partial=True)
     assert summary["trades"]["withheld"] == 1
     assert [row.source_id for row in exporter.upserts[0]] == ["tr-house-8219444-1"]
 
@@ -245,17 +271,27 @@ def test_vision_result_that_parses_publishes(exporter: _Calls) -> None:
         parser_confidence=0.85,
         parser_version="claude-vision-v2",
         transactions=[_transaction()],
-        vision_report={"ok": True, "needsReview": False},
+        vision_report={
+            "ok": True,
+            "needsReview": False,
+            "rowsTranscribed": 1,
+            "rowsRecovered": 1,
+            "transcription": [_settled_row()],
+        },
     )
-    trades = [object()]
+    trades = [_trade(line=1)]
 
-    summary = cli.persist_parsed_house_stub(Settings(), _stub(), parsed, trades)  # type: ignore[arg-type]
+    summary = cli.persist_parsed_house_stub(Settings(), _stub(), parsed, trades)
 
     assert summary["stubStatus"] == "parsed"
+    assert summary["filingGate"]["decision"] == "published"
     assert exporter.upserts == [trades]
     assert summary["trades"]["upserted"] == 1
     assert exporter.marks[0]["extracted_trade_id"] == "tr-house-8219444-1"
-    assert "withheldTrades" not in exporter.marks[0]["metadata_extra"]["visionParse"]
+    vision = exporter.marks[0]["metadata_extra"]["visionParse"]
+    # The gate's decision is recorded whatever it was.
+    assert vision["withheldTrades"] == 0 and vision["publishedTrades"] == 1
+    assert vision["filingGate"]["decision"] == "published"
 
 
 def test_vision_result_with_unresolved_member_is_withheld(exporter: _Calls) -> None:

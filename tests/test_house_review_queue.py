@@ -168,7 +168,7 @@ def _run_review(monkeypatch: pytest.MonkeyPatch, row: dict[str, Any]) -> _StubSt
     monkeypatch.setattr(
         cli,
         "parse_live_house_stub",
-        lambda stub, settings, ocr, vision: (
+        lambda stub, settings, ocr, vision, **_kwargs: (
             HousePtrParseResult(doc_id=stub.doc_id, parser_confidence=0.0, parser_version="regex-v1"),
             [],
         ),
@@ -176,7 +176,7 @@ def _run_review(monkeypatch: pytest.MonkeyPatch, row: dict[str, Any]) -> _StubSt
     monkeypatch.setattr(
         cli,
         "persist_parsed_house_stub",
-        lambda settings, stub, parsed, trades: {"stubStatus": "needs_review", "trades": {"upserted": 0}},
+        lambda settings, stub, parsed, trades, **_kwargs: {"stubStatus": "needs_review", "trades": {"upserted": 0}},
     )
     summary = cli.process_house_queue_rows(
         Settings(), [row], ocr_backend="auto", vision_backend="off", review_mode=True
@@ -223,7 +223,7 @@ def test_the_ingest_path_keeps_its_fixed_retry(monkeypatch: pytest.MonkeyPatch) 
     monkeypatch.setattr(
         cli,
         "parse_live_house_stub",
-        lambda stub, settings, ocr, vision: (
+        lambda stub, settings, ocr, vision, **_kwargs: (
             HousePtrParseResult(doc_id=stub.doc_id, parser_confidence=0.0, parser_version="regex-v1"),
             [],
         ),
@@ -231,7 +231,7 @@ def test_the_ingest_path_keeps_its_fixed_retry(monkeypatch: pytest.MonkeyPatch) 
     monkeypatch.setattr(
         cli,
         "persist_parsed_house_stub",
-        lambda settings, stub, parsed, trades: {"stubStatus": "needs_review", "trades": {"upserted": 0}},
+        lambda settings, stub, parsed, trades, **_kwargs: {"stubStatus": "needs_review", "trades": {"upserted": 0}},
     )
     row = dict(_queue_row({"reviewOutcomeStreak": 5}), status="pending_extraction")
     cli.process_house_queue_rows(Settings(), [row], ocr_backend="auto", review_retry_hours=12)

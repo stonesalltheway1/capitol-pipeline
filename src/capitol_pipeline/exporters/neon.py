@@ -1356,11 +1356,15 @@ def fetch_house_stub_queue(
     only_needs_review: bool = False,
     doc_ids: list[str] | None = None,
     review_config: str | None = None,
+    min_year: int | None = None,
+    max_year: int | None = None,
 ) -> list[dict[str, object]]:
     """Load queued House filing stubs that are ready for extraction or retry.
 
     ``doc_ids`` narrows the queue to those filings (the status and retry
-    clauses still apply), for targeted re-runs.
+    clauses still apply), for targeted re-runs. ``min_year`` / ``max_year``
+    bound ``filing_year`` (inclusive), so the scheduled review can keep to the
+    current filing cycle while the historical backlog is run on its own.
 
     The review queue (``only_needs_review``) is served least recently
     attempted first. With ``review_config`` (the scheduled
@@ -1373,6 +1377,14 @@ def fetch_house_stub_queue(
     """
 
     doc_filter = "AND doc_id = ANY(%s)" if doc_ids else ""
+    year_filter = ""
+    year_params: list[object] = []
+    if min_year is not None:
+        year_filter += " AND filing_year >= %s"
+        year_params.append(int(min_year))
+    if max_year is not None:
+        year_filter += " AND filing_year <= %s"
+        year_params.append(int(max_year))
     params: list[object] = []
     order_clause = """
                     CASE
@@ -1446,10 +1458,11 @@ def fetch_house_stub_queue(
                         OR COALESCE(metadata->>'lastError', '') NOT ILIKE 'PTR PDF fetch failed with 404%%'
                   )
                   {doc_filter}
+                  {year_filter}
                 ORDER BY {order_clause}
                 LIMIT %s
                 """,
-                (*params, *([list(doc_ids)] if doc_ids else []), max(1, limit)),
+                (*params, *([list(doc_ids)] if doc_ids else []), *year_params, max(1, limit)),
             )
             return list(cursor.fetchall())
 

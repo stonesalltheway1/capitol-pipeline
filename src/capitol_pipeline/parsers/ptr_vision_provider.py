@@ -39,8 +39,19 @@ Gemini notes that cost real money to rediscover
   type unions, nullability is the ``nullable`` keyword.
   :func:`gemini_response_schema` translates ours.
 * **Free tier means a request-per-minute ceiling, not a spending one.** Every
-  call goes through a per-model pacer, and 429/503 back off and retry rather
-  than failing the filing.
+  call goes through a per-model pacer shared by the whole run, and a
+  per-minute 429 or a 5xx backs off (honouring ``retryDelay``) and retries.
+  A 429 that names a *daily* quota, or that will not clear after the
+  retries, stops the run: every later call would get the same answer.
+* **A 401/403 stops the run too.** On 2026-10-02 every call answered
+  ``403 Lightning dunning decision is deny`` (the Cloud billing account behind
+  the key was in arrears, which blocks the free tier as well). Retrying that
+  per filing only rewrote each stub's saved read with an error record.
+* **Every request is charged to a per-run call budget**
+  (:class:`CallBudget`, ``CAPITOL_PTR_VISION_CALL_BUDGET``). The CLI starts a
+  run with :data:`DEFAULT_VISION_CALL_BUDGET` unless told otherwise; a filing
+  that will not fit is skipped before its first call, and a run that spends
+  the budget stops cleanly with :class:`VisionRunStopped`.
 * Free-tier inputs may be used to improve Google's models. Everything sent
   here is a published federal disclosure, which is why that is acceptable;
   it is a stated decision, not an oversight.
@@ -65,6 +76,12 @@ DEFAULT_PROVIDER = "gemini"
 # -- Anthropic --------------------------------------------------------------
 
 ANTHROPIC_MODEL_ID = "claude-opus-5"
+#: Read B on the Anthropic path. A different model on purpose, as on Gemini:
+#: two samples of one model agree with themselves, and the reconciliation is
+#: only worth having when the two reads can disagree. Until 2026-10-02 this
+#: path read twice with the same model; the supervised audit run of that day
+#: had to patch read B to a second model by hand.
+ANTHROPIC_MODEL_B_ID = "claude-sonnet-5"
 ANTHROPIC_ORIENTATION_MODEL_ID = "claude-haiku-4-5"
 VISION_TOOL_NAME = "record_ptr_transactions"
 
@@ -105,11 +122,18 @@ GEMINI_RETIRED_MODELS: frozenset[str] = frozenset({"gemini-2.5-flash", "gemini-2
 #: number and it is visible only in AI Studio; 10 is the conservative figure
 #: the trackers report for free Flash. Override per run.
 DEFAULT_GEMINI_RPM = 10.0
-#: Attempts per request when the API answers 429 or 5xx.
-DEFAULT_GEMINI_MAX_ATTEMPTS = 4
+#: Attempts per request when the API answers a per-minute 429 or a 5xx.
+DEFAULT_GEMINI_MAX_ATTEMPTS = 5
 GEMINI_BACKOFF_BASE_SECONDS = 4.0
 GEMINI_BACKOFF_MAX_SECONDS = 90.0
 GEMINI_TIMEOUT_SECONDS = 300.0
+
+#: Model requests one CLI run may make, retries included, when neither
+#: ``--vision-call-budget`` nor ``CAPITOL_PTR_VISION_CALL_BUDGET`` says
+#: otherwise. Every page costs two (read A and read B), so this is a
+#: twenty-page filing, or a handful of one- and two-page forms, per run -- at
+#: four runs a day, 160 requests across two free-tier models.
+DEFAULT_VISION_CALL_BUDGET = 40
 
 #: Free of charge on the free tier, for every model this path uses.
 GEMINI_PRICING: tuple[float, float] = (0.0, 0.0)
@@ -210,6 +234,109 @@ def _status_code(error: Exception) -> int:
         return 0
 
 
+# -- The run: call budget and stop conditions --------------------------------
+
+
+class VisionRunStopped(RuntimeError):
+    """No further model call can succeed in this run.
+
+    ``kind`` is ``budget`` (the run's call budget is spent), ``quota`` (the
+    provider's daily quota, or a 429 that would not clear) or ``denied`` (the
+    key was refused: 401/403). It is never retried, and the caller stops
+    taking filings rather than failing each one the same way.
+    """
+
+    def __init__(self, reason: str, *, kind: str) -> None:
+        super().__init__(reason)
+        self.reason = reason
+        self.kind = kind
+
+
+class CallBudget:
+    """Model requests one run may make. ``limit`` None means no limit.
+
+    Every HTTP request is charged, including retries, because every one of
+    them counts against a free-tier quota. Once the run has been stopped --
+    the budget spent, the quota gone, the key refused -- every later charge
+    raises at once, so a run ends cleanly instead of failing each remaining
+    filing in turn.
+    """
+
+    def __init__(self, limit: int | None = None) -> None:
+        self.limit = None if limit is None else max(0, int(limit))
+        self.used = 0
+        self.stopped: VisionRunStopped | None = None
+
+    def remaining(self) -> int | None:
+        return None if self.limit is None else max(0, self.limit - self.used)
+
+    def can_afford(self, calls: int) -> bool:
+        if self.stopped is not None:
+            return False
+        remaining = self.remaining()
+        return remaining is None or calls <= remaining
+
+    def charge(self, label: str = "") -> None:
+        if self.stopped is not None:
+            raise self.stopped
+        if self.limit is not None and self.used >= self.limit:
+            self.stop(
+                VisionRunStopped(f"vision call budget of {self.limit} spent", kind="budget")
+            )
+            raise self.stopped  # type: ignore[misc]
+        self.used += 1
+
+    def stop(self, error: VisionRunStopped) -> None:
+        if self.stopped is None:
+            self.stopped = error
+
+    def summary(self) -> dict[str, Any]:
+        return {
+            "limit": self.limit,
+            "used": self.used,
+            "remaining": self.remaining(),
+            "stopped": None
+            if self.stopped is None
+            else {"kind": self.stopped.kind, "reason": self.stopped.reason},
+        }
+
+
+_RUN_BUDGET = CallBudget(None)
+
+
+def start_run(limit: int | None) -> CallBudget:
+    """Begin a run with a fresh call budget (and a fresh pacer)."""
+
+    global _RUN_BUDGET, _SHARED_LIMITERS
+    _RUN_BUDGET = CallBudget(limit)
+    _SHARED_LIMITERS = {}
+    return _RUN_BUDGET
+
+
+def run_budget() -> CallBudget:
+    """The current run's budget. Unlimited until a caller starts a run."""
+
+    return _RUN_BUDGET
+
+
+def resolve_call_budget(value: int | None = None) -> int | None:
+    """The call budget a CLI run uses: the flag, else the env, else the default.
+
+    A negative value means no limit, for a supervised run that has its own.
+    """
+
+    if value is None:
+        raw = _env("CAPITOL_PTR_VISION_CALL_BUDGET")
+        if raw:
+            try:
+                value = int(float(raw))
+            except ValueError:
+                logger.warning("ptr_vision_provider: ignoring non-numeric CAPITOL_PTR_VISION_CALL_BUDGET=%r", raw)
+    if value is None:
+        return DEFAULT_VISION_CALL_BUDGET
+    return None if value < 0 else int(value)
+
+
 # -- Anthropic provider -----------------------------------------------------
 
 
@@ -221,10 +348,41 @@ class AnthropicProvider:
     def __init__(self, client_factory: Any) -> None:
         self._client_factory = client_factory
         self.read_model = _env("CAPITOL_PTR_VISION_MODEL") or ANTHROPIC_MODEL_ID
-        self.read_model_b = self.read_model
+        self.read_model_b = _env("CAPITOL_PTR_VISION_MODEL_B") or ANTHROPIC_MODEL_B_ID
+        if self.read_model_b == self.read_model:
+            logger.warning(
+                "ptr_vision_provider: read A and read B are both %s; two reads by one model "
+                "are not two independent reads",
+                self.read_model,
+            )
         self.orientation_model = (
             _env("CAPITOL_PTR_VISION_ORIENTATION_MODEL") or ANTHROPIC_ORIENTATION_MODEL_ID
         )
+
+    @staticmethod
+    def _stop_for(error: Exception) -> VisionRunStopped | None:
+        """A refusal no retry and no later filing can get past."""
+
+        status = _status_code(error)
+        text = str(error).lower()
+        if status in (401, 403) or type(error).__name__ in {"AuthenticationError", "PermissionDeniedError"}:
+            return VisionRunStopped(f"anthropic refused the key ({status or type(error).__name__}): {error}", kind="denied")
+        if status == 400 and "credit balance" in text:
+            return VisionRunStopped(f"anthropic account has no credit: {error}", kind="denied")
+        return None
+
+    def _charged(self, call: Any) -> Any:
+        run_budget().charge(self.name)
+        try:
+            return call()
+        except VisionRunStopped:
+            raise
+        except Exception as error:  # noqa: BLE001 - classified, then re-raised
+            stop = self._stop_for(error)
+            if stop is not None:
+                run_budget().stop(stop)
+                raise stop from error
+            raise
 
     # -- content ---------------------------------------------------------
 
@@ -331,18 +489,20 @@ class AnthropicProvider:
             structured=structured,
             with_output_config=with_output_config,
         )
-        message = self._invoke(kwargs)
+        message = self._charged(lambda: self._invoke(kwargs))
         return self._response(message, model)
 
     def ask_short(
         self, parts: list[dict[str, Any]], *, model: str, system: str, max_tokens: int
     ) -> VisionResponse:
         client = self._client_factory()
-        message = client.messages.create(
-            model=model,
-            max_tokens=max_tokens,
-            system=system,
-            messages=[{"role": "user", "content": self.content(parts)}],
+        message = self._charged(
+            lambda: client.messages.create(
+                model=model,
+                max_tokens=max_tokens,
+                system=system,
+                messages=[{"role": "user", "content": self.content(parts)}],
+            )
         )
         return self._response(message, model)
 
@@ -480,6 +640,51 @@ class _RateLimiter:
         return delay
 
 
+#: One pacer per rpm setting for the whole run: a provider is built per
+#: filing, and a pacer that started fresh with each filing let the first two
+#: calls of every filing go out back to back.
+_SHARED_LIMITERS: dict[float, _RateLimiter] = {}
+
+
+def _shared_limiter(rpm: float) -> _RateLimiter:
+    limiter = _SHARED_LIMITERS.get(rpm)
+    if limiter is None:
+        limiter = _SHARED_LIMITERS[rpm] = _RateLimiter(rpm)
+    return limiter
+
+
+#: Words in a 429 that mean the day's quota, not the minute's.
+_DAILY_QUOTA_MARKERS: tuple[str, ...] = ("perday", "per day", "requestsperday", "daily")
+
+
+def gemini_quota_kind(body: Any, detail: str) -> str:
+    """``daily`` when a 429 names a per-day quota (or a zero free-tier limit), else ``minute``.
+
+    Google says which quota in the error's ``QuotaFailure`` details
+    (``quotaId: GenerateRequestsPerDayPerProjectPerModel-FreeTier``) and in the
+    message ("... limit: 250, model: ..."). A per-minute 429 clears after its
+    ``retryDelay``; a per-day one does not clear today, and a free-tier limit
+    of 0 never will.
+    """
+
+    texts = [str(detail or "")]
+    error = body.get("error") if isinstance(body, dict) else None
+    for entry in (error or {}).get("details") or []:
+        if not isinstance(entry, dict):
+            continue
+        for violation in entry.get("violations") or []:
+            if isinstance(violation, dict):
+                texts.append(str(violation.get("quotaId") or ""))
+                texts.append(str(violation.get("quotaMetric") or ""))
+                texts.append(str(violation.get("description") or ""))
+    joined = " ".join(texts).lower()
+    if any(marker in joined.replace("_", "") for marker in _DAILY_QUOTA_MARKERS):
+        return "daily"
+    if "limit: 0" in joined:
+        return "daily"
+    return "minute"
+
+
 def gemini_response_schema(schema: Any) -> Any:
     """Translate a JSON Schema into the subset ``responseSchema`` accepts.
 
@@ -568,12 +773,12 @@ class GeminiProvider:
                 logger.warning(
                     "ptr_vision_provider: %s is retired for new API keys and will 404", model
                 )
-        resolved_rpm = (
-            rpm
-            if rpm is not None
-            else _env_float("CAPITOL_PTR_VISION_GEMINI_RPM", DEFAULT_GEMINI_RPM, low=0.0, high=600.0)
-        )
-        self.limiter = _RateLimiter(resolved_rpm)
+        if rpm is not None:
+            self.limiter = _RateLimiter(rpm)
+        else:
+            self.limiter = _shared_limiter(
+                _env_float("CAPITOL_PTR_VISION_GEMINI_RPM", DEFAULT_GEMINI_RPM, low=0.0, high=600.0)
+            )
         self.max_attempts = int(
             _env_float(
                 "CAPITOL_PTR_VISION_GEMINI_MAX_ATTEMPTS",
@@ -646,14 +851,22 @@ class GeminiProvider:
         }
 
     def _post(self, model: str, body: dict[str, Any], *, sleep: Any = time.sleep) -> dict[str, Any]:
-        """POST one request, pacing before it and backing off on 429/5xx."""
+        """POST one request, pacing before it and backing off on 429/5xx.
+
+        Every attempt is charged to the run's :class:`CallBudget`. A per-minute
+        429 or a 5xx waits (``retryDelay`` when Google gives one) and retries.
+        A 401/403, a 429 that names a daily quota, and a 429 still there after
+        the last attempt raise :class:`VisionRunStopped`, which ends the run.
+        """
 
         import httpx
 
         url = GEMINI_ENDPOINT.format(model=model)
         headers = {"x-goog-api-key": self._api_key, "Content-Type": "application/json"}
         last: Exception | None = None
+        budget = run_budget()
         for attempt in range(1, self.max_attempts + 1):
+            budget.charge(model)
             self.limiter.wait(model, sleep=sleep)
             try:
                 response = httpx.post(
@@ -670,6 +883,30 @@ class GeminiProvider:
             detail = self._error_message(response)
             error = GeminiError(response.status_code, detail)
             last = error
+            if response.status_code in (401, 403):
+                stop = VisionRunStopped(
+                    f"{model} refused the key ({response.status_code}): {detail[:300]}", kind="denied"
+                )
+                budget.stop(stop)
+                raise stop from error
+            if response.status_code == 429:
+                try:
+                    payload = response.json()
+                except Exception:  # noqa: BLE001 - non-JSON error body
+                    payload = None
+                if gemini_quota_kind(payload, detail) == "daily":
+                    stop = VisionRunStopped(
+                        f"{model} daily quota exhausted (429): {detail[:300]}", kind="quota"
+                    )
+                    budget.stop(stop)
+                    raise stop from error
+                if attempt >= self.max_attempts:
+                    stop = VisionRunStopped(
+                        f"{model} still rate-limited after {attempt} attempts (429): {detail[:300]}",
+                        kind="quota",
+                    )
+                    budget.stop(stop)
+                    raise stop from error
             if attempt >= self.max_attempts or not self.is_retryable(error):
                 break
             delay = self._backoff_seconds(attempt, self._retry_after(response, detail))

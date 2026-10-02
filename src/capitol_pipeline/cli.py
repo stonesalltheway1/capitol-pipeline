@@ -131,22 +131,30 @@ from capitol_pipeline.normalizers.crypto_assets import classify_crypto_asset
 from capitol_pipeline.parsers.house_ptr import (
     REPLAY_PARSER_VERSION,
     VISION_BACKENDS,
+    VISION_FORCE_BACKENDS,
     build_trade_rows_from_house_ptr,
     clean_asset_description,
     cleaning_gutted_description,
     get_transaction_date_issue,
     parse_house_ptr_pdf,
+    probe_text_layer,
     strip_form_annotation,
 )
 from capitol_pipeline.parsers.ptr_vision import (
     MAX_ROW_SUMMARIES_IN_METADATA,
+    calls_needed,
     detector_review_reasons,
     is_vision_parser_version,
     reconcile_stored_transcription,
+    resolve_chunk_pages,
+    resolve_orientation_mode,
     row_summary,
+    saved_read_is_current,
     stored_transcription,
     transcription_from_metadata,
 )
+from capitol_pipeline.parsers import ptr_vision_provider
+from capitol_pipeline.parsers.ptr_grid import DETECTOR_VERSION
 from capitol_pipeline.processors.chunking import build_search_chunks
 from capitol_pipeline.processors.embeddings import get_embedder
 from capitol_pipeline.processors.headshots import (
@@ -320,6 +328,53 @@ VISION_BACKEND_HELP = (
 )
 
 
+def parse_filing_year_bound(value: str | None, *, today: date | None = None) -> int | None:
+    """``2025``, ``current`` or ``current-1`` as a filing year; None passes through.
+
+    The relative form exists for the scheduled run, whose unit file has no
+    shell to compute "this year minus one" with.
+    """
+
+    if value is None or str(value).strip() == "":
+        return None
+    text = str(value).strip().lower().replace(" ", "")
+    year = (today or date.today()).year
+    if text == "current":
+        return year
+    if text.startswith("current-") and text[len("current-"):].isdigit():
+        return year - int(text[len("current-"):])
+    if text.lstrip("-").isdigit():
+        return int(text)
+    raise click.BadParameter(f"expected a year, 'current' or 'current-N', not {value!r}")
+
+
+def begin_vision_run(vision_call_budget: int | None) -> ptr_vision_provider.CallBudget:
+    """Start this command's vision call budget (flag, else env, else the default)."""
+
+    budget = ptr_vision_provider.start_run(ptr_vision_provider.resolve_call_budget(vision_call_budget))
+    logger.info(
+        "vision call budget for this run: %s",
+        "unlimited" if budget.limit is None else budget.limit,
+    )
+    return budget
+
+
+VISION_CALL_BUDGET_HELP = (
+    "Model requests this run may make, retries included (every page is two). "
+    "A filing that will not fit what is left is skipped untouched; a run that "
+    "spends it, or meets a daily quota or a refused key, stops and reports what "
+    "it skipped. Default: CAPITOL_PTR_VISION_CALL_BUDGET, else "
+    f"{ptr_vision_provider.DEFAULT_VISION_CALL_BUDGET}. Negative means no limit."
+)
+
+PUBLISH_PARTIAL_HELP = (
+    "Override the per-filing gate: publish the rows of a scanned filing that "
+    "are settled one by one even when other rows of the same filing are "
+    "disputed. Off by default; a disputed filing is withheld whole and its "
+    "reads stay on the stub."
+)
+
+
 def build_review_retry_after_iso(hours: int) -> str:
     """Return the next review retry time for a hard-to-parse House PTR."""
 
@@ -398,9 +453,19 @@ def parse_live_house_stub(
     settings: Settings,
     ocr_backend: str,
     vision_backend: str = "off",
+    *,
+    pdf_path: Path | None = None,
 ) -> tuple[HousePtrParseResult, list[NormalizedTradeRow]]:
-    """Download and parse a live House PTR filing."""
+    """Download and parse a live House PTR filing (``pdf_path``: already downloaded)."""
 
+    if pdf_path is not None:
+        return parse_house_ptr_pdf(
+            pdf_path,
+            stub=stub,
+            settings=settings,
+            backend=ocr_backend,
+            vision_backend=vision_backend,
+        )
     with TemporaryDirectory(prefix="capitol-ptr-") as temp_dir:
         pdf_path = Path(temp_dir) / f"{stub.doc_id}.pdf"
         download_house_pdf(stub, settings, pdf_path)
@@ -469,12 +534,49 @@ def house_stub_last_error(parsed: HousePtrParseResult) -> str | None:
     return HOUSE_REVIEW_LAST_ERROR
 
 
+def is_good_vision_read(vision: object) -> bool:
+    """Whether a vision report is a read worth keeping as the stub's ``visionParse``.
+
+    A completed read is, whether it found rows or found the form states there
+    is nothing to report. A skipped, refused, budget-blocked or failed attempt
+    is not, and neither is one that came back with no rows and no such
+    statement.
+    """
+
+    return isinstance(vision, dict) and bool(vision.get("ok")) and not vision.get("skipped")
+
+
+def vision_failure_record(vision: dict[str, object]) -> dict[str, object]:
+    """The compact record of a vision attempt that produced no usable read."""
+
+    keys = (
+        "at", "provider", "model", "modelB", "reason", "skipped", "stopRun", "budgetSkipped",
+        "callsNeeded", "stopReason", "attempts", "pdfSha256", "pageCount", "costUsd",
+        "visionVersion", "detectorVersion",
+    )
+    record = {key: vision.get(key) for key in keys if key in vision}
+    record.setdefault("at", now_iso())
+    record["calls"] = len(vision.get("calls") or [])  # type: ignore[arg-type]
+    return record
+
+
 def build_house_stub_metadata_extra(parsed: HousePtrParseResult) -> dict[str, object] | None:
-    """Vision and text-layer reports to merge into the stub metadata."""
+    """Vision and text-layer reports to merge into the stub metadata.
+
+    Only a good read becomes ``visionParse``. A failed attempt -- a 403, a
+    429, a budget skip, a read that returned nothing -- goes to
+    ``visionLastFailure`` and the last good read stays where it was. Until
+    2026-10-02 the failure replaced it: every attempt while the Gemini key was
+    blocked rewrote a stub's saved transcription with an error record.
+    """
 
     extra: dict[str, object] = {}
     if parsed.vision_report:
-        extra["visionParse"] = parsed.vision_report
+        if is_good_vision_read(parsed.vision_report):
+            extra["visionParse"] = parsed.vision_report
+            extra["visionLastFailure"] = None
+        else:
+            extra["visionLastFailure"] = vision_failure_record(parsed.vision_report)
     if parsed.text_layer:
         extra["textLayer"] = parsed.text_layer
     return extra or None
@@ -547,7 +649,13 @@ def split_scanned_trades(
     }
 
     def rating_for(trade: NormalizedTradeRow) -> str | None:
-        line = str(trade.source_id or "").rsplit("-", 1)[-1]
+        # build_trade_rows_from_house_ptr writes "<doc>:<line>"; the trade id
+        # it becomes is "tr-house-<doc>-<line>". Until 2026-10-02 only the
+        # second form was parsed here, so on every real row the rating came
+        # back None -- which publishes -- and the clear-only rule of b62d291
+        # never applied to a row built by the pipeline itself.
+        text = str(trade.source_id or "")
+        line = text.rpartition(":")[2] if ":" in text else text.rsplit("-", 1)[-1]
         return ratings.get(int(line)) if line.isdigit() else None
 
     publishable: list[NormalizedTradeRow] = []
@@ -567,11 +675,132 @@ def split_scanned_trades(
     return publishable, withheld
 
 
+#: Detector verdicts on a row that put the filing in front of a person.
+GATE_DETECTOR_STATUSES = frozenset({"disagree", "ambiguous", "unaligned", "no-ticks"})
+
+
+def scanned_filing_gate(
+    stub: FilingStub,
+    parsed: HousePtrParseResult,
+    trades: list[NormalizedTradeRow],
+    withheld: list[tuple[NormalizedTradeRow, str]],
+    line_report: dict[str, object] | None = None,
+) -> list[str]:
+    """Why a filing read off page images may not publish, or ``[]`` when it may.
+
+    The filing is the unit. Any row the reads disputed, the reader could not
+    rate clear, or the checkbox detector contradicted, could not settle or
+    could not align holds back every row of the filing; the reads stay on the
+    stub for a person. ``split_scanned_trades`` (per row) is what an explicit
+    override publishes instead.
+
+    Why the filing and not the row, after 67d2b5c chose the row: a filing is
+    one form read in one pass, and a disagreement anywhere on it is evidence
+    about the pass. On 9116218 the detector borrowed the printed example's x
+    for a row nobody ticked and the filing was rated clean; on 9116217,
+    9116257 and 9116326 one shifted band moved a tick onto every row below it.
+    The rows the reads agreed on in those filings were exactly the rows a
+    shifted alignment had "confirmed". A person looks at the whole form or it
+    does not go out.
+    """
+
+    vision = parsed.vision_report if isinstance(parsed.vision_report, dict) else {}
+    reasons: list[str] = []
+    if not stub.member.id:
+        reasons.append("member unresolved")
+    if not is_good_vision_read(vision):
+        reasons.append("no usable read")
+    if vision.get("needsReview"):
+        reasons.extend(str(reason) for reason in (vision.get("needsReviewReasons") or []))
+        if not vision.get("needsReviewReasons"):
+            reasons.append("the read is marked for review")
+    dropped = int(vision.get("rowsDroppedForType") or 0)
+    if dropped:
+        reasons.append(f"{dropped} row(s) dropped: the reads disagreed on the transaction type")
+    transcribed = int(vision.get("rowsTranscribed") or 0)
+    recovered = int(vision.get("rowsRecovered") or 0)
+    if transcribed and recovered < transcribed:
+        reasons.append(f"{transcribed - recovered} transcribed row(s) failed date validation")
+    unrated = sum(1 for row in parsed.transactions if row.legibility is None)
+    if unrated:
+        reasons.append(f"{unrated} row(s) carry no legibility rating")
+    counts: dict[str, int] = {}
+    for _trade, reason in withheld:
+        counts[reason] = counts.get(reason, 0) + 1
+    for reason, count in sorted(counts.items()):
+        reasons.append(f"{count} row(s): {reason}")
+    statuses: dict[str, int] = {}
+    for row in vision.get("transcription") or []:
+        if not isinstance(row, dict):
+            continue
+        for key in ("detectorStatus", "detectorTypeStatus"):
+            status = str(row.get(key) or "")
+            if status in GATE_DETECTOR_STATUSES:
+                label = "type " + status if key == "detectorTypeStatus" else status
+                statuses[label] = statuses.get(label, 0) + 1
+    for label, count in sorted(statuses.items()):
+        reasons.append(f"checkbox detector: {count} row(s) {label}")
+    if vision and vision.get("transcription") is None and parsed.transactions:
+        reasons.append("the read kept no transcription to check against")
+    held = (line_report or {}).get("withheld") or []
+    if held:
+        reasons.append(f"{len(held)} row(s) match trade ids withdrawn or published elsewhere")
+    if not trades:
+        reasons.append("no rows to publish")
+    unique: list[str] = []
+    for reason in reasons:
+        if reason not in unique:
+            unique.append(reason)
+    return unique
+
+
+def _renumber_transcription(
+    vision: dict[str, object] | None,
+    numbers: dict[int, int],
+) -> None:
+    """Carry a renumbering onto ``visionParse.transcription``.
+
+    ``line_number`` there is the key ``reconcile-house-vision`` uses to find a
+    row's published copy, so it must name the same line as the published row.
+    """
+
+    if not isinstance(vision, dict) or not numbers:
+        return
+    rows = vision.get("transcription")
+    if not isinstance(rows, list):
+        return
+    for row in rows:
+        if not isinstance(row, dict):
+            continue
+        try:
+            line = int(row.get("line_number"))  # type: ignore[arg-type]
+        except (TypeError, ValueError):
+            continue
+        if line in numbers:
+            row["line_number"] = numbers[line]
+
+
+def _source_changed(stub: FilingStub, parsed: HousePtrParseResult) -> bool:
+    """Whether the PDF differs from the one the stub's last good read was made of.
+
+    Only then may a row whose id was withdrawn come back: the Clerk replaced
+    the document, and what it says now is new evidence. Unknown is unchanged.
+    """
+
+    prior = (stub.prior_vision or {}).get("visionParse") if isinstance(stub.prior_vision, dict) else None
+    before = str((prior or {}).get("pdfSha256") or "") if isinstance(prior, dict) else ""
+    vision = parsed.vision_report if isinstance(parsed.vision_report, dict) else {}
+    now = str(vision.get("pdfSha256") or "")
+    return bool(before and now and before != now)
+
+
 def stabilize_house_line_ids(
     settings: Settings,
     stub: FilingStub,
     parsed: HousePtrParseResult,
     trades: list[NormalizedTradeRow],
+    *,
+    source_changed: bool = False,
 ) -> tuple[HousePtrParseResult, list[NormalizedTradeRow], dict[str, object] | None]:
     """Keep the trade ids a filing already has when it is read again.
 
@@ -597,13 +826,20 @@ def stabilize_house_line_ids(
         return parsed, trades, None
     assignment = assign_line_numbers(parsed.transactions, references)
     parsed, trades = apply_line_numbers(parsed, trades, assignment.numbers)
+    _renumber_transcription(
+        parsed.vision_report if isinstance(parsed.vision_report, dict) else None,
+        {old: new for old, new in assignment.numbers.items() if old != new},
+    )
     parsed, trades, withheld = withhold_rows(
         parsed, trades, references,
         doc_id=stub.doc_id, filing_date=stub.filing_date, standins=standins,
+        source_changed=source_changed,
     )
     report: dict[str, object] = assignment.summary()
     if withheld:
         report["withheld"] = withheld
+    if source_changed:
+        report["sourceChanged"] = True
     return parsed, trades, report
 
 
@@ -648,38 +884,155 @@ def reconcile_house_amendments(
     return plan.rows, {**plan.summary(), "applied": applied}
 
 
+class HousePublishPlan:
+    """What persisting a parsed House filing would do, decided without writing.
+
+    ``publish`` is the rows that would be upserted, ``withheld`` the rows held
+    back and why, ``gate`` the per-filing decision for a scanned read (None
+    for the text path), ``line_report`` how the rows were matched to the ids
+    the filing already uses. ``parsed`` and ``trades`` are renumbered.
+    """
+
+    def __init__(
+        self,
+        *,
+        stub_status: str,
+        parsed: HousePtrParseResult,
+        trades: list[NormalizedTradeRow],
+        publish: list[NormalizedTradeRow],
+        withheld: list[tuple[NormalizedTradeRow, str]],
+        scanned: bool,
+        line_report: dict[str, object] | None,
+        gate: dict[str, object] | None,
+    ) -> None:
+        self.stub_status = stub_status
+        self.parsed = parsed
+        self.trades = trades
+        self.publish = publish
+        self.withheld = withheld
+        self.scanned = scanned
+        self.line_report = line_report
+        self.gate = gate
+
+    def summary(self) -> dict[str, object]:
+        reasons: dict[str, int] = {}
+        for _trade, reason in self.withheld:
+            reasons[reason] = reasons.get(reason, 0) + 1
+        return {
+            "stubStatus": self.stub_status,
+            "scanned": self.scanned,
+            "publish": [trade.source_id for trade in self.publish],
+            "withheld": len(self.withheld),
+            "withheldReasons": reasons,
+            "gate": self.gate,
+            "lineIds": self.line_report,
+        }
+
+
+def plan_house_publication(
+    settings: Settings,
+    stub: FilingStub,
+    parsed: HousePtrParseResult,
+    trades: list[NormalizedTradeRow],
+    *,
+    allow_partial: bool = False,
+) -> HousePublishPlan:
+    """Decide what a parsed House filing publishes. Reads the database, writes nothing.
+
+    A filing read off page images is matched to the ids it already uses
+    (``house_line_ids``, as typed filings are), so a re-read never mints a
+    second id for a row that is live, never resurrects an id the trade change
+    log withdrew unless the PDF itself changed, and keeps a held row held.
+    Then the filing is gated as a whole (:func:`scanned_filing_gate`): any row
+    disputed, unrated-clear or detector-conflicting withholds every row, and
+    the reads stay on the stub. ``allow_partial`` is the explicit override: it
+    publishes the rows :func:`split_scanned_trades` settles, one by one, as
+    the path did from 67d2b5c to 2026-10-02. The text path is unchanged.
+    """
+
+    status = resolve_house_stub_status(stub, parsed, trades)
+    scanned = is_scanned_read(parsed)
+    line_report: dict[str, object] | None = None
+    if not scanned or not trades:
+        # A filing read before keeps its trade ids, so this runs before the
+        # amendment step (which deletes tr-house-<doc>-<line> by number) and
+        # before the transcription is stored (it is what the next run matches).
+        if not scanned:
+            parsed, trades, line_report = stabilize_house_line_ids(settings, stub, parsed, trades)
+        return HousePublishPlan(
+            stub_status=status, parsed=parsed, trades=trades, publish=list(trades),
+            withheld=[], scanned=scanned, line_report=line_report, gate=None,
+        )
+
+    parsed, trades, line_report = stabilize_house_line_ids(
+        settings, stub, parsed, trades, source_changed=_source_changed(stub, parsed)
+    )
+    publishable, withheld = split_scanned_trades(parsed, trades)
+    reasons = scanned_filing_gate(stub, parsed, trades, withheld, line_report)
+    if not reasons:
+        decision = "published"
+        publish, held = list(trades), []
+    elif allow_partial:
+        decision = "published-partial"
+        publish, held = publishable, withheld
+    else:
+        decision = "withheld"
+        publish = []
+        held = [(trade, f"filing withheld: {reasons[0]}") for trade in trades]
+    if held or reasons:
+        status = "needs_review"
+    gate = {
+        "decision": decision,
+        "reasons": reasons,
+        "override": bool(allow_partial),
+        "rows": len(trades),
+        "publish": len(publish),
+        "at": now_iso(),
+    }
+    return HousePublishPlan(
+        stub_status=status, parsed=parsed, trades=trades, publish=publish,
+        withheld=held, scanned=True, line_report=line_report, gate=gate,
+    )
+
+
 def persist_parsed_house_stub(
     settings: Settings,
     stub: FilingStub,
     parsed: HousePtrParseResult,
     trades: list[NormalizedTradeRow],
+    *,
+    allow_partial: bool = False,
 ) -> dict[str, object]:
     """Write a parsed House PTR result back into CapitolExposed.
 
-    A filing read off page images publishes row by row while it is
-    ``needs_review``: a row two reads and the checkbox detector agree on goes
-    to ``trades``, and a row missing a date, a type or an amount band stays in
-    the stub metadata (``parsedTransactions`` and ``visionParse``). The counts
-    are recorded on the stub so the site can say what is being held back. The
+    What is written is :func:`plan_house_publication`'s decision. A filing
+    read off page images publishes whole or not at all (``allow_partial``
+    overrides, row by row); what it holds back stays in the stub metadata
+    (``parsedTransactions`` and ``visionParse``) with the counts and the gate
+    decision, so the site can say what is held and a person can see why. The
     text path is unchanged.
     """
 
     sync_house_stubs_to_neon(settings, [stub])
-    status = resolve_house_stub_status(stub, parsed, trades)
+    plan = plan_house_publication(settings, stub, parsed, trades, allow_partial=allow_partial)
+    parsed, trades, status = plan.parsed, plan.trades, plan.stub_status
     amendment_report: dict[str, object] | None = None
-    line_report: dict[str, object] | None = None
-    scanned_under_review = bool(trades) and is_scanned_read(parsed) and status != "parsed"
-    if scanned_under_review:
-        publishable, withheld = split_scanned_trades(parsed, trades)
+    line_report = plan.line_report
+    if plan.scanned and plan.gate is not None:
+        publish = plan.publish
+        if publish:
+            # An amended or deleted row is not a new trade, read off a scan
+            # or not.
+            publish, amendment_report = reconcile_house_amendments(settings, stub, publish)
         trade_summary = (
-            upsert_trade_rows_to_neon(settings, publishable)
-            if publishable
+            upsert_trade_rows_to_neon(settings, publish)
+            if publish
             else {"upserted": 0, "trade_ids": []}
         )
-        trade_summary["withheld"] = len(withheld)
+        trade_summary["withheld"] = len(plan.withheld)
         if isinstance(parsed.vision_report, dict):
             reasons: dict[str, int] = {}
-            for _trade, reason in withheld:
+            for _trade, reason in plan.withheld:
                 reasons[reason] = reasons.get(reason, 0) + 1
             # Rows the reads disagreed on the type of never reach trade
             # building at all (rowsDroppedForType, set by the vision parser),
@@ -687,16 +1040,12 @@ def persist_parsed_house_stub(
             dropped_for_type = int(parsed.vision_report.get("rowsDroppedForType") or 0)
             if dropped_for_type:
                 reasons["reads disagree on transaction type"] = dropped_for_type
-            parsed.vision_report["withheldTrades"] = len(withheld)
-            parsed.vision_report["publishedTrades"] = len(publishable)
-            parsed.vision_report["rowsWithheldTotal"] = len(withheld) + dropped_for_type
+            parsed.vision_report["withheldTrades"] = len(plan.withheld)
+            parsed.vision_report["publishedTrades"] = len(plan.publish)
+            parsed.vision_report["rowsWithheldTotal"] = len(plan.withheld) + dropped_for_type
             parsed.vision_report["withheldReasons"] = reasons
+            parsed.vision_report["filingGate"] = plan.gate
     else:
-        # A filing read before keeps its trade ids, so this runs before the
-        # amendment step (which deletes tr-house-<doc>-<line> by number) and
-        # before the transcription is stored (it is what the next run matches).
-        if not is_scanned_read(parsed):
-            parsed, trades, line_report = stabilize_house_line_ids(settings, stub, parsed, trades)
         # An amended or deleted row is not a new trade. The stub status above
         # was decided on every row the filing carries, as before.
         trades, amendment_report = reconcile_house_amendments(settings, stub, trades)
@@ -724,6 +1073,7 @@ def persist_parsed_house_stub(
         "trades": trade_summary,
         "stubStatus": status,
         "visionParse": parsed.vision_report,
+        "filingGate": plan.gate,
     }
 
 
@@ -790,6 +1140,17 @@ def rebuild_parsed_house_stub(
     stored = metadata.get("parsedTransactions")
     if not isinstance(stored, list) or not stored:
         return stub, None, [], "no stored transcription"
+
+    # Rows read off page images are replayed only from a read today's reader
+    # and detector would stand behind. The saved reads of 8221322, 8221358 and
+    # 8221360 still hold the misread rows migrations 042/043 took out of
+    # trades, and the Khanna reads of 9115726, 9115822, 9116142 and 9116206
+    # predate the Type-column check; replaying them republishes both.
+    saved_vision = metadata.get("visionParse")
+    if is_good_vision_read(saved_vision):
+        current, why_not = saved_read_is_current(saved_vision)
+        if not current:
+            return stub, None, [], f"stale vision read: {why_not}; read the filing again"
 
     transactions: list[HousePtrTransaction] = []
     for entry in stored:
@@ -866,6 +1227,7 @@ def repersist_house_stub_rows(
     registry: MemberRegistry | None = None,
     min_confidence: float = 0.0,
     dry_run: bool = False,
+    allow_partial: bool = False,
 ) -> dict[str, object]:
     """Publish stored transcriptions for a batch of stubs. No model, no PDF."""
 
@@ -917,14 +1279,17 @@ def repersist_house_stub_rows(
             "rowsDropped": max(0, dropped),
         }
         if dry_run:
-            entry["status"] = "would publish"
-            entry["stubStatus"] = resolve_house_stub_status(stub, parsed, trades)
-            summary["published"] = int(summary["published"]) + 1
-            summary["tradeRowsUpserted"] = int(summary["tradeRowsUpserted"]) + len(trades)
+            # The same decision a real run makes, read-only.
+            plan = plan_house_publication(settings, stub, parsed, trades, allow_partial=allow_partial)
+            entry["status"] = "would publish" if plan.publish else "would withhold"
+            entry["stubStatus"] = plan.stub_status
+            entry["filingGate"] = plan.gate
+            summary["published"] = int(summary["published"]) + (1 if plan.publish else 0)
+            summary["tradeRowsUpserted"] = int(summary["tradeRowsUpserted"]) + len(plan.publish)
             summary["stubs"].append(entry)  # type: ignore[union-attr]
             continue
         try:
-            result = persist_parsed_house_stub(settings, stub, parsed, trades)
+            result = persist_parsed_house_stub(settings, stub, parsed, trades, allow_partial=allow_partial)
         except Exception as error:  # pragma: no cover - depends on the live database
             logger.exception("repersist: %s failed: %s", doc_id, error)
             summary["failed"] = int(summary["failed"]) + 1
@@ -1047,6 +1412,126 @@ def index_search_document_with_retry(
     raise RuntimeError("Search indexing retry failed without a captured error.")
 
 
+#: Keys a review attempt stamps on a stub before it reads it; put back as they
+#: were when the run turns out not to be able to read the filing after all.
+_ATTEMPT_KEYS: tuple[str, ...] = (
+    "extractionStartedAt",
+    "extractionAttempts",
+    "retryAfter",
+    "reviewLastAttemptAt",
+    "reviewLastBackend",
+    "reviewLastConfig",
+    "reviewAttempts",
+)
+
+
+def vision_calls_needed_for_pdf(pdf_path: Path, vision_backend: str) -> int:
+    """Model calls reading this PDF will take, when it is certain to need them.
+
+    An image-only scan always goes to the vision path; on ``on`` every filing
+    does. A typed PDF on ``auto`` only reaches it when the text parse is weak,
+    which cannot be known before parsing, so it is counted as 0 here and the
+    reader's own pre-flight check (``extract_via_vision``) covers it.
+    """
+
+    mode = str(vision_backend or "off").strip().lower()
+    if mode == "off":
+        return 0
+    probe = probe_text_layer(pdf_path)
+    if probe is None:
+        return 0
+    if probe.has_text_layer and mode not in VISION_FORCE_BACKENDS:
+        return 0
+    return calls_needed(
+        int(probe.page_count or 0),
+        chunk_pages=resolve_chunk_pages(),
+        orientation_mode=resolve_orientation_mode(),
+    )
+
+
+def _vision_run_blocked(vision_report: dict[str, object] | None) -> dict[str, object] | None:
+    """Why a parse's vision attempt never ran, when that is the run's doing."""
+
+    if not isinstance(vision_report, dict) or is_good_vision_read(vision_report):
+        return None
+    stop = vision_report.get("stopRun")
+    if isinstance(stop, dict):
+        return {"kind": stop.get("kind"), "reason": stop.get("reason"), "stopsRun": True}
+    if vision_report.get("budgetSkipped"):
+        return {"kind": "budget", "reason": vision_report.get("reason"), "stopsRun": False}
+    return None
+
+
+def dry_run_report(
+    settings: Settings,
+    stub: FilingStub,
+    parsed: HousePtrParseResult,
+    trades: list[NormalizedTradeRow],
+    *,
+    allow_partial: bool,
+    calls_used: int,
+) -> dict[str, object]:
+    """What persisting this parse would do, for a person, with nothing written."""
+
+    plan = plan_house_publication(settings, stub, parsed, trades, allow_partial=allow_partial)
+    vision = plan.parsed.vision_report if isinstance(plan.parsed.vision_report, dict) else {}
+    detector = vision.get("detector") if isinstance(vision.get("detector"), dict) else {}
+    return {
+        "docId": stub.doc_id,
+        "member": stub.member.name,
+        "filingYear": stub.filing_year,
+        "filingDate": stub.filing_date,
+        "callsUsed": calls_used,
+        "parserVersion": plan.parsed.parser_version,
+        "vision": {
+            "ok": vision.get("ok"),
+            "reason": vision.get("reason"),
+            "reused": vision.get("reused", False),
+            "models": [vision.get("model"), vision.get("modelB")],
+            "chunkPages": vision.get("chunkPages"),
+            "visionVersion": vision.get("visionVersion"),
+            "detectorVersion": vision.get("detectorVersion"),
+            "needsReview": vision.get("needsReview"),
+            "needsReviewReasons": vision.get("needsReviewReasons"),
+            "readAgreement": vision.get("readAgreement"),
+            "detector": dict(detector or {}),
+        }
+        if vision
+        else None,
+        "plan": plan.summary(),
+        "rows": [
+            {
+                "line": row.line_number,
+                "asset": row.asset_description,
+                "type": row.transaction_type,
+                "date": row.transaction_date,
+                "amount": [row.amount_min, row.amount_max],
+                "owner": row.owner,
+                "legibility": row.legibility,
+            }
+            for row in plan.parsed.transactions
+        ],
+        "transcription": [
+            {
+                "page": entry.get("page_number"),
+                "line": entry.get("line_number"),
+                "asset": entry.get("asset_description"),
+                "type": entry.get("transaction_type"),
+                "letter": entry.get("amount_column_letter"),
+                "legibility": entry.get("legibility"),
+                "detector": [
+                    entry.get("detectorLetter"),
+                    entry.get("detectorStatus"),
+                    entry.get("detectorType"),
+                    entry.get("detectorTypeStatus"),
+                ],
+            }
+            for entry in (vision.get("transcription") or [])
+            if isinstance(entry, dict)
+        ],
+    }
+
+
 def process_house_queue_rows(
     settings: Settings,
     queue_rows: list[dict[str, object]],
@@ -1057,15 +1542,32 @@ def process_house_queue_rows(
     review_retry_hours: int = 12,
     vision_backend: str = "off",
     review_mode: bool = False,
+    allow_partial: bool = False,
+    max_filings: int | None = None,
+    dry_run: bool = False,
 ) -> dict[str, object]:
     """Process a batch of queued House PTR stubs from Neon.
 
     ``review_mode`` is ``process-house-review``: every filing is a review
     attempt, recorded with the configuration it ran under, and one that comes
     back the same as last time backs off (``next_review_backoff``).
+
+    The run's vision call budget (``ptr_vision_provider.run_budget``) is
+    checked before a filing is touched: an image-only filing that will not fit
+    what is left is skipped and its stub left exactly as it was, and once the
+    run is stopped (budget spent, daily quota, key refused) every remaining
+    filing is skipped the same way. ``max_filings`` caps the filings actually
+    attempted. ``allow_partial`` is the per-row override of the per-filing
+    gate (see ``plan_house_publication``).
+
+    ``dry_run`` downloads and reads exactly as a real run does -- model calls
+    included, within the budget -- and writes nothing at all: no stub state,
+    no trades, no search index. Each filing's report says what a real run
+    would have published and withheld, and why.
     """
 
     review_config = review_config_signature(ocr_backend, vision_backend)
+    budget = ptr_vision_provider.run_budget()
 
     summary = {
         "queued": len(queue_rows),
@@ -1073,6 +1575,7 @@ def process_house_queue_rows(
         "needsReview": 0,
         "deferred": 0,
         "failed": 0,
+        "skipped": 0,
         "tradeRowsUpserted": 0,
         "searchDocumentsUpserted": 0,
         "searchChunksUpserted": 0,
@@ -1080,11 +1583,26 @@ def process_house_queue_rows(
         "visionCalls": 0,
         "visionRowsRecovered": 0,
         "visionCostUsd": 0.0,
+        "dryRun": dry_run,
+        "allowPartialFilings": allow_partial,
+        "maxFilings": max_filings,
+        "stoppedEarly": None,
         "processed": [],
     }
+    attempted = 0
+
+    def _skip(doc_id: str, reason: str, **extra: object) -> None:
+        summary["skipped"] += 1
+        summary["processed"].append({"docId": doc_id, "status": "skipped", "reason": reason, **extra})
 
     for row in queue_rows:
         stub = build_stub_from_queue_row(row)
+        if budget.stopped is not None:
+            _skip(stub.doc_id, f"run stopped: {budget.stopped.reason}")
+            continue
+        if max_filings is not None and attempted >= max_filings:
+            _skip(stub.doc_id, f"--max-filings {max_filings} reached")
+            continue
         current_status = str(row.get("status") or "")
         metadata = row.get("metadata") or {}
         if not isinstance(metadata, dict):
@@ -1105,166 +1623,236 @@ def process_house_queue_rows(
                     "reviewAttempts": int(metadata.get("reviewAttempts") or 0) + 1,
                 }
             )
-        update_house_stub_state(
-            settings,
-            doc_id=stub.doc_id,
-            status="extracting",
-            extracted_trade_id=None,
-            metadata_updates=metadata_updates,
-        )
 
-        try:
-            parsed, trades = parse_live_house_stub(stub, settings, ocr_backend, vision_backend)
-            upsert_summary = persist_parsed_house_stub(settings, stub, parsed, trades)
-            status = str(upsert_summary["stubStatus"])
-            vision_report = parsed.vision_report if isinstance(parsed.vision_report, dict) else None
-            if vision_report:
-                summary["visionCalls"] += 1
-                summary["visionRowsRecovered"] += int(vision_report.get("rowCount") or 0)
-                summary["visionCostUsd"] = round(
-                    float(summary["visionCostUsd"]) + float(vision_report.get("costUsd") or 0.0),
-                    6,
-                )
-            if status == "parsed":
-                summary["parsed"] += 1
-                if current_status == "needs_review":
+        touched = False
+        with TemporaryDirectory(prefix="capitol-ptr-") as temp_dir:
+            pdf_path: Path | None = None
+            try:
+                needed = 0
+                if str(vision_backend or "off").strip().lower() != "off":
+                    # Fetched once, before the stub is touched, so the budget
+                    # can be checked against the filing's real page count.
+                    pdf_path = Path(temp_dir) / f"{stub.doc_id}.pdf"
+                    download_house_pdf(stub, settings, pdf_path)
+                    needed = vision_calls_needed_for_pdf(pdf_path, vision_backend)
+                if needed and not budget.can_afford(needed):
+                    # Not started, so not attempted: the stub is left exactly
+                    # as it was and keeps its place in the queue.
+                    _skip(
+                        stub.doc_id,
+                        f"vision call budget: needs {needed} calls, {budget.remaining()} left in this run",
+                        callsNeeded=needed,
+                    )
+                    continue
+                attempted += 1
+                if not dry_run:
                     update_house_stub_state(
                         settings,
                         doc_id=stub.doc_id,
-                        status="parsed",
+                        status="extracting",
                         extracted_trade_id=None,
-                        metadata_updates={
-                            "retryAfter": None,
-                            "reviewResolvedAt": now_iso(),
-                            "reviewLastBackend": ocr_backend,
-                        },
+                        metadata_updates=metadata_updates,
                     )
-            else:
-                summary["needsReview"] += 1
+                    touched = True
+                used_before = budget.used
+                parsed, trades = parse_live_house_stub(
+                    stub, settings, ocr_backend, vision_backend, pdf_path=pdf_path
+                )
+                vision_report = parsed.vision_report if isinstance(parsed.vision_report, dict) else None
+                blocked = _vision_run_blocked(vision_report)
+                if blocked is not None:
+                    # The run could not read this filing: not the filing's
+                    # fault, and not a review attempt. Put the stub back.
+                    if touched:
+                        update_house_stub_state(
+                            settings,
+                            doc_id=stub.doc_id,
+                            status=current_status or "needs_review",
+                            extracted_trade_id=row.get("extracted_trade_id"),  # type: ignore[arg-type]
+                            metadata_updates={key: metadata.get(key) for key in _ATTEMPT_KEYS},
+                        )
+                    if blocked.get("stopsRun"):
+                        summary["stoppedEarly"] = blocked.get("reason")
+                    _skip(stub.doc_id, str(blocked.get("reason")), callsUsed=budget.used - used_before)
+                    continue
+                if vision_report:
+                    summary["visionCalls"] += 1
+                    summary["visionRowsRecovered"] += int(vision_report.get("rowCount") or 0)
+                    summary["visionCostUsd"] = round(
+                        float(summary["visionCostUsd"]) + float(vision_report.get("costUsd") or 0.0),
+                        6,
+                    )
+                if dry_run:
+                    report = dry_run_report(
+                        settings,
+                        stub,
+                        parsed,
+                        trades,
+                        allow_partial=allow_partial,
+                        calls_used=budget.used - used_before,
+                    )
+                    status = str(report["plan"]["stubStatus"])  # type: ignore[index]
+                    summary["parsed" if status == "parsed" else "needsReview"] += 1
+                    summary["processed"].append({"status": f"would be {status}", **report})
+                    continue
+
+                upsert_summary = persist_parsed_house_stub(
+                    settings, stub, parsed, trades, allow_partial=allow_partial
+                )
+                status = str(upsert_summary["stubStatus"])
+                if status == "parsed":
+                    summary["parsed"] += 1
+                    if current_status == "needs_review":
+                        update_house_stub_state(
+                            settings,
+                            doc_id=stub.doc_id,
+                            status="parsed",
+                            extracted_trade_id=None,
+                            metadata_updates={
+                                "retryAfter": None,
+                                "reviewResolvedAt": now_iso(),
+                                "reviewLastBackend": ocr_backend,
+                            },
+                        )
+                else:
+                    summary["needsReview"] += 1
+                    retry_hours = review_retry_hours
+                    review_updates: dict[str, object] = {"needsReviewAt": now_iso()}
+                    if review_mode:
+                        trade_counts = upsert_summary.get("trades") or {}
+                        outcome = review_outcome_signature(
+                            status,
+                            trade_rows=int(trade_counts.get("upserted", 0)),  # type: ignore[union-attr]
+                            withheld=int(trade_counts.get("withheld", 0)),  # type: ignore[union-attr]
+                            parser_version=parsed.parser_version,
+                        )
+                        streak, retry_hours = next_review_backoff(metadata, outcome, review_retry_hours)
+                        review_updates.update(
+                            {"reviewLastOutcome": outcome, "reviewOutcomeStreak": streak}
+                        )
+                    review_updates["retryAfter"] = build_review_retry_after_iso(retry_hours)
+                    if review_mode or current_status == "needs_review":
+                        review_updates.update(
+                            {
+                                "reviewLastBackend": ocr_backend,
+                                "reviewLastAttemptAt": now_iso(),
+                            }
+                        )
+                    update_house_stub_state(
+                        settings,
+                        doc_id=stub.doc_id,
+                        status="needs_review",
+                        extracted_trade_id=None,
+                        metadata_updates=review_updates,
+                    )
+                trade_rows = int((upsert_summary.get("trades") or {}).get("upserted", 0))  # type: ignore[union-attr]
+                summary["tradeRowsUpserted"] += trade_rows
+
+                index_summary: dict[str, object] | None = None
+                if with_search_index:
+                    search_document = build_house_ptr_search_document(stub, parsed, trades)
+                    index_summary = index_search_document(
+                        settings,
+                        search_document,
+                        with_embeddings=with_embeddings,
+                    )
+                    summary["searchDocumentsUpserted"] += int(
+                        (index_summary.get("document") or {}).get("upserted", 0)  # type: ignore[union-attr]
+                    )
+                    summary["searchChunksUpserted"] += int(
+                        (index_summary.get("chunks") or {}).get("upserted", 0)  # type: ignore[union-attr]
+                    )
+
+                processed_item = {
+                    "docId": stub.doc_id,
+                    "status": status,
+                    "tradeRows": trade_rows,
+                    "tradesWithheld": int((upsert_summary.get("trades") or {}).get("withheld", 0)),  # type: ignore[union-attr]
+                    "parserVersion": parsed.parser_version,
+                    "filingGate": upsert_summary.get("filingGate"),
+                }
+                if vision_report:
+                    processed_item["visionParse"] = {
+                        "ok": vision_report.get("ok"),
+                        "reason": vision_report.get("reason"),
+                        "rowCount": vision_report.get("rowCount"),
+                        "rowsRecovered": vision_report.get("rowsRecovered"),
+                        "noTransactions": vision_report.get("noTransactions"),
+                        "reused": vision_report.get("reused", False),
+                        "chunks": len(vision_report.get("chunks") or []),
+                        "legibility": vision_report.get("legibility"),
+                        "needsReviewReasons": vision_report.get("needsReviewReasons"),
+                        "costUsd": vision_report.get("costUsd"),
+                        "callsUsed": budget.used - used_before,
+                    }
+                if index_summary:
+                    processed_item["searchDocumentId"] = (index_summary.get("document") or {}).get("document_id")  # type: ignore[union-attr]
+                    processed_item["searchChunks"] = (index_summary.get("chunks") or {}).get("upserted", 0)  # type: ignore[union-attr]
+                summary["processed"].append(processed_item)
+            except Exception as error:  # pragma: no cover - depends on live upstream PDFs
+                retryable = is_retryable_house_error(error)
+                if dry_run:
+                    summary["deferred" if retryable else "failed"] += 1
+                    summary["processed"].append(
+                        {"docId": stub.doc_id, "status": "would fail", "error": str(error)[:300]}
+                    )
+                    continue
+                failed_status = "pending_extraction" if retryable else "needs_review"
                 retry_hours = review_retry_hours
-                review_updates: dict[str, object] = {"needsReviewAt": now_iso()}
-                if review_mode:
-                    trade_counts = upsert_summary.get("trades") or {}
-                    outcome = review_outcome_signature(
-                        status,
-                        trade_rows=int(trade_counts.get("upserted", 0)),  # type: ignore[union-attr]
-                        withheld=int(trade_counts.get("withheld", 0)),  # type: ignore[union-attr]
-                        parser_version=parsed.parser_version,
-                    )
+                failure_updates: dict[str, object] = {
+                    # What the attempt would have stamped, so a download that
+                    # fails before the attempt began still counts as one.
+                    **metadata_updates,
+                    "failedAt": now_iso(),
+                    "lastError": str(error)[:500],
+                }
+                if review_mode and not retryable:
+                    outcome = review_outcome_signature("failed", error=str(error))
                     streak, retry_hours = next_review_backoff(metadata, outcome, review_retry_hours)
-                    review_updates.update(
-                        {"reviewLastOutcome": outcome, "reviewOutcomeStreak": streak}
-                    )
-                review_updates["retryAfter"] = build_review_retry_after_iso(retry_hours)
-                if review_mode or current_status == "needs_review":
-                    review_updates.update(
+                    failure_updates.update(
                         {
-                            "reviewLastBackend": ocr_backend,
-                            "reviewLastAttemptAt": now_iso(),
+                            "reviewLastOutcome": outcome,
+                            "reviewOutcomeStreak": streak,
+                            "reviewLastConfig": review_config,
+                            "reviewAttempts": int(metadata.get("reviewAttempts") or 0) + 1,
                         }
                     )
+                failure_updates["retryAfter"] = (
+                    build_retry_after_iso(error, attempts)
+                    if retryable
+                    else build_review_retry_after_iso(retry_hours)
+                )
+                if not retryable:
+                    failure_updates["needsReviewAt"] = now_iso()
+                    if review_mode or current_status == "needs_review":
+                        failure_updates.update(
+                            {
+                                "reviewLastBackend": ocr_backend,
+                                "reviewLastAttemptAt": now_iso(),
+                            }
+                        )
                 update_house_stub_state(
                     settings,
                     doc_id=stub.doc_id,
-                    status="needs_review",
+                    status=failed_status,
                     extracted_trade_id=None,
-                    metadata_updates=review_updates,
+                    metadata_updates=failure_updates,
                 )
-            trade_rows = int((upsert_summary.get("trades") or {}).get("upserted", 0))  # type: ignore[union-attr]
-            summary["tradeRowsUpserted"] += trade_rows
-
-            index_summary: dict[str, object] | None = None
-            if with_search_index:
-                search_document = build_house_ptr_search_document(stub, parsed, trades)
-                index_summary = index_search_document(
-                    settings,
-                    search_document,
-                    with_embeddings=with_embeddings,
-                )
-                summary["searchDocumentsUpserted"] += int(
-                    (index_summary.get("document") or {}).get("upserted", 0)  # type: ignore[union-attr]
-                )
-                summary["searchChunksUpserted"] += int(
-                    (index_summary.get("chunks") or {}).get("upserted", 0)  # type: ignore[union-attr]
-                )
-
-            processed_item = {
-                "docId": stub.doc_id,
-                "status": status,
-                "tradeRows": trade_rows,
-                "tradesWithheld": int((upsert_summary.get("trades") or {}).get("withheld", 0)),  # type: ignore[union-attr]
-                "parserVersion": parsed.parser_version,
-            }
-            if vision_report:
-                processed_item["visionParse"] = {
-                    "ok": vision_report.get("ok"),
-                    "reason": vision_report.get("reason"),
-                    "rowCount": vision_report.get("rowCount"),
-                    "rowsRecovered": vision_report.get("rowsRecovered"),
-                    "noTransactions": vision_report.get("noTransactions"),
-                    "reused": vision_report.get("reused", False),
-                    "chunks": len(vision_report.get("chunks") or []),
-                    "legibility": vision_report.get("legibility"),
-                    "needsReviewReasons": vision_report.get("needsReviewReasons"),
-                    "costUsd": vision_report.get("costUsd"),
-                }
-            if index_summary:
-                processed_item["searchDocumentId"] = (index_summary.get("document") or {}).get("document_id")  # type: ignore[union-attr]
-                processed_item["searchChunks"] = (index_summary.get("chunks") or {}).get("upserted", 0)  # type: ignore[union-attr]
-            summary["processed"].append(processed_item)
-        except Exception as error:  # pragma: no cover - depends on live upstream PDFs
-            retryable = is_retryable_house_error(error)
-            failed_status = "pending_extraction" if retryable else "needs_review"
-            retry_hours = review_retry_hours
-            failure_updates: dict[str, object] = {
-                **metadata,
-                "failedAt": now_iso(),
-                "lastError": str(error)[:500],
-            }
-            if review_mode and not retryable:
-                outcome = review_outcome_signature("failed", error=str(error))
-                streak, retry_hours = next_review_backoff(metadata, outcome, review_retry_hours)
-                failure_updates.update(
+                if retryable:
+                    summary["deferred"] += 1
+                else:
+                    summary["failed"] += 1
+                summary["processed"].append(
                     {
-                        "reviewLastOutcome": outcome,
-                        "reviewOutcomeStreak": streak,
-                        "reviewLastConfig": review_config,
-                        "reviewAttempts": int(metadata.get("reviewAttempts") or 0) + 1,
+                        "docId": stub.doc_id,
+                        "status": "deferred" if retryable else "failed",
+                        "error": str(error)[:200],
                     }
                 )
-            failure_updates["retryAfter"] = (
-                build_retry_after_iso(error, attempts)
-                if retryable
-                else build_review_retry_after_iso(retry_hours)
-            )
-            if not retryable:
-                failure_updates["needsReviewAt"] = now_iso()
-                if review_mode or current_status == "needs_review":
-                    failure_updates.update(
-                        {
-                            "reviewLastBackend": ocr_backend,
-                            "reviewLastAttemptAt": now_iso(),
-                        }
-                    )
-            update_house_stub_state(
-                settings,
-                doc_id=stub.doc_id,
-                status=failed_status,
-                extracted_trade_id=None,
-                metadata_updates=failure_updates,
-            )
-            if retryable:
-                summary["deferred"] += 1
-            else:
-                summary["failed"] += 1
-            summary["processed"].append(
-                {
-                    "docId": stub.doc_id,
-                    "status": "deferred" if retryable else "failed",
-                    "error": str(error)[:200],
-                }
-            )
 
+    summary["visionCallBudget"] = budget.summary()
+    if budget.stopped is not None and not summary["stoppedEarly"]:
+        summary["stoppedEarly"] = budget.stopped.reason
     return summary
 
 
@@ -3007,6 +3595,7 @@ def ocr_file(pdf_path: Path) -> None:
     show_default=True,
     help=VISION_BACKEND_HELP,
 )
+@click.option("--vision-call-budget", type=int, default=None, help=VISION_CALL_BUDGET_HELP)
 def parse_house_ptr_command(
     pdf_path: Path,
     doc_id: str,
@@ -3021,9 +3610,11 @@ def parse_house_ptr_command(
     upsert: bool,
     ocr_backend: str,
     vision_backend: str,
+    vision_call_budget: int | None,
 ) -> None:
     """OCR and parse a House PTR PDF into structured transactions."""
 
+    begin_vision_run(vision_call_budget)
     settings = Settings()
     stub = FilingStub(
         doc_id=doc_id,
@@ -3506,6 +4097,8 @@ def embed_search_corpus_command(
     show_default=True,
     help=VISION_BACKEND_HELP,
 )
+@click.option("--vision-call-budget", type=int, default=None, help=VISION_CALL_BUDGET_HELP)
+@click.option("--publish-partial-filings", is_flag=True, default=False, help=PUBLISH_PARTIAL_HELP)
 def process_house_backlog_command(
     limit: int,
     export_registry: bool,
@@ -3515,9 +4108,12 @@ def process_house_backlog_command(
     review_retry_hours: int,
     ocr_backend: str,
     vision_backend: str,
+    vision_call_budget: int | None,
+    publish_partial_filings: bool,
 ) -> None:
     """Process queued House PTR stubs from Neon in batch order."""
 
+    begin_vision_run(vision_call_budget)
     settings = Settings()
     load_registry_if_available(settings, export_cache=export_registry)
     queue_rows = fetch_house_stub_queue(
@@ -3533,6 +4129,7 @@ def process_house_backlog_command(
         with_embeddings=with_embeddings,
         review_retry_hours=review_retry_hours,
         vision_backend=vision_backend,
+        allow_partial=publish_partial_filings,
     )
     click.echo(json.dumps(summary, indent=2))
 
@@ -3568,6 +4165,43 @@ def process_house_backlog_command(
     multiple=True,
     help="Only these filings (repeatable); the queue's status rules and --limit still apply.",
 )
+@click.option(
+    "--min-year",
+    type=str,
+    default=None,
+    help=(
+        "Only filings with filing_year at or after this: a year, 'current' or "
+        "'current-N'. The scheduled run uses current-1, the filing cycle; the "
+        "historical backlog runs separately with --max-year. Default: every year."
+    ),
+)
+@click.option(
+    "--max-year",
+    type=str,
+    default=None,
+    help="Only filings with filing_year at or before this (a year, 'current' or 'current-N').",
+)
+@click.option(
+    "--max-filings",
+    type=int,
+    default=None,
+    help=(
+        "At most this many filings attempted in the run (a filing skipped for the "
+        "call budget is not attempted). --limit is how many candidates are fetched."
+    ),
+)
+@click.option("--vision-call-budget", type=int, default=None, help=VISION_CALL_BUDGET_HELP)
+@click.option("--publish-partial-filings", is_flag=True, default=False, help=PUBLISH_PARTIAL_HELP)
+@click.option(
+    "--dry-run",
+    is_flag=True,
+    default=False,
+    help=(
+        "Read exactly as a real run would (model calls included, within the budget) "
+        "and write nothing: no stub state, no trades, no search index. Reports the "
+        "per-filing gate decision and the detector's verdicts for each filing."
+    ),
+)
 def process_house_review_command(
     limit: int,
     export_registry: bool,
@@ -3577,30 +4211,47 @@ def process_house_review_command(
     ocr_backend: str,
     vision_backend: str,
     doc_ids: tuple[str, ...],
+    min_year: str | None,
+    max_year: str | None,
+    max_filings: int | None,
+    vision_call_budget: int | None,
+    publish_partial_filings: bool,
+    dry_run: bool,
 ) -> None:
     """Reprocess the House PTR review queue with an alternate OCR backend."""
 
+    budget = begin_vision_run(vision_call_budget)
     settings = Settings()
-    load_registry_if_available(settings, export_cache=export_registry)
+    # A dry run must not write even the registry cache.
+    load_registry_if_available(settings, export_cache=export_registry and not dry_run)
+    lower = parse_filing_year_bound(min_year)
+    upper = parse_filing_year_bound(max_year)
     queue_rows = fetch_house_stub_queue(
         settings,
         limit=limit,
         only_needs_review=True,
         doc_ids=[doc_id.strip() for doc_id in doc_ids if doc_id.strip()] or None,
         review_config=review_config_signature(ocr_backend, vision_backend),
+        min_year=lower,
+        max_year=upper,
     )
     summary = process_house_queue_rows(
         settings,
         queue_rows,
         ocr_backend=ocr_backend,
-        with_search_index=with_search_index,
+        with_search_index=with_search_index and not dry_run,
         with_embeddings=with_embeddings,
         review_retry_hours=review_retry_hours,
         vision_backend=vision_backend,
         review_mode=True,
+        allow_partial=publish_partial_filings,
+        max_filings=max_filings,
+        dry_run=dry_run,
     )
     summary["mode"] = "needs_review"
-    click.echo(json.dumps(summary, indent=2))
+    summary["yearRange"] = [lower, upper]
+    summary["visionCallBudget"] = budget.summary()
+    click.echo(json.dumps(summary, indent=2, default=str))
 
 
 @cli.command("repersist-house-stubs")
@@ -3636,6 +4287,7 @@ def process_house_review_command(
 )
 @click.option("--dry-run/--apply", default=False, show_default=True)
 @click.option("--export-registry/--no-export-registry", default=True, show_default=True)
+@click.option("--publish-partial-filings", is_flag=True, default=False, help=PUBLISH_PARTIAL_HELP)
 def repersist_house_stubs_command(
     limit: int,
     doc_ids: tuple[str, ...],
@@ -3643,6 +4295,7 @@ def repersist_house_stubs_command(
     min_confidence: float,
     dry_run: bool,
     export_registry: bool,
+    publish_partial_filings: bool,
 ) -> None:
     """Publish House filings whose rows were parsed before their member resolved.
 
@@ -3667,6 +4320,7 @@ def repersist_house_stubs_command(
         registry=registry,
         min_confidence=min_confidence,
         dry_run=dry_run,
+        allow_partial=publish_partial_filings,
     )
     click.echo(json.dumps(summary, indent=2))
 
@@ -4149,6 +4803,9 @@ def reconcile_stored_house_vision(
     vision["needsReview"] = bool(reasons)
     vision["reconciledAt"] = datetime.now(timezone.utc).isoformat()
     vision["reconcileCostUsd"] = 0.0
+    # The rows were checked again by today's detector; the read itself is
+    # still as old as it was (visionVersion is left alone).
+    vision["detectorVersion"] = DETECTOR_VERSION
     report.update(
         {
             "changed": True,
@@ -4167,6 +4824,7 @@ def reconcile_house_stub_rows(
     *,
     registry: MemberRegistry | None = None,
     dry_run: bool = True,
+    allow_partial: bool = False,
 ) -> dict[str, object]:
     """Reconcile a batch of stubs and, unless dry running, publish what clears."""
 
@@ -4206,11 +4864,12 @@ def reconcile_house_stub_rows(
             entry["publish"] = skip_reason
             summary["stubs"].append(entry)  # type: ignore[union-attr]
             continue
-        result = persist_parsed_house_stub(settings, stub, parsed, trades)
+        result = persist_parsed_house_stub(settings, stub, parsed, trades, allow_partial=allow_partial)
         upserted = int((result.get("trades") or {}).get("upserted", 0))  # type: ignore[union-attr]
         summary["published"] = int(summary["published"]) + 1
         summary["tradeRowsUpserted"] = int(summary["tradeRowsUpserted"]) + upserted
         entry["stubStatus"] = result.get("stubStatus")
+        entry["filingGate"] = result.get("filingGate")
         entry["tradeRowsUpserted"] = upserted
         summary["stubs"].append(entry)  # type: ignore[union-attr]
     return summary
@@ -4231,11 +4890,13 @@ def reconcile_house_stub_rows(
     help="Dry run reports what would be settled and writes nothing.",
 )
 @click.option("--export-registry/--no-export-registry", default=True, show_default=True)
+@click.option("--publish-partial-filings", is_flag=True, default=False, help=PUBLISH_PARTIAL_HELP)
 def reconcile_house_vision_command(
     doc_ids: tuple[str, ...],
     limit: int,
     dry_run: bool,
     export_registry: bool,
+    publish_partial_filings: bool,
 ) -> None:
     """Settle withheld amounts from a stored transcription. No model, no cost.
 
@@ -4256,7 +4917,9 @@ def reconcile_house_vision_command(
         only_needs_review=True,
         doc_ids=[doc_id.strip() for doc_id in doc_ids if doc_id.strip()] or None,
     )
-    summary = reconcile_house_stub_rows(settings, queue_rows, registry=registry, dry_run=dry_run)
+    summary = reconcile_house_stub_rows(
+        settings, queue_rows, registry=registry, dry_run=dry_run, allow_partial=publish_partial_filings
+    )
     click.echo(json.dumps(summary, indent=2))
 
 
