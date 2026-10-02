@@ -206,6 +206,32 @@ Relevant settings (all `CAPITOL_`-prefixed environment variables):
 - `CAPITOL_SENATE_EFD_LOOKBACK_DAYS`
 - `CAPITOL_SENATE_EFD_FLOOR_DAYS`
 
+## House PTR Text Path: Codes in Any Case, Ids That Do Not Move
+
+The Clerk's PDFs embed subset fonts that draw some capitals as small capitals,
+and the text layer returns those in lower case: Sale as `s` or `s (partial)`,
+tickers as `(AAPl)`, type codes as `[sT]`, the spouse code as `sP`. Until
+`regex-v2` (2026-10-02) the row core matched only upper case, so across the
+5,939 text-layer PTRs 2,856 sale rows were never read at all, 10,835 tickers
+stayed inside asset names, and 1,642 rows lost their owner code (an `sP` line
+after a full-width description, a bond whose name ends in its maturity line, or
+the 2014-2018 column heading in front of the first row) and were published as
+the member's own. The repair of the rows already in `trades` is recorded in
+`trades_houserecover_actions_20261002`.
+
+Trade ids are `tr-house-<doc>-<line>`, and `line` used to be the row's position
+in the parse. When a fix finds rows an earlier parse missed, every later row
+moves, and a positional upsert overwrites row N with a different trade (and the
+amendment step deletes the wrong `tr-house-<doc>-<line>`). So
+`persist_parsed_house_stub` now numbers a filing that has history by content
+(`capitol_pipeline.house_line_ids`): each row is matched to the stub's stored
+transcription, the filing's live rows and its withdrawn ids; a matched row keeps
+its number, a new row gets the next number above every number the filing has
+used, and nothing is deleted. Rows that must stay out of `trades` -- withdrawn
+earlier, or already published by an amendment row "First disclosed in House PTR
+<doc>" -- are kept in the stored transcription with a `withheld` reason. A
+filing with no history is numbered by position, as before.
+
 ## House PTR Vision Path
 
 About 210 House PTRs sit in `house_filing_stubs.status = 'needs_review'` because

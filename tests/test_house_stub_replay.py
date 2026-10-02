@@ -87,6 +87,8 @@ def exporter(monkeypatch: pytest.MonkeyPatch) -> _Calls:
         calls.marks.append(kwargs)
 
     monkeypatch.setattr(cli, "upsert_trade_rows_to_neon", _upsert)
+    # A filing with no history: numbered by position (capitol_pipeline.house_line_ids).
+    monkeypatch.setattr(cli, "fetch_house_line_references", lambda _settings, **_kwargs: ([], [], [], []))
     monkeypatch.setattr(cli, "mark_house_stub_processed", _mark)
     return calls
 

@@ -1,0 +1,177 @@
+PerIODIC TrANSACTION rePOrT
+Clerk of the House of Representatives • Legislative Resource Center • 135 Cannon building • Washington, DC 20515
+fIler INfOrmATION
+Name:
+Hon. Lois Frankel
+Status:
+Member
+State/District: FL21
+TrANSACTIONS
+ID
+Owner Asset
+Transaction
+Type
+Date
+Notification
+Date
+Amount
+Cap.
+Gains >
+$200?
+broadridge Financial solutions,
+Inc. (bR) [sT]
+s (partial)
+03/21/2018 03/21/2018
+$1,001 - $15,000
+g
+f
+e
+d
+c
+FILING sTATus: New
+subHoLDING oF: Morgan stanley IRA - X142
+Chubb Limited (Cb) [sT]
+s (partial)
+04/11/2018
+04/11/2018
+$1,001 - $15,000
+g
+f
+e
+d
+c
+FILING sTATus: New
+subHoLDING oF: Morgan stanley IRA - X141
+Equifax, Inc. (EFX) [sT]
+s
+03/21/2018 03/21/2018
+$1,001 - $15,000
+g
+f
+e
+d
+c
+FILING sTATus: New
+subHoLDING oF: Morgan stanley IRA - X141
+Globus Medical, Inc. Class A
+(GMED) [sT]
+s (partial)
+04/10/2018 04/10/2018
+$1,001 - $15,000
+g
+f
+e
+d
+c
+FILING sTATus: New
+subHoLDING oF: Morgan stanley IRA - X142
+Hess Corporation (HEs) [sT]
+s (partial)
+04/10/2018 04/10/2018
+$1,001 - $15,000
+g
+f
+e
+d
+c
+FILING sTATus: New
+subHoLDING oF: Morgan stanley IRA - X142
+Kimberly-Clark Corporation
+(KMb) [sT]
+P
+03/21/2018 03/21/2018
+$1,001 - $15,000
+g
+f
+e
+d
+c
+FILING sTATus: New
+subHoLDING oF: Morgan stanley IRA - X141
+Filing ID #20009360
+
+
+Lockheed Martin Corporation
+(LMT) [sT]
+P
+04/05/2018 04/05/2018
+$1,001 - $15,000
+g
+f
+e
+d
+c
+FILING sTATus: New
+subHoLDING oF: Morgan stanley IRA - X141
+NuVasive, Inc. (NuVA) [sT]
+P
+04/04/2018 04/04/2018
+$1,001 - $15,000
+g
+f
+e
+d
+c
+FILING sTATus: New
+subHoLDING oF: Morgan stanley IRA - X142
+occidental Petroleum Corporation
+(oXY) [sT]
+s
+04/05/2018 04/05/2018
+$1,001 - $15,000
+g
+f
+e
+d
+c
+FILING sTATus: New
+subHoLDING oF: Morgan stanley IRA - X141
+Wells Fargo & Company (WFC)
+[sT]
+P
+03/28/2018 03/28/2018
+$1,001 - $15,000
+g
+f
+e
+d
+c
+FILING sTATus: New
+subHoLDING oF: Morgan stanley IRA - X141
+* For the complete list of asset type abbreviations, please visit https://fd.house.gov/reference/asset-type-codes.aspx.
+ASSeT ClASS DeTAIlS
+Morgan stanley IRA - X141
+DEsCRIPTIoN: Managed by MFs Investment MGMT 
+Morgan stanley IRA - X142
+DEsCRIPTIoN: Managed by Anchor Capital Advisors LLC 
+INITIAl PublIC OfferINGS
+n
+m
+l
+k
+j Yes n
+m
+l
+k
+j
+i No
+CerTIfICATION AND SIGNATure
+g
+f
+e
+d
+c
+b I CERTIFY that the statements I have made on the attached Periodic Transaction Report are true, complete, and correct to the
+best of my knowledge and belief.
+Digitally Signed: Hon. Lois Frankel , 04/27/2018
+ID
+Owner Asset
+Transaction
+Type
+Date
+Notification
+Date
+Amount
+Cap.
+Gains >
+$200?

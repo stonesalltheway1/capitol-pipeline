@@ -100,6 +100,10 @@ class HousePtrTransaction(BaseModel):
     # The Clerk's id for the transaction being amended or deleted, printed in
     # front of the owner code on those rows ("2000060675 SP"). Informational.
     filing_id: str | None = None
+    # Set on a stored row that is deliberately not in ``trades``, with the
+    # reason ("represented by tr-house-...", "withdrawn ..."). A later read of
+    # the filing keeps it out too: see capitol_pipeline.house_line_ids.
+    withheld: str | None = None
 
 
 class HousePtrParseResult(BaseModel):

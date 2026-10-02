@@ -46,6 +46,7 @@ from capitol_pipeline.exporters.neon import (
     ensure_usaspending_schema,
     fetch_existing_trade_ids,
     fetch_house_amendment_priors,
+    fetch_house_line_references,
     fetch_latest_trade_disclosure_date,
     fetch_existing_fara_registration_numbers,
     fetch_alerts_for_search,
@@ -93,6 +94,12 @@ from capitol_pipeline.house_amendments import (
     plan_house_amendments,
     prior_from_trade,
     priors_from_transcription,
+)
+from capitol_pipeline.house_line_ids import (
+    apply_line_numbers,
+    assign_line_numbers,
+    references_from,
+    withhold_rows,
 )
 from capitol_pipeline.models.congress import (
     FilingStub,
@@ -560,6 +567,46 @@ def split_scanned_trades(
     return publishable, withheld
 
 
+def stabilize_house_line_ids(
+    settings: Settings,
+    stub: FilingStub,
+    parsed: HousePtrParseResult,
+    trades: list[NormalizedTradeRow],
+) -> tuple[HousePtrParseResult, list[NormalizedTradeRow], dict[str, object] | None]:
+    """Keep the trade ids a filing already has when it is read again.
+
+    Ids are ``tr-house-<doc>-<line>``; a parse that finds a row an earlier one
+    missed would otherwise renumber every row after it, and the upsert would
+    overwrite row N with a different transaction. Rows are matched by content
+    to the filing's stored transcription and live rows, matched rows keep
+    their number, and new rows take numbers above any the filing has used.
+    Rows that must stay out of ``trades`` (withdrawn before, or already
+    published by an amendment row) are kept in the transcription, marked.
+    Returns the renumbered parse and rows and a report for the stub (None for
+    a filing with no history, which is numbered by position as before). See
+    capitol_pipeline.house_line_ids.
+    """
+
+    if not parsed.transactions:
+        return parsed, trades, None
+    stored, live, standins, withdrawn = fetch_house_line_references(
+        settings, doc_id=stub.doc_id, member_id=stub.member.id
+    )
+    references = references_from(stub.doc_id, stored, live, withdrawn)
+    if not references and not standins:
+        return parsed, trades, None
+    assignment = assign_line_numbers(parsed.transactions, references)
+    parsed, trades = apply_line_numbers(parsed, trades, assignment.numbers)
+    parsed, trades, withheld = withhold_rows(
+        parsed, trades, references,
+        doc_id=stub.doc_id, filing_date=stub.filing_date, standins=standins,
+    )
+    report: dict[str, object] = assignment.summary()
+    if withheld:
+        report["withheld"] = withheld
+    return parsed, trades, report
+
+
 def reconcile_house_amendments(
     settings: Settings,
     stub: FilingStub,
@@ -620,6 +667,7 @@ def persist_parsed_house_stub(
     sync_house_stubs_to_neon(settings, [stub])
     status = resolve_house_stub_status(stub, parsed, trades)
     amendment_report: dict[str, object] | None = None
+    line_report: dict[str, object] | None = None
     scanned_under_review = bool(trades) and is_scanned_read(parsed) and status != "parsed"
     if scanned_under_review:
         publishable, withheld = split_scanned_trades(parsed, trades)
@@ -644,6 +692,11 @@ def persist_parsed_house_stub(
             parsed.vision_report["rowsWithheldTotal"] = len(withheld) + dropped_for_type
             parsed.vision_report["withheldReasons"] = reasons
     else:
+        # A filing read before keeps its trade ids, so this runs before the
+        # amendment step (which deletes tr-house-<doc>-<line> by number) and
+        # before the transcription is stored (it is what the next run matches).
+        if not is_scanned_read(parsed):
+            parsed, trades, line_report = stabilize_house_line_ids(settings, stub, parsed, trades)
         # An amended or deleted row is not a new trade. The stub status above
         # was decided on every row the filing carries, as before.
         trades, amendment_report = reconcile_house_amendments(settings, stub, trades)
@@ -651,6 +704,8 @@ def persist_parsed_house_stub(
     metadata_extra = build_house_stub_metadata_extra(parsed)
     if amendment_report:
         metadata_extra = {**(metadata_extra or {}), "amendments": amendment_report}
+    if line_report:
+        metadata_extra = {**(metadata_extra or {}), "lineIds": line_report}
     mark_house_stub_processed(
         settings,
         stub,

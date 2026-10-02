@@ -256,7 +256,7 @@ def test_torres_first_rows_and_comment(torres) -> None:
     assert first.comment.endswith("without my input or direction.")
     assert trades[0].comment is not None
     assert trades[0].comment.startswith(first.comment)
-    assert trades[0].comment.endswith("[regex-v1]")
+    assert trades[0].comment.endswith("[regex-v2]")
 
 
 def test_torres_row_across_page_break(torres) -> None:
@@ -317,7 +317,7 @@ def test_morrison_descriptions_go_to_comment_not_asset() -> None:
     assert page_break.comment.endswith("Description: Energy infrastructure in space, Jacksonville, FL")
     assert trades[1].comment == (
         "Filing Status: New | Subholding Of: Investment Fund 1 | Description: Sports Software, London, UK"
-        " | Parsed from House PTR 20034300 at 95% confidence [regex-v1]"
+        " | Parsed from House PTR 20034300 at 95% confidence [regex-v2]"
     )
 
 

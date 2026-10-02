@@ -1,0 +1,80 @@
+DC
+AFLAC Incorporated (AFL)
+P
+01/12/2015 02/1/2015
+$1,001 - $15,000
+FILINg STATUS: New
+SUBHoLDINg oF: MacArthur Family 2008 Irr Tr FBo Isabella MacArthur
+Airbus group Unsponsored ADR
+(EADSY)
+S
+01/12/2015 02/1/2015
+$1,001 - $15,000
+FILINg STATUS: New
+SUBHoLDINg oF: Thomas C MacArthur IRA
+JT
+Akzo Nobel N.V. American Depositary
+Shares (AKZoY)
+S
+01/27/2015 02/1/2015
+$15,001 - $50,000
+FILINg STATUS: New
+SUBHoLDINg oF: Thomas C MacArthur and Deborah A MacArthur
+JT
+ALASKA ST SR A BE/R/ 5 DUE 080128
+DTD 041409
+P
+01/15/2015 02/1/2015
+$250,001 - $500,000
+FILINg STATUS: New
+SUBHoLDINg oF: Thomas C MacArthur and Deborah A MacArthur
+Alexion Pharmaceuticals, Inc. (ALXN)
+P
+01/21/2015 02/1/2015
+$1,001 - $15,000
+FILINg STATUS: New
+SUBHoLDINg oF: Thomas C MacArthur IRA
+Alexion Pharmaceuticals, Inc. (ALXN)
+S
+01/27/2015 02/1/2015
+$1,001 - $15,000
+FILINg STATUS: New
+SUBHoLDINg oF: Thomas C MacArthur IRA
+Allergan, Inc. (AgN)
+S
+01/27/2015 02/1/2015
+$1,001 - $15,000
+FILINg STATUS: New
+SUBHoLDINg oF: Thomas C MacArthur IRA
+JT
+ALLIANT TECHSYSTEMS INC 06.875%
+091520
+S
+01/14/2015 02/1/2015
+$15,001 - $50,000
+FILINg STATUS: New
+SUBHoLDINg oF: Thomas C MacArthur and Deborah A MacArthur
+DESCRIPTIoN: Corporate bond
+JT
+ALLY FINANCIAL INC B/E 05.125%
+093024
+P
+01/22/2015 02/1/2015
+$1,001 - $15,000
+FILINg STATUS: New
+SUBHoLDINg oF: Thomas C MacArthur and Deborah A MacArthur
+DESCRIPTIoN: Corporate bond
+JT
+ALLY FINANCIAL INC B/E 05.125%
+P
+01/8/2015
+02/1/2015
+$1,001 - $15,000
+ID
+Owner Asset
+Transaction
+Type
+Date
+Notification
+Date
+Amount

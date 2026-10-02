@@ -1,0 +1,125 @@
+PerIODIC TrANSACTION rePOrT
+Clerk of the House of Representatives • Legislative Resource Center • 135 Cannon Building • Washington, DC 20515
+fIler INfOrmATION
+Name:
+Hon. Linda T. Sanchez
+Status:
+Member
+State/District: CA38
+TrANSACTIONS
+ID
+Owner Asset
+Transaction
+Type
+Date
+Notification
+Date
+Amount
+Cap.
+Gains >
+$200?
+SP
+Charles Schwab - Bank of America
+[OT]
+S
+02/22/2019 09/12/2020
+$1,001 - $15,000
+g
+f
+e
+d
+c
+FILINg STATUS: New
+LOCATION: US
+DESCRIPTION: withdrew money from fund
+SP
+Charles Schwab - Enbridge [OT]
+S
+02/22/2019 09/12/2020
+$1,001 - $15,000
+g
+f
+e
+d
+c
+b
+FILINg STATUS: New
+LOCATION: US
+DESCRIPTION: withdrew money from fund
+SP
+Charles Schwab - Ford Motor Co
+[OT]
+S
+02/22/2019 09/12/2020
+$1,001 - $15,000
+g
+f
+e
+d
+c
+FILINg STATUS: New
+LOCATION: US
+DESCRIPTION: withdrew money from fund
+SP
+Charles Schwab - Root 9 B
+Technologies Inc [OT]
+S
+02/22/2019 09/12/2020
+$.25
+g
+f
+e
+d
+c
+FILINg STATUS: New
+LOCATION: US
+DESCRIPTION: withdrew money from fund
+SP
+Charles Schwab - UBS group Ag
+[OT]
+S
+02/22/2019 09/12/2020
+$1,001 - $15,000
+g
+f
+e
+d
+c
+FILINg STATUS: New
+LOCATION: US
+DESCRIPTION: withdrew money from fund
+Filing ID #20017356
+
+
+* For the complete list of asset type abbreviations, please visit https://fd.house.gov/reference/asset-type-codes.aspx.
+INITIAl PublIC OfferINGS
+n
+m
+l
+k
+j Yes n
+m
+l
+k
+j
+i No
+CerTIfICATION AND SIGNATure
+g
+f
+e
+d
+c
+b I CERTIFY that the statements I have made on the attached Periodic Transaction Report are true, complete, and correct to the
+best of my knowledge and belief. Further, I CERTIFY that I have disclosed all transactions as required by the STOCK Act.
+Digitally Signed: Hon. Linda T. Sanchez , 09/13/2020
+ID
+Owner Asset
+Transaction
+Type
+Date
+Notification
+Date
+Amount
+Cap.
+Gains >
+$200?

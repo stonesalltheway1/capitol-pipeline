@@ -466,6 +466,8 @@ def exporter(monkeypatch: pytest.MonkeyPatch) -> _Calls:
         calls.marks.append(kwargs)
 
     monkeypatch.setattr(cli, "upsert_trade_rows_to_neon", _upsert)
+    # A filing with no history: numbered by position (capitol_pipeline.house_line_ids).
+    monkeypatch.setattr(cli, "fetch_house_line_references", lambda _settings, **_kwargs: ([], [], [], []))
     monkeypatch.setattr(cli, "fetch_house_amendment_priors", _priors)
     monkeypatch.setattr(cli, "apply_house_amendment_changes", _apply)
     monkeypatch.setattr(cli, "mark_house_stub_processed", _mark)
@@ -503,3 +505,29 @@ def test_a_filing_with_no_restated_rows_never_queries_for_originals(
     cli.persist_parsed_house_stub(Settings(), _stub(), parsed, trades)
     assert len(exporter.upserts[0]) == 3
     assert "amendments" not in (exporter.marks[0]["metadata_extra"] or {})
+
+
+def test_a_filing_read_again_withdraws_its_own_rows_by_their_existing_ids(
+    exporter: _Calls, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # The amendment step deletes tr-house-<doc>-<line> for each amended or
+    # deleted row. Numbered by position, a filing whose earlier parse put these
+    # rows at 5, 6 and 7 would delete -1 and -3 instead: somebody else's trades.
+    stored = [
+        {"line_number": 5, "ticker": "AMZN", "asset_description": "Amazon.com, Inc.", "transaction_type": "sale",
+         "transaction_date": "2020-01-16", "amount_min": 250001, "amount_max": 500000, "owner": "spouse"},
+        {"line_number": 6, "ticker": "AXP", "asset_description": "American Express Company",
+         "transaction_type": "purchase", "transaction_date": "2020-06-24", "amount_min": 100001,
+         "amount_max": 250000, "owner": "spouse"},
+        {"line_number": 7, "ticker": "CAT", "asset_description": "Caterpillar, Inc.", "transaction_type": "exchange",
+         "transaction_date": "2020-03-11", "amount_min": 1001, "amount_max": 15000, "owner": "joint"},
+    ]
+    monkeypatch.setattr(cli, "fetch_house_line_references", lambda _settings, **_kwargs: (stored, [], [], []))
+    parsed, trades = parse_house_ptr_text(AMENDMENT_TEXT, _stub())
+    cli.persist_parsed_house_stub(Settings(), _stub(), parsed, trades)
+
+    assert sorted(f"tr-house-{t.source_id.replace(':', '-')}" for t in exporter.upserts[0]) == [
+        "tr-house-20016961-5", "tr-house-20016961-6"
+    ]
+    assert exporter.applied == [{"updates": {}, "deletes": ["tr-house-20016961-7", "tr-house-20016300-2"]}]
+    assert [t["line_number"] for t in exporter.marks[0]["parsed_transactions"]] == [5, 6, 7]

@@ -1548,7 +1548,7 @@ def test_vision_rows_are_indistinguishable_from_text_parsed_rows(
     assert vision_row.normalized_asset.kind == text_row.normalized_asset.kind
 
     # Only provenance differs.
-    assert text_parsed.parser_version == "regex-v1"
+    assert text_parsed.parser_version == "regex-v2"
     assert vision_parsed.parser_version == VISION_PARSER_VERSION
     assert vision_row.parser_version == VISION_PARSER_VERSION
 
@@ -1671,7 +1671,7 @@ def test_parse_house_ptr_pdf_skips_vision_when_backend_is_off(
     )
 
     assert calls == []
-    assert parsed.parser_version == "regex-v1"
+    assert parsed.parser_version == "regex-v2"
     assert len(rows) == 1
     assert parsed.vision_report is None
 

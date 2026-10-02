@@ -3923,6 +3923,80 @@ def fetch_house_amendment_priors(
     return trades, stubs
 
 
+def fetch_house_line_references(
+    settings: Settings,
+    *,
+    doc_id: str,
+    member_id: str | None,
+) -> tuple[list[dict[str, object]], list[dict[str, object]], list[dict[str, object]], list[dict[str, object]]]:
+    """What a House filing carried before it is written again, for stable ids.
+
+    Returns (stored transcription, live rows, stand-ins, withdrawn): the
+    stub's stored ``parsedTransactions``, the filing's ``tr-house-<doc>-<n>``
+    rows in ``trades``, the member's rows from other filings whose comment
+    says they were first disclosed in this one, and the last snapshot of each
+    of this filing's ids the trade change log records as withdrawn. See
+    capitol_pipeline.house_line_ids.
+    """
+
+    columns = """
+        id, ticker, asset_description, transaction_type,
+        transaction_date::text AS transaction_date, disclosure_date::text AS disclosure_date,
+        amount_min, amount_max, owner, comment, source_url
+    """
+    with neon_connection(settings) as connection:
+        with connection.cursor() as cursor:
+            cursor.execute(
+                """
+                SELECT CASE WHEN jsonb_typeof(metadata->'parsedTransactions') = 'array'
+                            THEN metadata->'parsedTransactions' END AS parsed_transactions
+                FROM house_filing_stubs WHERE doc_id = %s
+                """,
+                (doc_id,),
+            )
+            found = cursor.fetchone()
+            stored = list((found or {}).get("parsed_transactions") or [])
+            cursor.execute(
+                f"SELECT {columns} FROM trades WHERE id LIKE %s",
+                (f"tr-house-{doc_id}-%",),
+            )
+            live = list(cursor.fetchall())
+            standins: list[dict[str, object]] = []
+            if member_id:
+                cursor.execute(
+                    f"""
+                    SELECT {columns} FROM trades
+                    WHERE member_id = %s
+                      AND source IN ('house_clerk', 'house_ptr')
+                      AND id NOT LIKE %s
+                      AND comment LIKE %s
+                    """,
+                    (member_id, f"tr-house-{doc_id}-%", f"%First disclosed in House PTR {doc_id} %"),
+                )
+                standins = list(cursor.fetchall())
+            # The last snapshot of each of this filing's withdrawn ids that is
+            # not live again: what the row said when it was taken out.
+            cursor.execute(
+                """
+                SELECT DISTINCT ON (c.trade_id)
+                       c.trade_id AS id, c.before->>'ticker' AS ticker,
+                       c.before->>'asset_description' AS asset_description,
+                       c.before->>'transaction_type' AS transaction_type,
+                       c.before->>'transaction_date' AS transaction_date,
+                       (c.before->>'amount_min')::bigint AS amount_min,
+                       (c.before->>'amount_max')::bigint AS amount_max,
+                       c.before->>'owner' AS owner
+                FROM trade_changes c
+                WHERE c.trade_id LIKE %s AND c.change_type = 'withdrawn'
+                  AND NOT EXISTS (SELECT 1 FROM trades t WHERE t.id = c.trade_id)
+                ORDER BY c.trade_id, c.id DESC
+                """,
+                (f"tr-house-{doc_id}-%",),
+            )
+            withdrawn = list(cursor.fetchall())
+    return stored, live, standins, withdrawn
+
+
 def apply_house_amendment_changes(
     settings: Settings,
     *,

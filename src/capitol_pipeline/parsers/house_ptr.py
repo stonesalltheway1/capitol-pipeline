@@ -32,7 +32,10 @@ from capitol_pipeline.processors.ocr import fix_font_mojibake, OcrProcessor
 
 logger = logging.getLogger(__name__)
 
-REGEX_PARSER_VERSION = "regex-v1"
+#: v2 (2026-10-02) reads the row codes in any case -- the small-capital fonts
+#: print Sale as "s" and tickers as "(AAPl)" -- and starts a row at its owner
+#: code line. Rows written by v1 keep their label.
+REGEX_PARSER_VERSION = "regex-v2"
 
 #: Rows published from a stub's stored transcription in a later run, where the
 #: original parse predates :func:`mark_house_stub_processed` recording which
@@ -95,14 +98,22 @@ AMOUNT_RANGES: list[tuple[re.Pattern[str], int, int]] = [
 #: to the next core, is that row's annotation block. Anchoring on the core
 #: (instead of a bounded lazy prefix) is what keeps long per-row comments from
 #: sliding into the next row's asset name.
+#:
+#: The codes are matched in any case. The Clerk's PDFs embed subset fonts that
+#: draw some capitals with small-capital glyphs, and the text layer (after
+#: :func:`fix_font_mojibake`) returns those as lower case: the Sale code comes
+#: out as "s" or "s (partial)", tickers as "(AAPl)" or "(goog)", type codes as
+#: "[sT]". Across the 5,939 text-layer PTRs on file that was 2,856 sale rows the
+#: core never matched -- dropped without a trace -- and 10,835 tickers it
+#: left inside the asset name. Callers upper-case what they keep.
 _ROW_CORE_SOURCE = (
-    r"(?:\(\s*(?P<ticker>[A-Z.]{1,6})\s*\)\s*)?"
-    r"(?:\[\s*(?P<asset_type>[A-Z]{2,4})\s*\]\s*)?"
-    r"(?<![A-Za-z0-9])(?P<tx_type>P|S(?:\s*\((?i:partial)\))?|E)\s+"
+    r"(?:\(\s*(?P<ticker>[A-Za-z.]{1,6})\s*\)\s*)?"
+    r"(?:\[\s*(?P<asset_type>[A-Za-z]{2,4})\s*\]\s*)?"
+    r"(?<![A-Za-z0-9])(?P<tx_type>[PSEpse](?:\s*\((?i:partial)\))?)\s+"
     r"(?P<date>\d{1,2}/\d{1,2}/\d{4})\s+(?P<notified>\d{1,2}/\d{1,2}/\d{4})\s+"
-    r"(?:(?P<owner>Spouse/DC|JT|DC|SP|TR|XX)\s+)?"
+    r"(?:(?P<owner>(?i:Spouse/DC|JT|DC|SP|TR|XX))\s+)?"
     r"(?P<amount>\$\s*[\d,]+(?:\.\d+)?\s*[-–—]\s*\$\s*[\d,]+(?:\.\d+)?"
-    r"|(?i:over|>)\s*\$\s*[\d,]+|\$\s*[\d,]+(?:\.\d+)?)"
+    r"|(?i:over|>)\s*\$\s*[\d,]+|\$\s*(?:[\d,]+(?:\.\d+)?|\.\d+))"
 )
 
 ROW_CORE_PATTERN = re.compile(_ROW_CORE_SOURCE)
@@ -126,6 +137,14 @@ _COLUMN_HEADER_PATTERN = re.compile(
     re.I,
 )
 _CAP_GAINS_HEADER_PATTERN = re.compile(r"Cap\.\s*Gains\s*>\s*\$200\?", re.I)
+#: The column heading of the form before it grew a "Cap. Gains > $200?" column
+#: (2014 to early 2018). Nothing stripped it: on the first page it sat in front
+#: of the first row's owner code ("iD owner asset ... amount sP Intuit") and
+#: hid it from parse_owner, and at a page break it was swept into a row.
+_SHORT_COLUMN_HEADER_PATTERN = re.compile(
+    r"(?:\bID\s+)?Owner\s+Asset\s+Transaction\s+Type\s+Date\s+Notification\s+Date\s+Amount\b",
+    re.I,
+)
 _FILING_ID_FOOTER_PATTERN = re.compile(r"Filing ID\s*#\s*\d+", re.I)
 _REPORT_TITLE_PATTERN = re.compile(
     r"(?:Periodic Transaction Report|\bP T R\b)"
@@ -164,8 +183,12 @@ _ACCOUNT_NUMBER_LINE_PATTERN = re.compile(r"^[xX*#.-]*\d{3,}[xX*#.-]*$")
 #: The tail of an asset name that pymupdf emitted after the row core (seen when
 #: a row straddles a page break): ends with the ticker and/or type code.
 _ASSET_TAIL_PATTERN = re.compile(
-    r"^(?P<name>.*?)\s*(?:\(\s*(?P<ticker>[A-Z.]{1,6})\s*\))?\s*(?:\[\s*(?P<asset_type>[A-Z]{2,4})\s*\])?$"
+    r"^(?P<name>.*?)\s*(?:\(\s*(?P<ticker>[A-Za-z.]{1,6})\s*\))?\s*(?:\[\s*(?P<asset_type>[A-Za-z]{2,4})\s*\])?$"
 )
+#: A line holding nothing but the row's owner code, optionally after the
+#: Clerk's transaction id ("JT", "2000090459 SP", and "sP" in the small-capital
+#: fonts). It opens a row: it is the first thing printed for it.
+_OWNER_LINE_PATTERN = re.compile(r"^(?:\d{6,}\s+)?(?:Spouse/DC|SP|JT|DC)$", re.I)
 _SENTENCE_END_PATTERN = re.compile(r"[.!?]['\")]?$")
 _NAME_ABBREVIATIONS: frozenset[str] = frozenset(
     {
@@ -227,8 +250,9 @@ def parse_amount_range(raw: str) -> tuple[int, int]:
         if pattern.search(raw):
             return minimum, maximum
     # Capital calls and similar rows carry an exact figure ("$647.63")
-    # instead of a bracket; keep it as a degenerate range.
-    exact = re.fullmatch(r"\s*\$\s*([\d,]+(?:\.\d+)?)\s*", raw)
+    # instead of a bracket; keep it as a degenerate range. Sub-dollar figures
+    # print without a leading zero ("$.25").
+    exact = re.fullmatch(r"\s*\$\s*([\d,]+(?:\.\d+)?|\.\d+)\s*", raw)
     if exact:
         try:
             value = round(float(exact.group(1).replace(",", "")))
@@ -522,10 +546,19 @@ def strip_page_furniture(text: str) -> str:
     if _CAP_GAINS_HEADER_PATTERN.search(cleaned):
         cleaned = _FIRST_COLUMN_HEADER_PATTERN.sub("", cleaned, count=1)
     else:
+        # The older form's heading has no "Cap. Gains" column. It still closes
+        # the page-1 preamble, which some filings print in a font whose text
+        # layer is unreadable ("P㨗廅... T廅趰..."), so everything before it
+        # goes -- but only when it comes before the first row.
+        heading = _SHORT_COLUMN_HEADER_PATTERN.search(cleaned)
+        first_row = ROW_CORE_PATTERN.search(cleaned)
+        if heading and (first_row is None or heading.end() <= first_row.start()):
+            cleaned = cleaned[heading.end():]
         cleaned = _REPORT_TITLE_PATTERN.sub("\n", cleaned)
         cleaned = _CLERK_LINE_PATTERN.sub("\n", cleaned)
         cleaned = _FILER_BLOCK_PATTERN.sub("\n", cleaned)
     cleaned = _COLUMN_HEADER_PATTERN.sub("\n", cleaned)
+    cleaned = _SHORT_COLUMN_HEADER_PATTERN.sub("\n", cleaned)
     cleaned = _CAP_GAINS_HEADER_PATTERN.sub("\n", cleaned)
     cleaned = _FILING_ID_FOOTER_PATTERN.sub("\n", cleaned)
     cleaned = _ASSET_TYPE_FOOTNOTE_PATTERN.sub("\n", cleaned)
@@ -584,17 +617,29 @@ def split_row_segment(segment: str) -> tuple[list[str], list[str]]:
     lines = [line for line in lines if line]
     if not lines:
         return [], []
-    split_at = len(lines)
+    # An owner-code line is the first thing the form prints for a row, so it
+    # settles the boundary whatever the lines after it look like. Without this
+    # the shape rules below misfile two kinds of row: "sP" (a small-capital
+    # "SP") after a full-width description reads as that description's
+    # lower-case wrapped tail, and a bond whose name ends in its maturity
+    # ("... B/E 05.125%" / "091520") reads as an account number. Either way
+    # the owner went into the previous row's comment and the trade was
+    # published as the member's own.
+    owner_lines = [index for index, line in enumerate(lines) if _OWNER_LINE_PATTERN.match(line)]
+    if owner_lines:
+        split_at = owner_lines[-1]
+        return lines[:split_at], lines[split_at:]
+    # The line printed directly before the core is always part of the asset
+    # (the text layer emits a row's name right before its type code), even
+    # when it looks like annotation: a last name line of "2053" is a maturity,
+    # not an account number. Walk back from the line before it.
+    split_at = len(lines) - 1
     while split_at > 0:
         candidate = lines[split_at - 1]
         previous = lines[split_at - 2] if split_at >= 2 else None
         if _is_annotation_line(candidate, previous):
             break
         split_at -= 1
-    if split_at == len(lines):
-        # Every line looked like annotation; the last one is still the best
-        # guess at the asset so the row is not lost.
-        split_at = len(lines) - 1
     return lines[:split_at], lines[split_at:]
 
 
@@ -613,7 +658,8 @@ def _take_asset_tail(lines: list[str]) -> tuple[list[str], str, str | None, str 
     match = _ASSET_TAIL_PATTERN.match(lines[0])
     if not match or not (match.group("ticker") or match.group("asset_type")):
         return lines, "", None, None
-    return lines[1:], match.group("name").strip(), match.group("ticker"), match.group("asset_type")
+    ticker = match.group("ticker")
+    return lines[1:], match.group("name").strip(), ticker.upper() if ticker else None, match.group("asset_type")
 
 
 def _expand_legacy_markers(line: str) -> str:
@@ -692,7 +738,8 @@ def parse_transactions(text: str) -> list[HousePtrTransaction]:
         annotation_lines, asset_lines = split_row_segment(prepared[previous_end:match.start()])
         if transactions:
             transactions[-1] = _finish_row(transactions[-1], annotation_lines)
-        ticker = match.group("ticker") or None
+        # Small-capital fonts print tickers in mixed case ("(AAPl)").
+        ticker = (match.group("ticker") or "").upper() or None
         # Amended and deleted rows print the Clerk's transaction id before the
         # owner code; it is not part of the asset and hides the owner from
         # parse_owner, which only honours a code at the very start.
