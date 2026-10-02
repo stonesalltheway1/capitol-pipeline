@@ -327,10 +327,17 @@ A filing transcribed before `transcription` was stored falls back to reading
 holding fewer rows than the read saw on it is skipped rather than aligned
 against a short list.
 
-A vision-parsed filing publishes trade rows only when it resolves to `parsed`;
-while it is `needs_review` the transcription stays on the stub
-(`parsedTransactions`, `visionParse.rows`) and nothing is written to `trades`
-(`visionParse.withheldTrades`). The text path is unchanged.
+A vision-parsed filing publishes whole or not at all. Any row the reads
+disputed, the reader did not rate `clear`, or the checkbox detector
+contradicted, could not settle or could not align withholds every row of the
+filing; the transcription stays on the stub (`parsedTransactions`,
+`visionParse.transcription`) and `visionParse.filingGate` records the decision
+and its reasons. `--publish-partial-filings` (on `process-house-review`,
+`process-house-backlog`, `repersist-house-stubs` and `reconcile-house-vision`)
+is the explicit override that publishes the settled rows one by one. A
+re-read is matched to the ids the filing already uses (`house_line_ids.py`, as
+typed filings are), and an id the trade change log withdrew is not
+republished unless the PDF itself changed. The text path is unchanged.
 `process-house-review --doc-id <id>` (repeatable) targets specific stubs, and
 `reconcile-house-vision --doc-id <id>` settles withheld amounts from the stored
 transcription for nothing.
@@ -347,7 +354,12 @@ Settings:
   and the stub stays `needs_review`.
 - `CAPITOL_PTR_VISION_MODEL` — override the read model (default `claude-opus-5`).
 - `CAPITOL_PTR_VISION_EFFORT` — reasoning effort (`low`..`max`, default `medium`).
-- `CAPITOL_PTR_VISION_CHUNK_PAGES` — pages per read request (default 4).
+- `CAPITOL_PTR_VISION_CHUNK_PAGES` — pages per read request (default 1: one
+  rendered page per call).
+- `CAPITOL_PTR_VISION_CALL_BUDGET` — model requests one CLI run may make,
+  retries included (default 40; `--vision-call-budget` overrides, negative
+  means no limit). A filing that will not fit is skipped untouched, and a run
+  that spends it, hits a daily quota or has its key refused stops cleanly.
 - `CAPITOL_PTR_VISION_MAX_COST_USD` — per-filing ceiling on the pre-flight cost
   estimate (default 25, sized for a 60-page filing at the measured $0.40 a page); a filing over it is refused
   with the estimate in `visionParse.reason`, and one that overruns 1.5x the
@@ -363,9 +375,11 @@ Guardrails: one filing per call, PDFs over 60 pages or 20 MB are skipped with a
 reason, the cost ceiling above, one retry on 429/5xx, and `--limit` caps
 filings per run.
 
-Every attempt is recorded on the stub under `metadata.visionParse` with the
-model, token usage, estimated cost, per-row legibility counts, and the skip
-reason when it did not run. A filing leaves the review queue when the model
+A good read is recorded on the stub under `metadata.visionParse` with the
+model, token usage, estimated cost, per-row legibility counts, and the
+`visionVersion` / `detectorVersion` that made and checked it; a saved read is
+replayed only when both are current. A failed or skipped attempt goes to
+`metadata.visionLastFailure` and never replaces the last good read. A filing leaves the review queue when the model
 rated more than half its rows legible; otherwise it stays `needs_review` with
 the transcription attached for a human.
 

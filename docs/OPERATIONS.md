@@ -167,14 +167,22 @@ otherwise falls back to "a portrait page is a sideways landscape form".
   new API keys and 404s.
 - `CAPITOL_PTR_VISION_GEMINI_RPM` — requests per minute per model, default 10.
   Google no longer publishes the free-tier limit; check it in AI Studio before
-  sizing a batch. A 429 backs off (honouring the API's own `retryDelay`) and
-  retries up to `CAPITOL_PTR_VISION_GEMINI_MAX_ATTEMPTS` (default 4).
+  sizing a batch. A per-minute 429 backs off (honouring the API's own
+  `retryDelay`) and retries up to `CAPITOL_PTR_VISION_GEMINI_MAX_ATTEMPTS`
+  (default 5). A 429 that names a daily quota, one that will not clear, and a
+  401/403 stop the run: the remaining filings are skipped untouched and the
+  summary's `stoppedEarly` says why.
+- `CAPITOL_PTR_VISION_CALL_BUDGET` / `--vision-call-budget` — model requests
+  one run may make, retries included (default 40; negative means no limit).
+  Every page is two (read A and read B). An image-only filing that will not
+  fit what is left is skipped before its stub is touched.
 - `CAPITOL_PTR_VISION_DISABLED=1` — kill switch. Every filing is skipped with
   `reason: disabled by CAPITOL_PTR_VISION_DISABLED` and stays in the queue. Use
   this first if output quality looks wrong; you do not need to redeploy.
 - `CAPITOL_PTR_VISION_EFFORT` — `low`..`max`, default `medium`; use `high` for a
   queue of handwritten forms. On Gemini it maps to `thinkingLevel`.
-- `CAPITOL_PTR_VISION_CHUNK_PAGES` — pages per read request, default 4.
+- `CAPITOL_PTR_VISION_CHUNK_PAGES` — pages per read request, default 1 (one
+  rendered page per call, as every audited read was made).
 - `CAPITOL_PTR_VISION_MAX_COST_USD` — per-filing ceiling on the pre-flight
   estimate, default 25. Every Gemini rate is zero, so on the free provider the
   ceiling never bites and the long typed attachments the paid path had to
@@ -195,14 +203,26 @@ otherwise falls back to "a portrait page is a sideways landscape form".
 The checkbox detector (`parsers/ptr_grid.py`) runs on every rendered page
 without a model call and cross-checks each row's amount column; its verdicts
 are in `visionParse.detector` (per page: `status` one of `ok`, `no-grid`,
-`no-rows`, `unaligned`; counts of `agreed`, `disagreed`, `ambiguous`) and per
-row in `visionParse.rows` (`det:<letter>/<status>`). A disagreement or an
-ambiguous cell nulls that row's amount and sends the filing to review. A
-vision filing in `needs_review` publishes nothing to `trades`
-(`visionParse.withheldTrades` says how many rows are waiting); once a human
-resolves it, `process-house-review --doc-id <id>` re-runs that stub alone and,
-if the PDF is unchanged, the previous read is under 30 days old and the same
-provider would answer today, reuses the transcription for free.
+`no-rows`, `no-ticks`, `unaligned`, and `exampleRow` where the form's
+pre-printed example row was found and set aside; counts of `agreed`,
+`disagreed`, `ambiguous`, `typeDisagreed`) and per row in
+`visionParse.transcription`. A disagreement or an ambiguous cell nulls that
+row's amount and sends the filing to review; the detector settles an amount
+only where the two reads disputed it, never one both reads saw unticked. A
+vision filing publishes whole or not at all (`visionParse.filingGate`; the
+override is `--publish-partial-filings`); once a human resolves it,
+`process-house-review --doc-id <id>` re-runs that stub alone and, if the PDF is
+unchanged, the previous read is under 30 days old, the same provider would
+answer today, and the read's `visionVersion` and `detectorVersion` are
+current, reuses the transcription for free.
+
+`process-house-review --dry-run` reads exactly as a real run would (model calls
+included, within the budget) and writes nothing: no stub state, no trades, no
+search index, no registry cache. Each filing's entry carries the gate decision
+and reasons, the planned trade ids, the detector's per-page verdicts and every
+transcribed row. `--min-year` / `--max-year` (a year, `current` or
+`current-N`) bound `filing_year`, and `--max-filings` caps the filings
+attempted (`--limit` is the candidates fetched).
 
 Guardrails, in order: the env kill switch, missing credentials for the
 configured provider, PDFs over 20 MB, PDFs over 60 pages, the cost ceiling, one
