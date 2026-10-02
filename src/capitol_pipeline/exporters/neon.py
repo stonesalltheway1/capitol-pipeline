@@ -3785,6 +3785,103 @@ def backfill_crypto_trade_classification(
     }
 
 
+#: Fields the conflict score is computed from. A re-read that changes any of
+#: them has to be rescored (see TRADE_UPSERT_SQL).
+TRADE_SCORED_FIELDS: tuple[str, ...] = (
+    "member_id",
+    "ticker",
+    "asset_description",
+    "asset_type",
+    "transaction_type",
+    "transaction_date",
+    "disclosure_date",
+    "amount_min",
+    "amount_max",
+    "owner",
+)
+_SCORED_CHANGED = (
+    "(" + ", ".join(f"trades.{f}" for f in TRADE_SCORED_FIELDS) + ")"
+    " IS DISTINCT FROM "
+    "(" + ", ".join(f"EXCLUDED.{f}" for f in TRADE_SCORED_FIELDS) + ")"
+)
+
+#: Insert a trade row, or overwrite the one with its id. Until 2026-10-02 the
+#: overwrite set conflict_score to 0 and conflict_flags to [] on every re-read
+#: but left conflict_scored_at alone, so the nightly scorer -- which picks rows
+#: by that watermark -- never came back to them: a re-read silently zeroed a
+#: trade's score for good.
+TRADE_UPSERT_SQL = """
+    INSERT INTO trades (
+        id,
+        member_id,
+        ticker,
+        asset_description,
+        asset_type,
+        transaction_type,
+        transaction_date,
+        disclosure_date,
+        amount_min,
+        amount_max,
+        owner,
+        comment,
+        source,
+        source_url,
+        conflict_score,
+        conflict_flags,
+        parser_version,
+        parser_confidence
+    )
+    VALUES (
+        %(id)s,
+        %(member_id)s,
+        %(ticker)s,
+        %(asset_description)s,
+        %(asset_type)s,
+        %(transaction_type)s,
+        %(transaction_date)s,
+        %(disclosure_date)s,
+        %(amount_min)s,
+        %(amount_max)s,
+        %(owner)s,
+        %(comment)s,
+        %(source)s,
+        %(source_url)s,
+        %(conflict_score)s,
+        %(conflict_flags)s,
+        %(parser_version)s,
+        %(parser_confidence)s
+    )
+    ON CONFLICT (id) DO UPDATE SET
+        member_id = EXCLUDED.member_id,
+        ticker = EXCLUDED.ticker,
+        asset_description = EXCLUDED.asset_description,
+        asset_type = EXCLUDED.asset_type,
+        transaction_type = EXCLUDED.transaction_type,
+        transaction_date = EXCLUDED.transaction_date,
+        disclosure_date = EXCLUDED.disclosure_date,
+        amount_min = EXCLUDED.amount_min,
+        amount_max = EXCLUDED.amount_max,
+        owner = EXCLUDED.owner,
+        comment = EXCLUDED.comment,
+        source = EXCLUDED.source,
+        source_url = EXCLUDED.source_url,
+        -- The site's scorer (lib/daily-pipeline.ts) rescores rows whose
+        -- conflict_scored_at is NULL. A re-read that changes what the
+        -- score is computed from resets the score and clears the
+        -- watermark so the row is scored again; one that changes
+        -- nothing keeps the score it has. Every SET expression here
+        -- reads the row as it was before this statement.
+        conflict_score = CASE WHEN {changed} THEN EXCLUDED.conflict_score
+                              ELSE trades.conflict_score END,
+        conflict_flags = CASE WHEN {changed} THEN EXCLUDED.conflict_flags
+                              ELSE trades.conflict_flags END,
+        conflict_scored_at = CASE WHEN {changed} THEN NULL
+                                  ELSE trades.conflict_scored_at END,
+        parser_version = EXCLUDED.parser_version,
+        parser_confidence = EXCLUDED.parser_confidence
+""".replace("{changed}", _SCORED_CHANGED)
+
+
 def upsert_trade_rows_to_neon(
     settings: Settings,
     rows: list[NormalizedTradeRow],
@@ -3799,66 +3896,7 @@ def upsert_trade_rows_to_neon(
     with neon_connection(settings) as connection:
         with connection.cursor() as cursor:
             cursor.executemany(
-                """
-                INSERT INTO trades (
-                    id,
-                    member_id,
-                    ticker,
-                    asset_description,
-                    asset_type,
-                    transaction_type,
-                    transaction_date,
-                    disclosure_date,
-                    amount_min,
-                    amount_max,
-                    owner,
-                    comment,
-                    source,
-                    source_url,
-                    conflict_score,
-                    conflict_flags,
-                    parser_version,
-                    parser_confidence
-                )
-                VALUES (
-                    %(id)s,
-                    %(member_id)s,
-                    %(ticker)s,
-                    %(asset_description)s,
-                    %(asset_type)s,
-                    %(transaction_type)s,
-                    %(transaction_date)s,
-                    %(disclosure_date)s,
-                    %(amount_min)s,
-                    %(amount_max)s,
-                    %(owner)s,
-                    %(comment)s,
-                    %(source)s,
-                    %(source_url)s,
-                    %(conflict_score)s,
-                    %(conflict_flags)s,
-                    %(parser_version)s,
-                    %(parser_confidence)s
-                )
-                ON CONFLICT (id) DO UPDATE SET
-                    member_id = EXCLUDED.member_id,
-                    ticker = EXCLUDED.ticker,
-                    asset_description = EXCLUDED.asset_description,
-                    asset_type = EXCLUDED.asset_type,
-                    transaction_type = EXCLUDED.transaction_type,
-                    transaction_date = EXCLUDED.transaction_date,
-                    disclosure_date = EXCLUDED.disclosure_date,
-                    amount_min = EXCLUDED.amount_min,
-                    amount_max = EXCLUDED.amount_max,
-                    owner = EXCLUDED.owner,
-                    comment = EXCLUDED.comment,
-                    source = EXCLUDED.source,
-                    source_url = EXCLUDED.source_url,
-                    conflict_score = EXCLUDED.conflict_score,
-                    conflict_flags = EXCLUDED.conflict_flags,
-                    parser_version = EXCLUDED.parser_version,
-                    parser_confidence = EXCLUDED.parser_confidence
-                """,
+                TRADE_UPSERT_SQL,
                 [
                     {
                         **payload,
@@ -4030,6 +4068,10 @@ def apply_house_amendment_changes(
                     params.extend([note, note, note])
                 if not assignments:
                     continue
+                if fields:
+                    # Every allowed field is one the conflict score is computed
+                    # from: send the row back to the site's scorer.
+                    assignments.append("conflict_scored_at = NULL")
                 cursor.execute(
                     f"UPDATE trades SET {', '.join(assignments)} WHERE id = %s",
                     (*params, trade_id),
