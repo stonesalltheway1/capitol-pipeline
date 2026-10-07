@@ -7,7 +7,7 @@ from datetime import datetime, timezone
 import hashlib
 import random
 import time
-from typing import Callable, Iterator
+from typing import Any, Callable, Iterator
 from urllib.parse import parse_qs, urlencode, urlparse, urlunparse
 
 from capitol_pipeline.bridges.capitol_exposed import (
@@ -3895,6 +3895,127 @@ TRADE_UPSERT_SQL = """
 """.replace("{changed}", _SCORED_CHANGED)
 
 
+#: The sources ``idx_trades_unique_senate_natural_v2`` covers (its partial-index
+#: predicate). KEEP IN SYNC with the index in the site repo,
+#: E:\CapitolGraph\scripts\migrate-schema.mjs.
+SENATE_NATURAL_KEY_SOURCES = (
+    "senate_quiver",
+    "senate-quiver",
+    "senate_watcher",
+    "senate_efd",
+    "senate-watcher",
+    "senate-ethics",
+)
+
+#: Finds a row that already holds this trade under a different id. Every
+#: comparison mirrors one expression of idx_trades_unique_senate_natural_v2.
+SENATE_NATURAL_KEY_LOOKUP_SQL = """
+    SELECT id
+    FROM trades
+    WHERE source = ANY(%(sources)s)
+      AND id <> %(id)s::text
+      AND member_id = %(member_id)s::text
+      AND COALESCE(NULLIF(upper(btrim(ticker)), ''), '')
+          = COALESCE(NULLIF(upper(btrim(%(ticker)s::text)), ''), '')
+      AND lower(btrim(asset_description)) = lower(btrim(%(asset_description)s::text))
+      AND lower(btrim(transaction_type)) = lower(btrim(%(transaction_type)s::text))
+      AND transaction_date = %(transaction_date)s::date
+      AND COALESCE(disclosure_date, '0001-01-01'::date)
+          = COALESCE(%(disclosure_date)s::date, '0001-01-01'::date)
+      AND COALESCE(amount_min, 0) = COALESCE(%(amount_min)s::bigint, 0)
+      AND COALESCE(amount_max, 0) = COALESCE(%(amount_max)s::bigint, 0)
+      AND lower(COALESCE(NULLIF(btrim(owner), ''), 'self'))
+          = lower(COALESCE(NULLIF(btrim(%(owner)s::text), ''), 'self'))
+      AND lower(COALESCE(source_url, '')) = lower(COALESCE(%(source_url)s::text, ''))
+    ORDER BY id
+    LIMIT 1
+"""
+
+
+def _senate_natural_key(payload: dict[str, object]) -> tuple[object, ...] | None:
+    """The natural key idx_trades_unique_senate_natural_v2 enforces, or None.
+
+    None means the row is outside the index (not a Senate source) or has a NULL
+    in an uncoalesced column, which the index never treats as a duplicate.
+    """
+
+    if payload.get("source") not in SENATE_NATURAL_KEY_SOURCES:
+        return None
+    member_id = payload.get("member_id")
+    asset = payload.get("asset_description")
+    action = payload.get("transaction_type")
+    traded = payload.get("transaction_date")
+    if member_id is None or asset is None or action is None or traded is None:
+        return None
+    return (
+        member_id,
+        str(payload.get("ticker") or "").strip().upper(),
+        str(asset).strip().lower(),
+        str(action).strip().lower(),
+        str(traded),
+        str(payload.get("disclosure_date") or "0001-01-01"),
+        int(payload.get("amount_min") or 0),  # type: ignore[call-overload]
+        int(payload.get("amount_max") or 0),  # type: ignore[call-overload]
+        str(payload.get("owner") or "").strip().lower() or "self",
+        str(payload.get("source_url") or "").lower(),
+    )
+
+
+def adopt_existing_senate_trade_ids(cursor: Any, payloads: list[dict[str, object]]) -> int:
+    """Point each Senate payload at the row that already holds that trade.
+
+    A Senate trade's id is a hash of its facts (build_canonical_senate_trade_id),
+    but a row keeps the id it was inserted with when a later correction rewrites
+    those facts: the member-attribution repair moved rows between members, and
+    the amount-band migration moved their bounds. Re-reading such a filing then
+    computes a fresh id, misses the row under ``ON CONFLICT (id)``, and the
+    INSERT trips the natural-key index instead. Senate refresh and reconcile
+    failed on exactly that from 2026-10-02 (a WMB option filed under m-A000377,
+    later re-attributed to m-A000383).
+
+    Adopting the existing id updates the row in place and keeps every table
+    that references it (trade_performance, trade_notifications, social posts,
+    hearing and insider correlations) attached. Two payloads in one batch that
+    share a natural key are folded onto the first one's id for the same reason.
+    Returns how many payloads were re-pointed.
+    """
+
+    adopted = 0
+    first_id_by_key: dict[tuple[object, ...], object] = {}
+    for payload in payloads:
+        key = _senate_natural_key(payload)
+        if key is None:
+            continue
+        if key in first_id_by_key:
+            if payload["id"] != first_id_by_key[key]:
+                payload["id"] = first_id_by_key[key]
+                adopted += 1
+            continue
+        cursor.execute(
+            SENATE_NATURAL_KEY_LOOKUP_SQL,
+            {
+                "sources": list(SENATE_NATURAL_KEY_SOURCES),
+                "id": payload["id"],
+                "member_id": payload["member_id"],
+                "ticker": payload.get("ticker"),
+                "asset_description": payload["asset_description"],
+                "transaction_type": payload["transaction_type"],
+                "transaction_date": payload["transaction_date"],
+                "disclosure_date": payload.get("disclosure_date"),
+                "amount_min": payload.get("amount_min"),
+                "amount_max": payload.get("amount_max"),
+                "owner": payload.get("owner"),
+                "source_url": payload.get("source_url"),
+            },
+        )
+        existing = cursor.fetchone()
+        if existing:
+            payload["id"] = existing["id"]
+            adopted += 1
+        first_id_by_key[key] = payload["id"]
+    return adopted
+
+
 def upsert_trade_rows_to_neon(
     settings: Settings,
     rows: list[NormalizedTradeRow],
@@ -3908,6 +4029,7 @@ def upsert_trade_rows_to_neon(
 
     with neon_connection(settings) as connection:
         with connection.cursor() as cursor:
+            adopt_existing_senate_trade_ids(cursor, payloads)
             cursor.executemany(
                 TRADE_UPSERT_SQL,
                 [
